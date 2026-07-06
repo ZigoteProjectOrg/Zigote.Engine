@@ -1,0 +1,69 @@
+.{
+    .name = .zigote,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x1ca8f0ba720dfe61,
+    .paths = .{
+        "",
+    },
+    .dependencies = .{
+        .sdl3 = .{
+            .path = "zig-pkg/sdl3-0.2.1-NmT1Q1cQJwDO02ja_d7yXfv2mTs_jl2d3u1dx9Xa6wBt",
+        },
+        .zigimg = .{
+            .path = "zig-pkg/zigimg-0.1.0-8_eo2sywFwArMrr5UlqjhhAMbRtpmC4mL5KbBmjrxFba",
+        },
+        .zphysics = .{
+            .path = "libraries/zphysics",
+        },
+
+        // freetype + harfbuzz: built from source (allyourcodebase), replacing the Homebrew system
+        // libs. Pinned to the SAME revs the SDL3 binding already uses (already cached in zig-pkg), so
+        // harfbuzz's internal freetype dep dedups with ours into a single freetype instance.
+        .freetype = .{
+            .url = "git+https://github.com/allyourcodebase/freetype#884fd2235e6ae1ec4306eda30b3259f20930ed2e",
+            .hash = "freetype-2.14.3-C3-WdXSKAAB-kHs4qgRoeoFnRkNQn6M_SSlUGZ6ywgBQ",
+        },
+        .harfbuzz = .{
+            .url = "git+https://github.com/allyourcodebase/harfbuzz#d055840ecefefcd57f5ddeb2fa8c83fafed1a40b",
+            .hash = "harfbuzz-14.1.0-Ip1VAuGZAAC1jdxPHOMPoHyi-50Hm_q4bveaVflELHGw",
+        },
+
+        // wgpu-native: pinned prebuilt binaries per desktop platform (gfx-rs/wgpu-native
+        // v29.0.1.1). These replace the Homebrew `wgpu_native` system library so the build no
+        // longer drifts when Homebrew bumps the formula. Each is fetched lazily — only the
+        // archive matching the build target is downloaded. The vendored Zig binding under
+        // libraries/wgpu targets this exact ABI (immediates feature + immediate_size).
+        .wgpu_macos_aarch64 = .{
+            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-aarch64-release.zip",
+            .hash = "N-V-__8AAAUNfQJBPHGd3KMhFvl4WLpzHDx9rFkwSf2rFVhr",
+            .lazy = true,
+        },
+        .wgpu_macos_x86_64 = .{
+            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-x86_64-release.zip",
+            .hash = "N-V-__8AAFWheQIu8DV1xiTixrDsCJ0xr7-Ssy-XhEIkgx5u",
+            .lazy = true,
+        },
+        .wgpu_windows_x86_64 = .{
+            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-windows-x86_64-msvc-release.zip",
+            .hash = "N-V-__8AAC46GAQ3sxZqmcxtw9OBe44NYXQyRJ7jp8Jy2bMQ",
+            .lazy = true,
+        },
+        .wgpu_linux_x86_64 = .{
+            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-linux-x86_64-release.zip",
+            .hash = "N-V-__8AAAVLrgM9jWFLs7n4rHyodpjIYxtBBE1No8nK0pRz",
+            .lazy = true,
+        },
+        .wgpu_linux_aarch64 = .{
+            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-linux-aarch64-release.zip",
+            .hash = "N-V-__8AACvXrAO11f5LA-Qfgm2C0XyWNhS_0N30HTL-Y5pQ",
+            .lazy = true,
+        },
+        // Forked from allyourcodebase/assimp@ec4892c (assimp 5.3.1) into libraries/assimp with a
+        // Zig-0.16 fixup (Compile.linkLibC/linkLibCpp → root_module.link_libc/link_libcpp; examples
+        // dropped). Builds the assimp C++ importer from source, replacing the Homebrew system lib.
+        .zig_assimp = .{
+            .path = "libraries/assimp",
+        },
+    },
+}

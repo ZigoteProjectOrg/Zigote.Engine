@@ -1,0 +1,13 @@
+# Build outputs & caches (any depth — vendored packages carry their own).
+.zig-cache/
+zig-out/
+.DS_Store
+
+# Zig package cache: everything here is re-fetchable by URL+hash from build.zig.zon,
+# EXCEPT the two hand-vendored dependencies referenced by local `.path` — those must
+# be committed (nothing can re-fetch them).
+zig-pkg/
+!/zig-pkg/
+/zig-pkg/*
+!/zig-pkg/sdl3-0.2.1-NmT1Q1cQJwDO02ja_d7yXfv2mTs_jl2d3u1dx9Xa6wBt
+!/zig-pkg/zigimg-0.1.0-8_eo2sywFwArMrr5UlqjhhAMbRtpmC4mL5KbBmjrxFba
