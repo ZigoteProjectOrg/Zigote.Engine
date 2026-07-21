@@ -60,6 +60,7 @@ pub fn getLinearVelocity(_: *PhysicsState, _: u32, _: *f32, _: *f32, _: *f32) vo
 pub fn getAngularVelocity(_: *PhysicsState, _: u32, _: *f32, _: *f32, _: *f32) void {}
 pub fn getBodyRotationQuat(_: *PhysicsState, _: u32, _: *f32, _: *f32, _: *f32, _: *f32) void {}
 pub fn setBodyRotationQuat(_: *PhysicsState, _: u32, _: f32, _: f32, _: f32, _: f32) void {}
+pub fn getBodyTransforms(_: *PhysicsState, _: [*]const u32, _: u32, _: [*]f32) void {}
 
 pub fn raycastClosest(
     _: *PhysicsState,

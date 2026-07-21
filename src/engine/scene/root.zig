@@ -21,7 +21,6 @@ pub const SceneNode = node.SceneNode;
 pub const World = world.World;
 pub const Renderable = world.Renderable;
 pub const ActiveLight = world.ActiveLight;
-pub const InputState = world.InputState;
 
 // Pull the submodules' `test` blocks into the engine test binary. Without this, referencing the
 // `scene` namespace from engine/root.zig only includes THIS file's tests — the world/node/etc. tests

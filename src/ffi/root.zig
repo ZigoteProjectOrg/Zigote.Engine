@@ -992,8 +992,10 @@ export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
     // Reset the out-of-band text buffer for this poll batch (retains capacity across polls).
     state.poll_text.clearRetainingCapacity();
 
-    while (sdl3.events.poll()) |event| {
-        if (count >= capacity) break;
+    // Check capacity before popping: an event popped with the buffer already full would be
+    // silently dropped instead of staying queued for the next poll.
+    while (count < capacity) {
+        const event = sdl3.events.poll() orelse break;
 
         var zge = std.mem.zeroes(ZgEvent);
 
@@ -1956,6 +1958,33 @@ export fn zigote_model_free(ptr: [*c]u8) void {
     if (ptr != null) std.c.free(ptr);
 }
 
+/// Point `node` at freshly created mesh/material slots. If the node already carries a
+/// mesh_renderer, its handles are updated in place and the previous mesh/material are released
+/// when no surviving node still references them (same rule as zigote_scene_remove_node) —
+/// consumers read the FIRST matching component, so stacking a second one would leave the old
+/// mesh rendering and leak both slots. Fresh nodes get the component added.
+fn setNodeMeshRenderer(state: *EngineState, node: *zg.SceneNode, mesh_handle: u32, mat_handle: u32) void {
+    if (node.getComponent(.mesh_renderer)) |c| {
+        const old_mesh = c.mesh_renderer.mesh;
+        const old_mat = c.mesh_renderer.material;
+        c.mesh_renderer.mesh = mesh_handle;
+        c.mesh_renderer.material = mat_handle;
+        if (old_mesh != std.math.maxInt(u32) and old_mesh != mesh_handle and !state.world.isMeshReferenced(old_mesh)) {
+            state.world.freeMeshSlot(old_mesh);
+            if (state.gpu_3d) |g| g.mesh_cache.invalidate(old_mesh);
+        }
+        if (old_mat != std.math.maxInt(u32) and old_mat != mat_handle and !state.world.isMaterialReferenced(old_mat)) {
+            state.world.freeMaterialSlot(old_mat);
+            invalidateMaterialGpu(state, old_mat);
+        }
+    } else {
+        node.addComponent(state.allocator, .{ .mesh_renderer = .{
+            .mesh = mesh_handle,
+            .material = mat_handle,
+        } }) catch return;
+    }
+}
+
 /// Upload a `.zmesh` binary blob (engine Vertex layout, see zmesh_format.zig) to a node's
 /// mesh renderer. Replaces the former GLB-based path; the merged geometry is produced by the
 /// Assimp importer and read back here as a flat vertex/index buffer.
@@ -1977,10 +2006,7 @@ export fn zigote_scene_set_mesh_blob(handle: u64, node_handle: u64, data_ptr: [*
     const mesh_handle = state.world.addMesh(mesh) catch return;
     const mat_handle = state.world.addMaterial(.{}) catch return;
 
-    node.addComponent(state.allocator, .{ .mesh_renderer = .{
-        .mesh = mesh_handle,
-        .material = mat_handle,
-    } }) catch return;
+    setNodeMeshRenderer(state, node, mesh_handle, mat_handle);
 }
 
 export fn zigote_scene_set_mesh_primitive(handle: u64, node_handle: u64, prim_type: u8) void {
@@ -2003,10 +2029,7 @@ export fn zigote_scene_set_mesh_primitive(handle: u64, node_handle: u64, prim_ty
     const mesh_handle = state.world.addMesh(mesh) catch return;
     const mat_handle = state.world.addMaterial(.{}) catch return;
 
-    node.addComponent(state.allocator, .{ .mesh_renderer = .{
-        .mesh = mesh_handle,
-        .material = mat_handle,
-    } }) catch return;
+    setNodeMeshRenderer(state, node, mesh_handle, mat_handle);
 }
 
 export fn zigote_scene_set_light_properties(
@@ -2680,8 +2703,9 @@ export fn zigote_scene_load_textures_batch(handle: u64, items_ptr: [*]const ZgTe
     }
 }
 
-/// Mesh/material handles used by a subtree, collected before it is destroyed. Deduplicated so each
-/// slot is considered for freeing at most once even if two nodes happen to share a handle.
+/// Mesh/material handles used by a subtree, collected before it is destroyed. May contain
+/// duplicates if two nodes happen to share a handle; the free pass in zigote_scene_remove_node
+/// marks each handle as it is freed, so a slot is released at most once.
 const SubtreeAssets = struct {
     meshes: std.ArrayListUnmanaged(u32) = .empty,
     materials: std.ArrayListUnmanaged(u32) = .empty,
@@ -2691,11 +2715,6 @@ const SubtreeAssets = struct {
         self.materials.deinit(alloc);
     }
 };
-
-fn appendUniqueHandle(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(u32), v: u32) void {
-    for (list.items) |e| if (e == v) return;
-    list.append(alloc, v) catch {};
-}
 
 /// Walk `node` + descendants, shedding the per-node state the world's CPU tree does NOT own: drop
 /// each node's per-entity renderer state (instancing / model UBO), untrack its C# handle, clear it
@@ -2713,11 +2732,22 @@ fn gatherSubtreeForRemoval(state: *EngineState, node: *zg.SceneNode, assets: *Su
 
     if (node.getComponent(.mesh_renderer)) |c| {
         const mr = c.mesh_renderer;
-        if (mr.mesh != std.math.maxInt(u32)) appendUniqueHandle(state.allocator, &assets.meshes, mr.mesh);
-        if (mr.material != std.math.maxInt(u32)) appendUniqueHandle(state.allocator, &assets.materials, mr.material);
+        if (mr.mesh != std.math.maxInt(u32)) assets.meshes.append(state.allocator, mr.mesh) catch {};
+        if (mr.material != std.math.maxInt(u32)) assets.materials.append(state.allocator, mr.material) catch {};
     }
 
     for (node.children.items) |child| gatherSubtreeForRemoval(state, child, assets);
+}
+
+/// Mark every mesh/material handle still referenced by `node` + descendants in the given bitsets
+/// (indexed by handle — handles are dense array indices, see World.addMesh/addMaterial).
+fn markSubtreeAssets(node: *zg.SceneNode, used_meshes: []bool, used_materials: []bool) void {
+    if (node.getComponent(.mesh_renderer)) |c| {
+        const mr = c.mesh_renderer;
+        if (mr.mesh < used_meshes.len) used_meshes[mr.mesh] = true;
+        if (mr.material < used_materials.len) used_materials[mr.material] = true;
+    }
+    for (node.children.items) |child| markSubtreeAssets(child, used_meshes, used_materials);
 }
 
 export fn zigote_scene_remove_node(handle: u64, node_handle: u64) void {
@@ -2739,16 +2769,29 @@ export fn zigote_scene_remove_node(handle: u64, node_handle: u64) void {
     // freed on node removal. A shared handle (kept by another node) is left intact; only the last
     // reference frees it. CPU slot: tombstoned + recycled by addMesh/addMaterial. GPU: the cached
     // vertex/index/line buffers (MeshCache) and textures/views/bind group (MaterialGpu) are released.
+    // One walk over the surviving tree marks the handles still in use — O(nodes + assets) instead of
+    // a full-scene reference scan per collected handle. On marking-set OOM the free pass is skipped
+    // (a leak, never a wrong free). A freed handle is re-marked so a duplicate frees the slot once.
+    const used_meshes = state.allocator.alloc(bool, state.world.meshes.items.len) catch return;
+    defer state.allocator.free(used_meshes);
+    const used_materials = state.allocator.alloc(bool, state.world.materials.items.len) catch return;
+    defer state.allocator.free(used_materials);
+    @memset(used_meshes, false);
+    @memset(used_materials, false);
+    for (state.world.roots.items) |root| markSubtreeAssets(root, used_meshes, used_materials);
+
     for (assets.meshes.items) |h| {
-        if (!state.world.isMeshReferenced(h)) {
+        if (h < used_meshes.len and !used_meshes[h]) {
             state.world.freeMeshSlot(h);
             if (state.gpu_3d) |g| g.mesh_cache.invalidate(h);
+            used_meshes[h] = true;
         }
     }
     for (assets.materials.items) |h| {
-        if (!state.world.isMaterialReferenced(h)) {
+        if (h < used_materials.len and !used_materials[h]) {
             state.world.freeMaterialSlot(h);
             invalidateMaterialGpu(state, h);
+            used_materials[h] = true;
         }
     }
 }
@@ -4254,6 +4297,15 @@ export fn zigote_physics_set_body_rotation_quat(handle: u64, body_id: u32, qx: f
     const state = stateFromHandle(handle) orelse return;
     const phys = state.physics orelse return;
     physics_ffi.setBodyRotationQuat(phys, body_id, qx, qy, qz, qw);
+}
+
+/// Batched transform read: for each of the `count` body ids, writes 7 f32 (pos.xyz + quat.xyzw)
+/// into `out_xforms` (must hold `count * 7` floats). One call replaces a position + rotation
+/// FFI pair per body on the per-tick sync path.
+export fn zigote_physics_get_body_transforms(handle: u64, ids: [*c]const u32, count: u32, out_xforms: [*]f32) void {
+    const state = stateFromHandle(handle) orelse return;
+    const phys = state.physics orelse return;
+    physics_ffi.getBodyTransforms(phys, ids, count, out_xforms);
 }
 
 /// Closest-hit world ray cast, skipping `ignore_body` (0xFFFFFFFF = none). Returns 1 on hit, 0 on miss.

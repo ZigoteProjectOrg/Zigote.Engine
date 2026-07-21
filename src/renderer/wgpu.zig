@@ -105,6 +105,17 @@ pub const GpuUi = struct {
     custom_shader_pipelines: std.AutoHashMap(u32, *wgpu.RenderPipeline) = undefined,
     shader_effect_vertex_buffer: ?*wgpu.Buffer = null,
     shader_effect_vertex_buffer_size: usize = 0,
+    // Shared quad index pattern for the text/image pipelines (both are pure quads) — see
+    // ensureQuadIndexBuffer. Capacity is tracked in quads and only ever grows.
+    quad_index_buffer: ?*wgpu.Buffer = null,
+    quad_index_quads: usize = 0,
+    // Scratch scene target for renderToTexture, persisted across calls and recreated only on a
+    // size change — see ensureRtSceneTexture.
+    rt_scene_texture: ?*wgpu.Texture = null,
+    rt_scene_view: ?*wgpu.TextureView = null,
+    rt_blit_bind_group: ?*wgpu.BindGroup = null,
+    rt_scene_width: u32 = 0,
+    rt_scene_height: u32 = 0,
 
     /// GPU memory held by this window's 2D renderer, in bytes, attributed per subsystem. Diagnostic
     /// only (no allocation). scene/backdrop are the (lazy) glass-backdrop capture targets — null on a
@@ -131,7 +142,8 @@ pub const GpuUi = struct {
             0;
         const vbuf: u64 = self.shape_vertex_buffer_size + self.liquid_glass_vertex_buffer_size +
             self.text_vertex_buffer_size + self.image_vertex_buffer_size +
-            self.blit_vertex_buffer_size + self.shader_effect_vertex_buffer_size;
+            self.blit_vertex_buffer_size + self.shader_effect_vertex_buffer_size +
+            self.quad_index_quads * 6 * @sizeOf(u32);
         return .{
             .coverage_atlas = atlas.coverage,
             .emoji_atlas = atlas.emoji,
@@ -504,6 +516,10 @@ pub const GpuUi = struct {
         releaseBuffer(self.image_vertex_buffer);
         releaseBuffer(self.blit_vertex_buffer);
         releaseBuffer(self.shader_effect_vertex_buffer);
+        releaseBuffer(self.quad_index_buffer);
+        if (self.rt_blit_bind_group) |bg| bg.release();
+        if (self.rt_scene_view) |tv| tv.release();
+        if (self.rt_scene_texture) |t| t.release();
         if (self.clip_bind_group) |bg| bg.release();
         releaseBuffer(self.clip_buffer);
         var shader_it = self.custom_shader_pipelines.valueIterator();
@@ -933,6 +949,47 @@ fn ensureClipBuffer(
     }
 }
 
+/// (Re)create the shared index buffer holding the repeating per-quad pattern {0,1,2, 1,3,2} for at
+/// least `quad_count` quads. The text and image pipelines draw nothing but whole quads (4 vertices
+/// each, corners TL,TR,BL,BR), so one persistent pattern buffer serves every batch via drawIndexed
+/// and only regrows when a frame's quad count exceeds all previous frames.
+fn ensureQuadIndexBuffer(
+    device: *wgpu.Device,
+    queue: *wgpu.Queue,
+    gpu_ui: *GpuUi,
+    quad_count: usize,
+) !void {
+    if (gpu_ui.quad_index_buffer != null and gpu_ui.quad_index_quads >= quad_count) return;
+    const quads = @max(quad_count, @max(gpu_ui.quad_index_quads * 2, 256));
+    const bytes = quads * 6 * @sizeOf(u32);
+    const buffer = device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("zigote quad indices"),
+        .usage = wgpu.BufferUsages.copy_dst | wgpu.BufferUsages.index,
+        .size = @intCast(bytes),
+    }) orelse return error.WgpuIndexBufferUnavailable;
+
+    const indices = try gpu_ui.allocator.alloc(u32, quads * 6);
+    defer gpu_ui.allocator.free(indices);
+    for (0..quads) |q| {
+        const v: u32 = @intCast(q * 4);
+        indices[q * 6 + 0] = v;
+        indices[q * 6 + 1] = v + 1;
+        indices[q * 6 + 2] = v + 2;
+        indices[q * 6 + 3] = v + 1;
+        indices[q * 6 + 4] = v + 3;
+        indices[q * 6 + 5] = v + 2;
+    }
+    queue.writeBuffer(buffer, 0, std.mem.sliceAsBytes(indices).ptr, bytes);
+
+    releaseBuffer(gpu_ui.quad_index_buffer);
+    gpu_ui.quad_index_buffer = buffer;
+    gpu_ui.quad_index_quads = quads;
+}
+
+fn quadIndexBytes(gpu_ui: *const GpuUi) u64 {
+    return @intCast(gpu_ui.quad_index_quads * 6 * @sizeOf(u32));
+}
+
 fn uploadFrameVertices(
     device: *wgpu.Device,
     queue: *wgpu.Queue,
@@ -944,6 +1001,11 @@ fn uploadFrameVertices(
     // Always ensured (even with zero rounded clips) — every shape/text/image draw and the blit
     // bind the clip group, so the buffer + slot 0 must exist whenever anything renders.
     try ensureClipBuffer(device, queue, gpu_ui, frame.rounded_clips.items);
+
+    // Quad index pattern for the text/image batches; the blit paths draw one quad, so at least
+    // one entry is kept even on frames with no text or image content.
+    const quad_count = @max(frame.text_vertices.items.len / 4, @max(frame.image_vertices.items.len / 4, 1));
+    try ensureQuadIndexBuffer(device, queue, gpu_ui, quad_count);
 
     if (frame.shape_vertices.items.len > 0) {
         const bytes = std.mem.sliceAsBytes(frame.shape_vertices.items);
@@ -1093,10 +1155,59 @@ fn frameHasBackdropOp(frame: *const FramePaint) bool {
     return false;
 }
 
+/// Device-pixel AABB of a contiguous NDC vertex range (any vertex type with an NDC `position`).
+/// Computed from the final vertex data, so it is exact even under an active 2D transform.
+fn vertexRangeAabb(comptime V: type, verts: []const V, fw: f32, fh: f32) ?zg.Rect {
+    if (verts.len == 0) return null;
+    var min_x = verts[0].position[0];
+    var max_x = min_x;
+    var min_y = verts[0].position[1];
+    var max_y = min_y;
+    for (verts[1..]) |v| {
+        min_x = @min(min_x, v.position[0]);
+        max_x = @max(max_x, v.position[0]);
+        min_y = @min(min_y, v.position[1]);
+        max_y = @max(max_y, v.position[1]);
+    }
+    // NDC y is up, device y is down, so max NDC y maps to the device-space top edge.
+    return .{
+        .x = (min_x + 1.0) * 0.5 * fw,
+        .y = (1.0 - max_y) * 0.5 * fh,
+        .width = (max_x - min_x) * 0.5 * fw,
+        .height = (max_y - min_y) * 0.5 * fh,
+    };
+}
+
+/// Device-space bounds of one draw op, from its vertex range in the per-kind list. Null = no
+/// vertices (the op draws nothing anywhere).
+fn opDeviceAabb(frame: *const FramePaint, op: *const DrawOp, fw: f32, fh: f32) ?zg.Rect {
+    return switch (op.*) {
+        .shape => |b| vertexRangeAabb(ShapeVertex, frame.shape_vertices.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
+        .liquid_glass => |b| vertexRangeAabb(LiquidGlassVertex, frame.liquid_glass_vertices.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
+        .text => |b| vertexRangeAabb(ft_text.TextVertex, frame.text_vertices.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
+        .image => |b| vertexRangeAabb(ImageVertex, frame.image_vertices.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
+        .shader_effect => |b| vertexRangeAabb(ShaderEffectVertex, frame.shader_effect_vertices.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
+    };
+}
+
+/// True when an op's device-space AABB can produce fragments inside the damage region's scissor
+/// box. Mirrors applyScissor's clamping (a negative origin SHRINKS the box — shifting would make
+/// adjacent damage sweeps overlap and double-blend), with 1 px of slack against its float→integer
+/// truncation — a false positive just draws an op whose scissor discards everything, harmless.
+fn aabbHitsDamage(aabb: zg.Rect, region: zg.Rect, scale_factor: f32) bool {
+    const rx = @max(0.0, region.x * scale_factor);
+    const ry = @max(0.0, region.y * scale_factor);
+    const rw = @max(0.0, (region.width + @min(0.0, region.x)) * scale_factor);
+    const rh = @max(0.0, (region.height + @min(0.0, region.y)) * scale_factor);
+    return aabb.x + aabb.width >= rx - 1.0 and aabb.x <= rx + rw + 1.0 and
+        aabb.y + aabb.height >= ry - 1.0 and aabb.y <= ry + rh + 1.0;
+}
+
 /// Partial-repaint replay: preserve the persistent scene texture (loadOp=load) and redraw the frame's
 /// ops scissored to each damaged rect. Runs one op sweep per damage rect; because C# keeps the rects
 /// pairwise non-overlapping, no pixel is drawn twice (which for alpha-blended ops would be wrong). The
-/// caller guarantees the frame has no backdrop-sampling op, so there is no mid-pass backdrop barrier.
+/// caller guarantees the frame has no backdrop-sampling op, so there is no mid-pass backdrop barrier —
+/// every op is a pure draw, so skipping ops whose bounds miss a rect cannot desync any replay state.
 fn replayFramePaintDamage(
     encoder: *wgpu.CommandEncoder,
     scene_view: *wgpu.TextureView,
@@ -1110,14 +1221,36 @@ fn replayFramePaintDamage(
     frame_width: u32,
     frame_height: u32,
 ) !void {
+    // One device-space AABB per op, so the per-rect sweeps below can skip ops (and their full
+    // pipeline/bind-group/vertex-buffer setup) that cannot touch the rect being repainted.
+    const fw: f32 = @floatFromInt(frame_width);
+    const fh: f32 = @floatFromInt(frame_height);
+    const aabbs = try gpu_ui.scratch.allocator().alloc(?zg.Rect, frame.ops.items.len);
+    for (frame.ops.items, aabbs) |*op, *aabb| {
+        aabb.* = opDeviceAabb(frame, op, fw, fh);
+    }
+
     const pass = try beginScenePassLoad(encoder, scene_view);
     defer {
         pass.end();
         pass.release();
     }
 
+    const debug_replay = std.c.getenv("ZIGOTE_DEBUG_REPLAY") != null;
     for (damage) |region| {
-        for (frame.ops.items) |*op| {
+        var drawn: u32 = 0;
+        var culled: u32 = 0;
+        for (frame.ops.items, aabbs, 0..) |*op, aabb, op_idx| {
+            const bounds = aabb orelse continue;
+            if (!aabbHitsDamage(bounds, region, scale_factor)) {
+                culled += 1;
+                if (debug_replay) std.log.info(
+                    "[replay] CULL op#{d} {s} aabb=({d:.1},{d:.1} {d:.1}x{d:.1}) region=({d:.1},{d:.1} {d:.1}x{d:.1})",
+                    .{ op_idx, @tagName(op.*), bounds.x, bounds.y, bounds.width, bounds.height, region.x, region.y, region.width, region.height },
+                );
+                continue;
+            }
+            drawn += 1;
             try drawOp(
                 pass,
                 gpu_ui,
@@ -1130,6 +1263,10 @@ fn replayFramePaintDamage(
                 region,
             );
         }
+        if (debug_replay) std.log.info(
+            "[replay] region=({d:.1},{d:.1} {d:.1}x{d:.1}) sf={d:.1} fb={d}x{d} drawn={d} culled={d}",
+            .{ region.x, region.y, region.width, region.height, scale_factor, frame_width, frame_height, drawn, culled },
+        );
     }
 }
 
@@ -1238,10 +1375,10 @@ fn drawShapeOp(
     const buffer = uploaded.shape orelse return;
     // Guaranteed by ensureClipBuffer in uploadFrameVertices; skip rather than bind null.
     const clip_bg = gpu_ui.clip_bind_group orelse return;
+    if (!applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height)) return;
     pass.setPipeline(gpu_ui.shape_pipeline);
     pass.setBindGroup(0, clip_bg, 1, @ptrCast(&batch.clip_offset));
     pass.setVertexBuffer(0, buffer, 0, uploaded.shape_bytes_len);
-    applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height);
     pass.draw(batch.vertex_count, 1, batch.vertex_offset, 0);
 }
 
@@ -1261,10 +1398,10 @@ fn drawLiquidGlassOp(
     // Unreachable by construction (backdrop creation is gated on frameHasBackdropOp): skip the op
     // rather than binding null.
     const backdrop_bg = backdrop_bind_group orelse return;
+    if (!applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height)) return;
     pass.setPipeline(gpu_ui.liquid_glass_pipeline);
     pass.setBindGroup(0, backdrop_bg, 0, null);
     pass.setVertexBuffer(0, buffer, 0, uploaded.liquid_glass_bytes_len);
-    applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height);
     pass.draw(batch.vertex_count, 1, batch.vertex_offset, 0);
 }
 
@@ -1281,12 +1418,14 @@ fn drawTextOp(
     if (batch.vertex_count == 0) return;
     const buffer = uploaded.text orelse return;
     const clip_bg = gpu_ui.clip_bind_group orelse return;
+    const index_buffer = gpu_ui.quad_index_buffer orelse return;
+    if (!applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height)) return;
     pass.setPipeline(gpu_ui.text.pipeline);
     pass.setBindGroup(0, gpu_ui.text.bind_group, 0, null);
     pass.setBindGroup(1, clip_bg, 1, @ptrCast(&batch.clip_offset));
     pass.setVertexBuffer(0, buffer, 0, uploaded.text_bytes_len);
-    applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height);
-    pass.draw(batch.vertex_count, 1, batch.vertex_offset, 0);
+    pass.setIndexBuffer(index_buffer, .uint32, 0, quadIndexBytes(gpu_ui));
+    pass.drawIndexed(batch.vertex_count / 4 * 6, 1, batch.vertex_offset / 4 * 6, 0, 0);
 }
 
 fn drawImageOp(
@@ -1302,12 +1441,14 @@ fn drawImageOp(
     if (batch.vertex_count == 0) return;
     const buffer = uploaded.image orelse return;
     const clip_bg = gpu_ui.clip_bind_group orelse return;
+    const index_buffer = gpu_ui.quad_index_buffer orelse return;
+    if (!applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height)) return;
     pass.setPipeline(gpu_ui.image_pipeline);
     pass.setBindGroup(0, batch.bind_group, 0, null);
     pass.setBindGroup(1, clip_bg, 1, @ptrCast(&batch.clip_offset));
     pass.setVertexBuffer(0, buffer, 0, uploaded.image_bytes_len);
-    applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height);
-    pass.draw(batch.vertex_count, 1, batch.vertex_offset, 0);
+    pass.setIndexBuffer(index_buffer, .uint32, 0, quadIndexBytes(gpu_ui));
+    pass.drawIndexed(batch.vertex_count / 4 * 6, 1, batch.vertex_offset / 4 * 6, 0, 0);
 }
 
 fn drawShaderEffectOp(
@@ -1326,10 +1467,10 @@ fn drawShaderEffectOp(
     const pipeline = gpu_ui.custom_shader_pipelines.get(batch.shader_id) orelse return;
     // Unreachable by construction — see drawLiquidGlassOp.
     const backdrop_bg = backdrop_bind_group orelse return;
+    if (!applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height)) return;
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, backdrop_bg, 0, null);
     pass.setVertexBuffer(0, buffer, 0, uploaded.shader_effect_bytes_len);
-    applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height);
     pass.draw(batch.vertex_count, 1, batch.vertex_offset, 0);
 }
 
@@ -2029,6 +2170,100 @@ fn ensureBackdropTexture(
     gpu_ui.backdrop_bind_group = backdrop_bg;
 }
 
+/// (Re)create the scratch scene texture + blit bind group renderToTexture renders into, recreated
+/// only on a size change (mirrors ensureSceneTexture). renderToTexture is self-submitting and the
+/// queue executes submissions in order, so sequential RT renders can safely share one persistent
+/// scratch target instead of allocating and destroying a full-size texture per call per frame.
+fn ensureRtSceneTexture(
+    gpu_ui: *GpuUi,
+    device: *wgpu.Device,
+    width: u32,
+    height: u32,
+) !void {
+    if (gpu_ui.rt_scene_width == width and
+        gpu_ui.rt_scene_height == height and
+        gpu_ui.rt_scene_texture != null and
+        gpu_ui.rt_scene_view != null and
+        gpu_ui.rt_blit_bind_group != null) return;
+
+    if (gpu_ui.rt_blit_bind_group) |bg| bg.release();
+    gpu_ui.rt_blit_bind_group = null;
+    if (gpu_ui.rt_scene_view) |tv| tv.release();
+    gpu_ui.rt_scene_view = null;
+    if (gpu_ui.rt_scene_texture) |t| t.release();
+    gpu_ui.rt_scene_texture = null;
+
+    const scene_tex = device.createTexture(&.{
+        .label = wgpu.StringView.fromSlice("zigote rt scene"),
+        .usage = wgpu.TextureUsages.render_attachment | wgpu.TextureUsages.copy_src | wgpu.TextureUsages.texture_binding,
+        .dimension = .@"2d",
+        .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
+        .format = gpu_ui.surface_format,
+        .mip_level_count = 1,
+        .sample_count = 1,
+    }) orelse return error.RtSceneTexFailed;
+    errdefer scene_tex.release();
+
+    const scene_view = scene_tex.createView(null) orelse return error.RtSceneViewFailed;
+    errdefer scene_view.release();
+
+    const blit_bg = createImageBindGroup(device, gpu_ui.text.bindGroupLayout(), scene_view, gpu_ui.backdrop_sampler) orelse return error.RtBlitBgFailed;
+
+    gpu_ui.rt_scene_texture = scene_tex;
+    gpu_ui.rt_scene_view = scene_view;
+    gpu_ui.rt_blit_bind_group = blit_bg;
+    gpu_ui.rt_scene_width = width;
+    gpu_ui.rt_scene_height = height;
+}
+
+const blit_quad_size = @sizeOf(ImageVertex) * 4;
+
+/// Fullscreen quad in NDC (UV top-left=(0,0) bottom-right=(1,1)), corners TL,TR,BL,BR to match the
+/// shared quad index pattern. It is a compile-time constant — independent of frame size (the
+/// scissor handles that) — so upload it once into the persistent buffer and reuse it. `need_upload`
+/// is true exactly when ensureVertexBuffer will (re)create the buffer, so the constant is written
+/// on first use / after a device-recreation and skipped after.
+fn ensureBlitQuad(device: *wgpu.Device, queue: *wgpu.Queue, gpu_ui: *GpuUi) !*wgpu.Buffer {
+    const need_upload = gpu_ui.blit_vertex_buffer == null or gpu_ui.blit_vertex_buffer_size < blit_quad_size;
+    const vbuf = try ensureVertexBuffer(device, &gpu_ui.blit_vertex_buffer, &gpu_ui.blit_vertex_buffer_size, "zigote blit vertices", blit_quad_size);
+    if (need_upload) {
+        const verts = [_]ImageVertex{
+            .{ .position = .{ -1.0, 1.0 }, .uv = .{ 0.0, 0.0 }, .color = .{ 255, 255, 255, 255 } },
+            .{ .position = .{ 1.0, 1.0 }, .uv = .{ 1.0, 0.0 }, .color = .{ 255, 255, 255, 255 } },
+            .{ .position = .{ -1.0, -1.0 }, .uv = .{ 0.0, 1.0 }, .color = .{ 255, 255, 255, 255 } },
+            .{ .position = .{ 1.0, -1.0 }, .uv = .{ 1.0, 1.0 }, .color = .{ 255, 255, 255, 255 } },
+        };
+        queue.writeBuffer(vbuf, 0, std.mem.sliceAsBytes(&verts).ptr, blit_quad_size);
+    }
+    return vbuf;
+}
+
+/// Draw the fullscreen blit quad through the image pipeline with `blit_bg` as the source texture.
+/// Shared by the swapchain blit and the renderToTexture blit.
+fn drawBlit(
+    device: *wgpu.Device,
+    queue: *wgpu.Queue,
+    pass: *wgpu.RenderPassEncoder,
+    gpu_ui: *GpuUi,
+    blit_bg: *wgpu.BindGroup,
+    frame_width: u32,
+    frame_height: u32,
+) !void {
+    const vbuf = try ensureBlitQuad(device, queue, gpu_ui);
+    try ensureQuadIndexBuffer(device, queue, gpu_ui, 1);
+    const index_buffer = gpu_ui.quad_index_buffer orelse return;
+    // The image pipeline's layout includes the rounded-clip group; bind the disabled slot 0.
+    const clip_bg = gpu_ui.clip_bind_group orelse return;
+    const no_clip: u32 = 0;
+    pass.setPipeline(gpu_ui.image_pipeline);
+    pass.setBindGroup(0, blit_bg, 0, null);
+    pass.setBindGroup(1, clip_bg, 1, @ptrCast(&no_clip));
+    pass.setVertexBuffer(0, vbuf, 0, blit_quad_size);
+    pass.setIndexBuffer(index_buffer, .uint32, 0, quadIndexBytes(gpu_ui));
+    pass.setScissorRect(0, 0, frame_width, frame_height);
+    pass.drawIndexed(6, 1, 0, 0, 0);
+}
+
 fn blitSceneToSwapchain(
     device: *wgpu.Device,
     queue: *wgpu.Queue,
@@ -2038,33 +2273,7 @@ fn blitSceneToSwapchain(
     frame_height: u32,
 ) !void {
     const blit_bg = gpu_ui.blit_bind_group orelse return;
-    // Fullscreen quad in NDC (UV top-left=(0,0) bottom-right=(1,1)). It is a compile-time constant —
-    // independent of frame size (the scissor handles that) — so upload it once into the persistent
-    // buffer and reuse it. `need_upload` is true exactly when ensureVertexBuffer will (re)create the
-    // buffer, so the constant is written on first use / after a device-recreation and skipped after.
-    const blit_size = @sizeOf(ImageVertex) * 6;
-    const need_upload = gpu_ui.blit_vertex_buffer == null or gpu_ui.blit_vertex_buffer_size < blit_size;
-    const vbuf = try ensureVertexBuffer(device, &gpu_ui.blit_vertex_buffer, &gpu_ui.blit_vertex_buffer_size, "zigote blit vertices", blit_size);
-    if (need_upload) {
-        const verts = [_]ImageVertex{
-            .{ .position = .{ -1.0, 1.0 }, .uv = .{ 0.0, 0.0 }, .color = .{ 255, 255, 255, 255 } },
-            .{ .position = .{ 1.0, 1.0 }, .uv = .{ 1.0, 0.0 }, .color = .{ 255, 255, 255, 255 } },
-            .{ .position = .{ -1.0, -1.0 }, .uv = .{ 0.0, 1.0 }, .color = .{ 255, 255, 255, 255 } },
-            .{ .position = .{ 1.0, 1.0 }, .uv = .{ 1.0, 0.0 }, .color = .{ 255, 255, 255, 255 } },
-            .{ .position = .{ 1.0, -1.0 }, .uv = .{ 1.0, 1.0 }, .color = .{ 255, 255, 255, 255 } },
-            .{ .position = .{ -1.0, -1.0 }, .uv = .{ 0.0, 1.0 }, .color = .{ 255, 255, 255, 255 } },
-        };
-        queue.writeBuffer(vbuf, 0, std.mem.sliceAsBytes(&verts).ptr, blit_size);
-    }
-    // The image pipeline's layout includes the rounded-clip group; bind the disabled slot 0.
-    const clip_bg = gpu_ui.clip_bind_group orelse return;
-    const no_clip: u32 = 0;
-    pass.setPipeline(gpu_ui.image_pipeline);
-    pass.setBindGroup(0, blit_bg, 0, null);
-    pass.setBindGroup(1, clip_bg, 1, @ptrCast(&no_clip));
-    pass.setVertexBuffer(0, vbuf, 0, blit_size);
-    pass.setScissorRect(0, 0, frame_width, frame_height);
-    pass.draw(6, 1, 0, 0);
+    try drawBlit(device, queue, pass, gpu_ui, blit_bg, frame_width, frame_height);
 }
 
 fn appendShaderEffect(
@@ -2719,13 +2928,13 @@ fn appendImage(
     const x1 = (bounds.x + bounds.width - offset_x) / frame_width * 2.0 - 1.0;
     const y1 = 1.0 - (bounds.y + bounds.height - offset_y) / frame_height * 2.0;
 
+    // Corners TL,TR,BL,BR — the order the shared quad index pattern (ensureQuadIndexBuffer)
+    // expands into the two triangles the old 6-vertex emission produced.
     try vertices.appendSlice(allocator, &.{
         .{ .position = .{ x0, y0 }, .uv = .{ uv0_x, uv0_y }, .color = color },
         .{ .position = .{ x1, y0 }, .uv = .{ uv1_x, uv0_y }, .color = color },
         .{ .position = .{ x0, y1 }, .uv = .{ uv0_x, uv1_y }, .color = color },
-        .{ .position = .{ x1, y0 }, .uv = .{ uv1_x, uv0_y }, .color = color },
         .{ .position = .{ x1, y1 }, .uv = .{ uv1_x, uv1_y }, .color = color },
-        .{ .position = .{ x0, y1 }, .uv = .{ uv0_x, uv1_y }, .color = color },
     });
 }
 
@@ -2990,20 +3199,10 @@ pub fn renderToTexture(
     gpu_ui.text.uploadAtlasIfDirty(queue);
     gpu_ui.text.uploadColorAtlasIfDirty(queue);
 
-    // Temporary scene texture for this RT render
-    const scene_tex = device.createTexture(&.{
-        .label = wgpu.StringView.fromSlice("zigote rt scene"),
-        .usage = wgpu.TextureUsages.render_attachment | wgpu.TextureUsages.copy_src | wgpu.TextureUsages.texture_binding,
-        .dimension = .@"2d",
-        .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
-        .format = gpu_ui.surface_format,
-        .mip_level_count = 1,
-        .sample_count = 1,
-    }) orelse return error.RtSceneTexFailed;
-    defer scene_tex.release();
-
-    const scene_view = scene_tex.createView(null) orelse return error.RtSceneViewFailed;
-    defer scene_view.release();
+    // Persistent scratch scene target, recreated only when the RT size changes.
+    try ensureRtSceneTexture(gpu_ui, device, width, height);
+    const scene_tex = gpu_ui.rt_scene_texture orelse return error.RtSceneTexFailed;
+    const scene_view = gpu_ui.rt_scene_view orelse return error.RtSceneViewFailed;
 
     // Temporary backdrop trio, created only when this RT frame actually contains a
     // backdrop-sampling (glass / shader-effect) op — plain RT content skips the allocation.
@@ -3027,9 +3226,8 @@ pub fn renderToTexture(
         backdrop_bg = createImageBindGroup(device, gpu_ui.backdrop_bgl, backdrop_view.?, gpu_ui.backdrop_sampler) orelse return error.RtBackdropBgFailed;
     }
 
-    // Blit bind group: scene_tex → dst_view
-    const blit_bg = createImageBindGroup(device, gpu_ui.text.bindGroupLayout(), scene_view, gpu_ui.backdrop_sampler) orelse return error.RtBlitBgFailed;
-    defer blit_bg.release();
+    // Blit bind group: scene_tex → dst_view (persisted alongside the scratch scene texture)
+    const blit_bg = gpu_ui.rt_blit_bind_group orelse return error.RtBlitBgFailed;
 
     const uploaded = try uploadFrameVertices(device, queue, gpu_ui, &frame);
 
@@ -3053,24 +3251,9 @@ pub fn renderToTexture(
         height,
     );
 
-    // Blit scene_tex → dst_view. Same constant fullscreen quad as blitSceneToSwapchain, sharing the
-    // persistent blit_vertex_buffer; upload only when the buffer is (re)created (see that path).
+    // Blit scene_tex → dst_view. Same constant fullscreen quad as blitSceneToSwapchain, sharing
+    // the persistent blit_vertex_buffer (see ensureBlitQuad).
     {
-        const blit_size = @sizeOf(ImageVertex) * 6;
-        const need_upload = gpu_ui.blit_vertex_buffer == null or gpu_ui.blit_vertex_buffer_size < blit_size;
-        const vbuf = try ensureVertexBuffer(device, &gpu_ui.blit_vertex_buffer, &gpu_ui.blit_vertex_buffer_size, "zigote rt blit verts", blit_size);
-        if (need_upload) {
-            const verts = [_]ImageVertex{
-                .{ .position = .{ -1.0, 1.0 }, .uv = .{ 0.0, 0.0 }, .color = .{ 255, 255, 255, 255 } },
-                .{ .position = .{ 1.0, 1.0 }, .uv = .{ 1.0, 0.0 }, .color = .{ 255, 255, 255, 255 } },
-                .{ .position = .{ -1.0, -1.0 }, .uv = .{ 0.0, 1.0 }, .color = .{ 255, 255, 255, 255 } },
-                .{ .position = .{ 1.0, 1.0 }, .uv = .{ 1.0, 0.0 }, .color = .{ 255, 255, 255, 255 } },
-                .{ .position = .{ 1.0, -1.0 }, .uv = .{ 1.0, 1.0 }, .color = .{ 255, 255, 255, 255 } },
-                .{ .position = .{ -1.0, -1.0 }, .uv = .{ 0.0, 1.0 }, .color = .{ 255, 255, 255, 255 } },
-            };
-            queue.writeBuffer(vbuf, 0, std.mem.sliceAsBytes(&verts).ptr, blit_size);
-        }
-
         const attachment = wgpu.ColorAttachment{
             .view = dst_view,
             .load_op = .clear,
@@ -3082,15 +3265,7 @@ pub fn renderToTexture(
             .color_attachments = @ptrCast(&attachment),
         }) orelse return error.RtBlitPassFailed;
         defer pass.release();
-        // The image pipeline's layout includes the rounded-clip group; bind the disabled slot 0.
-        const clip_bg = gpu_ui.clip_bind_group orelse return error.RtBlitBgFailed;
-        const no_clip: u32 = 0;
-        pass.setPipeline(gpu_ui.image_pipeline);
-        pass.setBindGroup(0, blit_bg, 0, null);
-        pass.setBindGroup(1, clip_bg, 1, @ptrCast(&no_clip));
-        pass.setVertexBuffer(0, vbuf, 0, blit_size);
-        pass.setScissorRect(0, 0, width, height);
-        pass.draw(6, 1, 0, 0);
+        try drawBlit(device, queue, pass, gpu_ui, blit_bg, width, height);
         pass.end();
     }
 
@@ -3112,4 +3287,39 @@ pub const RendererPlan = struct {
 test "wgpu binding is visible" {
     try std.testing.expectEqualStrings("wgpu", Backend.name);
     _ = wgpu.StringView;
+}
+
+test "vertexRangeAabb maps NDC vertex bounds to device pixels" {
+    const fw: f32 = 512;
+    const fh: f32 = 512;
+    // Quad covering device px 128..256 × 64..192 on a 512×512 frame (corners TL,TR,BL,BR).
+    const verts = [_]ImageVertex{
+        .{ .position = .{ -0.5, 0.75 }, .uv = .{ 0, 0 }, .color = .{ 255, 255, 255, 255 } },
+        .{ .position = .{ 0.0, 0.75 }, .uv = .{ 1, 0 }, .color = .{ 255, 255, 255, 255 } },
+        .{ .position = .{ -0.5, 0.25 }, .uv = .{ 0, 1 }, .color = .{ 255, 255, 255, 255 } },
+        .{ .position = .{ 0.0, 0.25 }, .uv = .{ 1, 1 }, .color = .{ 255, 255, 255, 255 } },
+    };
+    const aabb = vertexRangeAabb(ImageVertex, &verts, fw, fh).?;
+    try std.testing.expectEqual(@as(f32, 128), aabb.x);
+    try std.testing.expectEqual(@as(f32, 64), aabb.y);
+    try std.testing.expectEqual(@as(f32, 128), aabb.width);
+    try std.testing.expectEqual(@as(f32, 128), aabb.height);
+    try std.testing.expect(vertexRangeAabb(ImageVertex, verts[0..0], fw, fh) == null);
+}
+
+test "aabbHitsDamage keeps touching ops and culls distant ones" {
+    const aabb = zg.Rect{ .x = 128, .y = 64, .width = 128, .height = 128 };
+    // Far away on either axis — culled.
+    try std.testing.expect(!aabbHitsDamage(aabb, .{ .x = 300, .y = 64, .width = 50, .height = 50 }, 1.0));
+    try std.testing.expect(!aabbHitsDamage(aabb, .{ .x = 128, .y = 300, .width = 50, .height = 50 }, 1.0));
+    // Overlapping and edge-touching (inside the 1 px slack) — kept.
+    try std.testing.expect(aabbHitsDamage(aabb, .{ .x = 200, .y = 100, .width = 50, .height = 50 }, 1.0));
+    try std.testing.expect(aabbHitsDamage(aabb, .{ .x = 256, .y = 64, .width = 50, .height = 50 }, 1.0));
+    // scale_factor applies to the damage region (logical px), not the device-space AABB.
+    try std.testing.expect(!aabbHitsDamage(aabb, .{ .x = 130, .y = 32, .width = 50, .height = 50 }, 2.0));
+    try std.testing.expect(aabbHitsDamage(aabb, .{ .x = 60, .y = 32, .width = 50, .height = 50 }, 2.0));
+    // Negative origin SHRINKS the effective box (mirrors applyScissor). A shifted box would reach
+    // x=100 here and wrongly keep the op; the true extent is [0, 60) — culled.
+    try std.testing.expect(!aabbHitsDamage(aabb, .{ .x = -40, .y = 64, .width = 100, .height = 50 }, 1.0));
+    try std.testing.expect(aabbHitsDamage(aabb, .{ .x = -40, .y = 64, .width = 170, .height = 50 }, 1.0));
 }

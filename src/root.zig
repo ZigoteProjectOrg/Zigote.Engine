@@ -46,4 +46,5 @@ test {
     _ = scene;
     _ = resources;
     _ = renderer;
+    _ = render;
 }

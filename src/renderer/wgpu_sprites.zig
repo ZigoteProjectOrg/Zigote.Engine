@@ -414,19 +414,35 @@ pub const SpriteSystem = struct {
             pass.release();
         }
 
+        // Camera group (0) is frame-constant per stage; every sprite pipeline shares self.layout,
+        // so it stays bound across pipeline switches. Pipeline and texture groups (1/3) dedupe
+        // across consecutive batches; the params group (2) uses a per-batch dynamic offset, so it
+        // rebinds every draw.
         const cam_bg = if (stage == 0) self.scene_cam_bg.? else self.overlay_cam_bg.?;
         const white_bg = self.white.?.bind_group;
+        pass.setBindGroup(0, cam_bg, 0, null);
+        var cur_pipeline: ?*wgpu.RenderPipeline = null;
+        var cur_tex_bg: ?*wgpu.BindGroup = null;
+        var cur_tex2_bg: ?*wgpu.BindGroup = null;
         var drawn: u32 = 0;
         for (self.batches.items) |b| {
             if (b.stage != stage) continue;
             const pipe = self.getPipeline(device, b.shader, format, b.blend, b.stage) orelse continue;
             const tex = self.textures.get(b.texture) orelse continue;
             const tex2_bg = if (self.textures.get(b.texture2)) |t2| t2.bind_group else white_bg;
-            pass.setPipeline(pipe);
-            pass.setBindGroup(0, cam_bg, 0, null);
-            pass.setBindGroup(1, tex.bind_group, 0, null);
+            if (cur_pipeline != pipe) {
+                pass.setPipeline(pipe);
+                cur_pipeline = pipe;
+            }
+            if (cur_tex_bg != tex.bind_group) {
+                pass.setBindGroup(1, tex.bind_group, 0, null);
+                cur_tex_bg = tex.bind_group;
+            }
             pass.setBindGroup(2, self.params_bg.?, 1, @ptrCast(&b.params_off));
-            pass.setBindGroup(3, tex2_bg, 0, null);
+            if (cur_tex2_bg != tex2_bg) {
+                pass.setBindGroup(3, tex2_bg, 0, null);
+                cur_tex2_bg = tex2_bg;
+            }
             pass.setVertexBuffer(0, self.inst_buf.?, b.inst_byte_off, @as(u64, b.count) * STRIDE_BYTES);
             pass.draw(6, b.count, 0, 0);
             drawn += 1;

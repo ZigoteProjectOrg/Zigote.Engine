@@ -44,6 +44,9 @@ pub fn releaseBuffer(buffer: ?*wgpu.Buffer) void {
     }
 }
 
+/// Returns false — with NO pass state touched — when the effective scissor is empty, so callers
+/// can skip the whole draw (pipeline/bind-group/vertex-buffer setup included) instead of issuing
+/// a draw that rasterizes nothing.
 pub fn applyScissor(
     pass: *wgpu.RenderPassEncoder,
     clip: ?zg.Rect,
@@ -51,7 +54,7 @@ pub fn applyScissor(
     scale_factor: f32,
     frame_width: u32,
     frame_height: u32,
-) void {
+) bool {
     // Effective scissor = the batch clip intersected with the frame damage region (partial repaint).
     // Either may be absent: no batch clip = the whole frame; no damage = full-frame repaint. The
     // intersection of a rect with "everything" is that rect, so this reduces to the plain clip when
@@ -63,13 +66,16 @@ pub fn applyScissor(
 
     if (effective) |c| {
         if (!std.math.isFinite(c.x) or !std.math.isFinite(c.y) or !std.math.isFinite(c.width) or !std.math.isFinite(c.height)) {
-            pass.setScissorRect(0, 0, 0, 0);
-            return;
+            return false;
         }
+        // Clamp a negative origin by SHRINKING the box, never shifting it: a shifted scissor invades
+        // the pixels to the right/below its true extent — on partial repaint that overlaps the
+        // neighbouring damage rect's sweep and alpha-blended ops composite twice in the overlap band
+        // (a visible lighter/darker strip), and on clips it draws content past the clip edge.
         const sx = @max(0.0, c.x * scale_factor);
         const sy = @max(0.0, c.y * scale_factor);
-        const sw = @max(0.0, c.width * scale_factor);
-        const sh = @max(0.0, c.height * scale_factor);
+        const sw = @max(0.0, (c.width + @min(0.0, c.x)) * scale_factor);
+        const sh = @max(0.0, (c.height + @min(0.0, c.y)) * scale_factor);
 
         const x_u32 = @as(u32, @intFromFloat(sx));
         const y_u32 = @as(u32, @intFromFloat(sy));
@@ -84,12 +90,12 @@ pub fn applyScissor(
 
         if (cw > 0 and ch > 0) {
             pass.setScissorRect(cx, cy, cw, ch);
-        } else {
-            pass.setScissorRect(0, 0, 0, 0);
+            return true;
         }
-    } else {
-        pass.setScissorRect(0, 0, frame_width, frame_height);
+        return false;
     }
+    pass.setScissorRect(0, 0, frame_width, frame_height);
+    return true;
 }
 
 pub fn intersectRects(a: zg.Rect, b: zg.Rect) zg.Rect {

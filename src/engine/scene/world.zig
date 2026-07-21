@@ -4,18 +4,6 @@ const entity_mod = @import("entity.zig");
 const components_mod = @import("components.zig");
 const transform_mod = @import("transform.zig");
 const resources_mod = @import("../resources/root.zig");
-const math = @import("../math/root.zig");
-
-pub const InputState = struct {
-    mouse_pos: math.Vec2 = .{},
-    /// Delta since last frame; zeroed at the start of each frame.
-    mouse_delta: math.Vec2 = .{},
-    /// Scroll wheel delta; zeroed at the start of each frame.
-    scroll_y: f32 = 0,
-    left_down: bool = false,
-    right_down: bool = false,
-    middle_down: bool = false,
-};
 
 pub const SceneNode = node_mod.SceneNode;
 pub const Entity = entity_mod.Entity;
@@ -38,9 +26,6 @@ pub const World = struct {
     free_materials: std.ArrayListUnmanaged(components_mod.MaterialHandle) = .{ .items = &.{}, .capacity = 0 },
     active_camera: ?*SceneNode = null,
     active_camera_2d: ?*SceneNode = null,
-    viewport_size: math.Vec2 = .{ .x = 1, .y = 1 },
-    elapsed_seconds: f64 = 0,
-    input: InputState = .{},
 
     pub fn init(allocator: std.mem.Allocator) World {
         return .{ .allocator = allocator };
@@ -241,30 +226,6 @@ pub const World = struct {
         }
     }
 
-    pub fn update(self: *World, delta: f64) void {
-        self.elapsed_seconds += delta;
-        // Clear per-frame input deltas
-        self.input.mouse_delta = .{};
-        self.input.scroll_y = 0;
-        self.updateTransforms();
-    }
-
-    /// Find the first node (depth-first) with the given name.
-    pub fn findByName(self: *World, name: []const u8) ?*SceneNode {
-        for (self.roots.items) |root| {
-            if (searchByName(root, name)) |found| return found;
-        }
-        return null;
-    }
-
-    fn searchByName(node: *SceneNode, name: []const u8) ?*SceneNode {
-        if (std.mem.eql(u8, node.name, name)) return node;
-        for (node.children.items) |child| {
-            if (searchByName(child, name)) |found| return found;
-        }
-        return null;
-    }
-
     /// Collect all nodes that carry a MeshRenderer for a given render layer.
     pub fn collectRenderables(
         self: *const World,
@@ -350,10 +311,7 @@ test "World retains state" {
     // Verify it is retained
     try testing.expectEqual(@as(usize, 1), world.roots.items.len);
     try testing.expectEqualStrings("root", world.roots.items[0].name);
-
-    const found = world.findByName("root");
-    try testing.expect(found != null);
-    try testing.expectEqual(root, found.?);
+    try testing.expectEqual(root, world.roots.items[0]);
 
     var renderables: std.ArrayListUnmanaged(Renderable) = .empty;
     defer renderables.deinit(testing.allocator);

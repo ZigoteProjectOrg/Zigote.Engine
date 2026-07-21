@@ -15,14 +15,6 @@ pub const Transform = struct {
         return p.mul(r).mul(s);
     }
 
-    pub fn lerp(a: Transform, b: Transform, t: f32) Transform {
-        return .{
-            .position = Vec3.lerp(a.position, b.position, t),
-            .rotation = Quat.slerp(a.rotation, b.rotation, t),
-            .scale = Vec3.lerp(a.scale, b.scale, t),
-        };
-    }
-
     pub fn combine(parent: Transform, child: Transform) Transform {
         return .{
             .position = parent.position.add(parent.rotation.rotateVec(child.position.mul(parent.scale))),

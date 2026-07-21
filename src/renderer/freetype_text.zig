@@ -693,7 +693,7 @@ pub const FreeTypeTextRenderer = struct {
     ) !void {
         if (segment.len == 0) return;
         if (is_emoji and self.emoji_families.items.len > 0) {
-            try self.appendEmojiShapedSegment(allocator, segment, self.emoji_families.items[0], pixel_size, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y);
+            try self.appendEmojiShapedSegment(segment, self.emoji_families.items[0], pixel_size, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y);
         } else {
             try self.appendShapedSegment(allocator, vertices, segment, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y, letter_spacing, word_spacing);
         }
@@ -1036,6 +1036,9 @@ pub const FreeTypeTextRenderer = struct {
         var result: std.ArrayList(TextCaret) = .empty;
         defer result.deinit(self.allocator);
 
+        var cluster_scratch: std.ArrayList(u32) = .empty;
+        defer cluster_scratch.deinit(self.allocator);
+
         var line_start: usize = 0;
         var line_index: usize = 0;
         while (line_start <= text.len) {
@@ -1057,6 +1060,15 @@ pub const FreeTypeTextRenderer = struct {
                 const rtl = run.glyphs.len > 1 and
                     run.glyphs[0].cluster > run.glyphs[run.glyphs.len - 1].cluster;
 
+                // One sorted sweep of the run's cluster values replaces a per-group rescan of
+                // every glyph: a group's logical end is the smallest cluster value above its own.
+                cluster_scratch.clearRetainingCapacity();
+                for (run.glyphs) |g| {
+                    if (cluster_scratch.items.len == 0 or cluster_scratch.items[cluster_scratch.items.len - 1] != g.cluster)
+                        try cluster_scratch.append(self.allocator, g.cluster);
+                }
+                std.mem.sort(u32, cluster_scratch.items, {}, std.sort.asc(u32));
+
                 while (glyph_index < run.glyphs.len) {
                     const cluster = run.glyphs[glyph_index].cluster;
                     var group_end = glyph_index;
@@ -1069,11 +1081,10 @@ pub const FreeTypeTextRenderer = struct {
                         advance += glyph.x_advance + spacing;
                     }
 
-                    var logical_end: usize = line.len;
-                    for (run.glyphs) |candidate| {
-                        if (candidate.cluster > cluster)
-                            logical_end = @min(logical_end, @as(usize, candidate.cluster));
-                    }
+                    const logical_end: usize = if (nextClusterAbove(cluster_scratch.items, cluster)) |next|
+                        @min(line.len, @as(usize, next))
+                    else
+                        line.len;
 
                     try result.append(self.allocator, .{
                         .text_offset = @intCast(line_start + if (rtl) logical_end else cluster),
@@ -1665,13 +1676,75 @@ pub const FreeTypeTextRenderer = struct {
         self.dirty_max_y = @max(self.dirty_max_y, y + height);
     }
 
+    /// Shape an emoji segment once and cache it in shaped_run_cache. Own key namespace
+    /// (separator byte 1 vs getShapedRun's 0): emoji segments are shaped against the directly
+    /// looked-up emoji face with HarfBuzz default features, so they must never alias a regular
+    /// run of the same (family, text, size) shaped via resolveFace with explicit features.
+    fn getEmojiShapedRun(
+        self: *FreeTypeTextRenderer,
+        face: ft.FT_Face,
+        text: []const u8,
+        emoji_family: []const u8,
+        pixel_size: u16,
+    ) !*const ShapedRun {
+        var hasher = std.hash.Wyhash.init(@as(u64, pixel_size));
+        hasher.update(emoji_family);
+        hasher.update(&[_]u8{1});
+        hasher.update(text);
+        const key = hasher.final();
+
+        if (self.shaped_run_cache.getPtr(key)) |run| return run;
+
+        // Bound the cache; a wholesale clear is fine — entries rebuild lazily when next drawn.
+        if (self.shaped_run_cache.count() >= 8192) self.clearShapedRunCache();
+
+        const hb_font = hb_ft_font_create_referenced(face) orelse return error.HarfBuzzFontCreateFailed;
+        defer hb.hb_font_destroy(hb_font);
+        hb_ft_font_set_funcs(hb_font);
+
+        const buffer = hb.hb_buffer_create() orelse return error.HarfBuzzBufferCreateFailed;
+        defer hb.hb_buffer_destroy(buffer);
+        hb.hb_buffer_add_utf8(buffer, text.ptr, @intCast(text.len), 0, @intCast(text.len));
+        hb.hb_buffer_guess_segment_properties(buffer);
+        hb.hb_shape(hb_font, buffer, null, 0);
+
+        var info_count: c_uint = 0;
+        const infos_ptr = hb.hb_buffer_get_glyph_infos(buffer, &info_count) orelse return error.HarfBuzzGlyphInfoFailed;
+        var pos_count: c_uint = 0;
+        const pos_ptr = hb.hb_buffer_get_glyph_positions(buffer, &pos_count) orelse return error.HarfBuzzGlyphPositionFailed;
+        const glyph_count: usize = @intCast(@min(info_count, pos_count));
+
+        const shaped = try self.allocator.alloc(ShapedGlyph, glyph_count);
+        errdefer self.allocator.free(shaped);
+        var advance_x: f32 = 0;
+        var advance_y: f32 = 0;
+        for (shaped, infos_ptr[0..glyph_count], pos_ptr[0..glyph_count]) |*out, info, pos| {
+            out.* = .{
+                .glyph_index = info.codepoint,
+                .cluster = info.cluster,
+                .x_offset = hbPositionToPixels(pos.x_offset),
+                .y_offset = hbPositionToPixels(pos.y_offset),
+                .x_advance = hbPositionToPixels(pos.x_advance),
+                .y_advance = hbPositionToPixels(pos.y_advance),
+            };
+            advance_x += out.x_advance;
+            advance_y -= out.y_advance;
+        }
+
+        try self.shaped_run_cache.put(key, .{
+            .glyphs = shaped,
+            .advance_x = advance_x,
+            .advance_y = advance_y,
+        });
+        return self.shaped_run_cache.getPtr(key).?;
+    }
+
     /// Shape and rasterize a run of emoji codepoints using the given emoji font face.
-    /// Color glyphs (FT_PIXEL_MODE_BGRA) are copied to the RGBA color atlas and
-    /// appended to self.pending_color_quads for the caller (wgpu.zig) to flush.
-    /// Monochrome fallback glyphs go directly into `vertices` via the text pipeline.
+    /// Color glyphs (FT_PIXEL_MODE_BGRA) are copied to the RGBA color atlas and appended
+    /// to self.pending_color_quads (renderer-lifetime storage) for wgpu.zig to flush.
+    /// Monochrome/missing glyphs are skipped — no fallback to the text atlas.
     fn appendEmojiShapedSegment(
         self: *FreeTypeTextRenderer,
-        allocator: std.mem.Allocator,
         text: []const u8,
         emoji_family: []const u8,
         pixel_size: u16,
@@ -1690,45 +1763,27 @@ pub const FreeTypeTextRenderer = struct {
 
         if (ft.FT_Set_Pixel_Sizes(face, 0, @intCast(pixel_size)) != 0) return;
 
-        const hb_font = hb_ft_font_create_referenced(face) orelse return;
-        defer hb.hb_font_destroy(hb_font);
-        hb_ft_font_set_funcs(hb_font);
+        const run = self.getEmojiShapedRun(face, text, emoji_family, pixel_size) catch return;
 
-        const buffer = hb.hb_buffer_create() orelse return;
-        defer hb.hb_buffer_destroy(buffer);
-        hb.hb_buffer_add_utf8(buffer, text.ptr, @intCast(text.len), 0, @intCast(text.len));
-        hb.hb_buffer_guess_segment_properties(buffer);
-        hb.hb_shape(hb_font, buffer, null, 0);
+        for (run.glyphs) |shaped| {
+            const key = glyphKey(emoji_family, shaped.glyph_index, pixel_size);
+            var glyph_opt: ?Glyph = self.color_glyphs.get(key);
 
-        var info_count: c_uint = 0;
-        const infos_ptr = hb.hb_buffer_get_glyph_infos(buffer, &info_count) orelse return;
-        var pos_count: c_uint = 0;
-        const pos_ptr = hb.hb_buffer_get_glyph_positions(buffer, &pos_count) orelse return;
+            if (glyph_opt == null) {
+                const load_flags = ft.FT_LOAD_COLOR | ft.FT_LOAD_RENDER;
+                if (ft.FT_Load_Glyph(face, @intCast(shaped.glyph_index), load_flags) != 0) {
+                    pen_x.* += shaped.x_advance;
+                    continue;
+                }
 
-        const glyph_count: usize = @intCast(@min(info_count, pos_count));
-        const infos = infos_ptr[0..glyph_count];
-        const positions = pos_ptr[0..glyph_count];
+                const slot = face.*.glyph;
+                const bitmap = slot.*.bitmap;
+                const bw: u32 = bitmap.width;
+                const bh: u32 = bitmap.rows;
 
-        for (infos, positions) |info, pos| {
-            const load_flags = ft.FT_LOAD_COLOR | ft.FT_LOAD_RENDER;
-            if (ft.FT_Load_Glyph(face, @intCast(info.codepoint), load_flags) != 0) {
-                pen_x.* += hbPositionToPixels(pos.x_advance);
-                continue;
-            }
-
-            const slot = face.*.glyph;
-            const bitmap = slot.*.bitmap;
-            const bw: u32 = bitmap.width;
-            const bh: u32 = bitmap.rows;
-
-            if (bitmap.pixel_mode == ft.FT_PIXEL_MODE_BGRA) {
-                // Color emoji glyph — cache in color atlas
-                const key = glyphKey(emoji_family, info.codepoint, pixel_size);
-                var glyph_opt: ?Glyph = self.color_glyphs.get(key);
-
-                if (glyph_opt == null and bw > 0 and bh > 0) {
+                if (bitmap.pixel_mode == ft.FT_PIXEL_MODE_BGRA and bw > 0 and bh > 0) {
                     // First color glyph materializes the atlas; on failure glyph_opt stays null,
-                    // no quad is appended, and the next bake retries.
+                    // no quad is appended, nothing is cached, and the next bake retries.
                     if (self.ensureColorAtlas()) |_| {
                         if (self.reserveColorAtlas(bw, bh)) |atlas_pos| {
                             self.copyColorBitmapToAtlas(bitmap, atlas_pos.x, atlas_pos.y) catch {};
@@ -1745,31 +1800,43 @@ pub const FreeTypeTextRenderer = struct {
                             glyph_opt = g;
                         } else |_| {}
                     } else |_| {}
-                }
-
-                if (glyph_opt) |glyph| {
-                    if (glyph.width > 0 and glyph.height > 0) {
-                        const x0 = pen_x.* + hbPositionToPixels(pos.x_offset) + glyph.bearing_x;
-                        const y0 = baseline_y.* - hbPositionToPixels(pos.y_offset) - glyph.bearing_y;
-                        const cw_f = @as(f32, @floatFromInt(ColorAtlas.width));
-                        const ch_f = @as(f32, @floatFromInt(ColorAtlas.height));
-                        self.pending_color_quads.append(allocator, .{
-                            .x = x0 - offset_x,
-                            .y = y0 - offset_y,
-                            .w = @as(f32, @floatFromInt(glyph.width)),
-                            .h = @as(f32, @floatFromInt(glyph.height)),
-                            .u0 = @as(f32, @floatFromInt(glyph.atlas_x)) / cw_f,
-                            .v0 = @as(f32, @floatFromInt(glyph.atlas_y)) / ch_f,
-                            .u1 = @as(f32, @floatFromInt(glyph.atlas_x + glyph.width)) / cw_f,
-                            .v1 = @as(f32, @floatFromInt(glyph.atlas_y + glyph.height)) / ch_f,
-                        }) catch {};
-                    }
+                } else {
+                    // Monochrome or zero-sized emoji: never drawn (no fallback to the text atlas to
+                    // avoid font confusion). Cache an empty marker so the glyph — a PNG decode for
+                    // CBDT faces — isn't re-loaded every frame.
+                    self.color_glyphs.put(key, .{
+                        .atlas_x = 0,
+                        .atlas_y = 0,
+                        .width = 0,
+                        .height = 0,
+                        .bearing_x = 0,
+                        .bearing_y = 0,
+                        .advance_x = 0,
+                    }) catch {};
                 }
             }
-            // Monochrome/missing emoji: skip (don't fall back to text atlas to avoid font confusion)
 
-            pen_x.* += hbPositionToPixels(pos.x_advance);
-            baseline_y.* -= hbPositionToPixels(pos.y_advance);
+            if (glyph_opt) |glyph| {
+                if (glyph.width > 0 and glyph.height > 0) {
+                    const x0 = pen_x.* + shaped.x_offset + glyph.bearing_x;
+                    const y0 = baseline_y.* - shaped.y_offset - glyph.bearing_y;
+                    const cw_f = @as(f32, @floatFromInt(ColorAtlas.width));
+                    const ch_f = @as(f32, @floatFromInt(ColorAtlas.height));
+                    self.pending_color_quads.append(self.allocator, .{
+                        .x = x0 - offset_x,
+                        .y = y0 - offset_y,
+                        .w = @as(f32, @floatFromInt(glyph.width)),
+                        .h = @as(f32, @floatFromInt(glyph.height)),
+                        .u0 = @as(f32, @floatFromInt(glyph.atlas_x)) / cw_f,
+                        .v0 = @as(f32, @floatFromInt(glyph.atlas_y)) / ch_f,
+                        .u1 = @as(f32, @floatFromInt(glyph.atlas_x + glyph.width)) / cw_f,
+                        .v1 = @as(f32, @floatFromInt(glyph.atlas_y + glyph.height)) / ch_f,
+                    }) catch {};
+                }
+            }
+
+            pen_x.* += shaped.x_advance;
+            baseline_y.* -= shaped.y_advance;
         }
         _ = frame_width;
         _ = frame_height;
@@ -1906,6 +1973,17 @@ fn fontPixelSize(size: f32) u16 {
     return @intFromFloat(@round(std.math.clamp(size, 1.0, 65535.0)));
 }
 
+/// First value in `sorted` strictly greater than `cluster`, or null if none.
+fn nextClusterAbove(sorted: []const u32, cluster: u32) ?u32 {
+    var lo: usize = 0;
+    var hi: usize = sorted.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (sorted[mid] <= cluster) lo = mid + 1 else hi = mid;
+    }
+    return if (lo < sorted.len) sorted[lo] else null;
+}
+
 fn clusterIsSpace(text: []const u8, cluster: u32) bool {
     const start: usize = @intCast(cluster);
     if (start >= text.len) return false;
@@ -1957,6 +2035,8 @@ fn appendGlyphQuad(
     const x1 = (x1_px - offset_x) / frame_width * 2.0 - 1.0;
     const y1 = 1.0 - (y1_px - offset_y) / frame_height * 2.0;
 
+    // Corners TL,TR,BL,BR — the order wgpu.zig's shared quad index pattern (ensureQuadIndexBuffer)
+    // expands into the two triangles the old 6-vertex emission produced.
     try vertices.appendSlice(allocator, &.{
         .{
             .position = .{ x0, y0 },
@@ -1973,20 +2053,9 @@ fn appendGlyphQuad(
             .uv = .{ uv0_x, uv1_y },
             .color = color,
         },
-
-        .{
-            .position = .{ x1, y0 },
-            .uv = .{ uv1_x, uv0_y },
-            .color = color,
-        },
         .{
             .position = .{ x1, y1 },
             .uv = .{ uv1_x, uv1_y },
-            .color = color,
-        },
-        .{
-            .position = .{ x0, y1 },
-            .uv = .{ uv0_x, uv1_y },
             .color = color,
         },
     });
@@ -2281,4 +2350,14 @@ test "coverage atlas tracks a minimal upload region" {
     try std.testing.expectEqual(@as(u32, 20), dirty.y);
     try std.testing.expectEqual(@as(u32, 6), dirty.width);
     try std.testing.expectEqual(@as(u32, 7), dirty.height);
+}
+
+test "nextClusterAbove returns the smallest cluster strictly greater" {
+    const sorted = [_]u32{ 0, 3, 3, 7, 12 };
+    try std.testing.expectEqual(@as(?u32, 3), nextClusterAbove(&sorted, 0));
+    try std.testing.expectEqual(@as(?u32, 3), nextClusterAbove(&sorted, 1));
+    try std.testing.expectEqual(@as(?u32, 7), nextClusterAbove(&sorted, 3));
+    try std.testing.expectEqual(@as(?u32, 12), nextClusterAbove(&sorted, 7));
+    try std.testing.expectEqual(@as(?u32, null), nextClusterAbove(&sorted, 12));
+    try std.testing.expectEqual(@as(?u32, null), nextClusterAbove(&[_]u32{}, 5));
 }

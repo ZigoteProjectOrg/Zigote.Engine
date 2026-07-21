@@ -438,6 +438,28 @@ pub fn setBodyRotationQuat(state: *PhysicsState, body_id: u32, qx: f32, qy: f32,
     joltc.JPC_BodyInterface_SetRotation(iface, jid, &q, 0); // JPC_ACTIVATION_ACTIVATE
 }
 
+/// Batched transform read for the per-tick body→node sync: writes 7 f32 per body
+/// (pos.xyz + quat.xyzw) into `out_xforms`, which must hold `count * 7` floats.
+pub fn getBodyTransforms(state: *PhysicsState, ids: [*]const u32, count: u32, out_xforms: [*]f32) void {
+    const iface = joltc.JPC_PhysicsSystem_GetBodyInterface(state.physics_system) orelse return;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const jid = joltc.JPC_BodyID{ .id = ids[i] };
+        var pos: [3]f32 = .{ 0, 0, 0 };
+        var quat: [4]f32 = .{ 0, 0, 0, 1 };
+        joltc.JPC_BodyInterface_GetPosition(iface, jid, &pos);
+        joltc.JPC_BodyInterface_GetRotation(iface, jid, &quat);
+        const base = i * 7;
+        out_xforms[base + 0] = pos[0];
+        out_xforms[base + 1] = pos[1];
+        out_xforms[base + 2] = pos[2];
+        out_xforms[base + 3] = quat[0];
+        out_xforms[base + 4] = quat[1];
+        out_xforms[base + 5] = quat[2];
+        out_xforms[base + 6] = quat[3];
+    }
+}
+
 // A body filter that rejects a single body id (so e.g. a vehicle's wheel ray skips its own chassis).
 const BodyFilterImpl = extern struct {
     vtable: ?*const joltc.JPC_BodyFilterVTable,

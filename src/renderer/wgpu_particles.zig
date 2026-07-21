@@ -187,6 +187,15 @@ pub const ParticleSystem = struct {
         if (!self.compute_ready) self.ensureCompute(device);
         if (self.failed or !self.compute_ready) return;
 
+        // One compute pass for all emitters (opened lazily so frames without a dispatching
+        // emitter record nothing); each dispatch touches only its own emitter's buffers. The
+        // counter-reset queue writes execute before the encoder's submission regardless.
+        var pass: ?*wgpu.ComputePassEncoder = null;
+        defer if (pass) |p| {
+            p.end();
+            p.release();
+        };
+
         var it = self.gpu_batches.valueIterator();
         while (it.next()) |b| {
             if (!b.dispatch or b.state == null) continue;
@@ -198,12 +207,12 @@ pub const ParticleSystem = struct {
             const zero: u32 = 0;
             queue.writeBuffer(b.counter.?, 0, @ptrCast(&zero), 4); // reset spawn budget
 
-            const pass = encoder.beginComputePass(null) orelse continue;
-            pass.setPipeline(self.compute_pipe.?);
-            pass.setBindGroup(0, b.bg.?, 0, null);
-            pass.dispatchWorkgroups((b.capacity + 63) / 64, 1, 1);
-            pass.end();
-            pass.release();
+            if (pass == null) {
+                pass = encoder.beginComputePass(null) orelse return;
+                pass.?.setPipeline(self.compute_pipe.?);
+            }
+            pass.?.setBindGroup(0, b.bg.?, 0, null);
+            pass.?.dispatchWorkgroups((b.capacity + 63) / 64, 1, 1);
             b.dispatch = false;
         }
     }

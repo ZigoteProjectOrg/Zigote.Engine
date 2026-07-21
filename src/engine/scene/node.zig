@@ -37,6 +37,13 @@ pub const SceneNode = struct {
     }
 
     pub fn addComponent(self: *SceneNode, allocator: std.mem.Allocator, component: Component) !void {
+        // One component per tag: getComponent returns the FIRST match, so a duplicate tag would be
+        // silently shadowed (and its assets leaked). Callers must update the existing entry instead.
+        if (std.debug.runtime_safety) {
+            for (self.components.items) |c| {
+                std.debug.assert(std.meta.activeTag(c) != std.meta.activeTag(component));
+            }
+        }
         try self.components.append(allocator, component);
     }
 
@@ -85,14 +92,5 @@ pub const SceneNode = struct {
 
     pub fn normalMatrix(self: *const SceneNode) math.Mat4 {
         return self.normal_matrix;
-    }
-
-    /// Depth-first iteration. Calls `cb` for every active descendant including self.
-    pub fn walk(self: *SceneNode, ctx: anytype, cb: fn (@TypeOf(ctx), *SceneNode) void) void {
-        if (!self.active) return;
-        cb(ctx, self);
-        for (self.children.items) |child| {
-            child.walk(ctx, cb);
-        }
     }
 };

@@ -66,24 +66,4 @@ pub const Material = struct {
     pub fn flat(color: Vec4) Material {
         return .{ .base_color_factor = color };
     }
-
-    pub fn fromPixels(
-        allocator: std.mem.Allocator,
-        name: []const u8,
-        pixels: []const u8,
-        width: u32,
-        height: u32,
-    ) !Material {
-        if (width == 0 or height == 0) return error.InvalidImageSize;
-        const expected_len: usize = @as(usize, width) * @as(usize, height) * 4;
-        if (pixels.len != expected_len) return error.InvalidImagePixels;
-
-        return .{
-            .name = name,
-            .base_color_factor = .{ .x = 1, .y = 1, .z = 1, .w = 1 },
-            .base_color_pixels = try allocator.dupe(u8, pixels),
-            .base_color_width = width,
-            .base_color_height = height,
-        };
-    }
 };
