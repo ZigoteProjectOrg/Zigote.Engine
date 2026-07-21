@@ -1,5 +1,18 @@
 const std = @import("std");
 
+/// Cross-compiling to macOS (`-Dtarget=x86_64-macos --sysroot "$(xcrun --show-sdk-path)"`) does not
+/// derive the SDK search paths from the sysroot the way a native build auto-detects them, so every
+/// module that compiles against or links Apple frameworks needs them added explicitly. No-op when
+/// no `--sysroot` is passed (native builds).
+fn addMacosSdkPaths(b: *std.Build, mod: *std.Build.Module) void {
+    const sysroot = b.sysroot orelse return;
+    mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) });
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
+    // The linker prepends the sysroot to -L paths itself, so this one stays sysroot-relative
+    // (an absolute path would be doubled into <sdk>/<sdk>/usr/lib).
+    mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+}
+
 fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     const os = target.result.os.tag;
     const arch = target.result.cpu.arch;
@@ -47,6 +60,7 @@ fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resol
             mod.linkFramework("CoreFoundation", .{});
             mod.linkSystemLibrary("objc", .{});
             mod.linkSystemLibrary("iconv", .{});
+            addMacosSdkPaths(b, mod);
         },
         .linux => {
             // libc (link_libc) already covers pthread/dl/m; Rust's panic/unwind path needs unwind.
@@ -158,6 +172,7 @@ fn buildMiniaudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             lib.root_module.linkFramework("CoreFoundation", .{});
             lib.root_module.linkFramework("AudioUnit", .{});
             lib.root_module.linkFramework("AudioToolbox", .{});
+            addMacosSdkPaths(b, lib.root_module);
         },
         .linux => {
             lib.root_module.linkSystemLibrary("pthread", .{});
@@ -469,6 +484,7 @@ pub fn build(b: *std.Build) void {
             .flags = &.{"-fno-objc-arc"},
         });
         ffi_mod.linkFramework("Cocoa", .{});
+        addMacosSdkPaths(b, ffi_mod);
         // Metal/QuartzCore/Foundation arrive transitively via SDL + wgpu-native (wgpu renders
         // through Metal on macOS) — no explicit links needed now the native Metal backend is gone.
     }

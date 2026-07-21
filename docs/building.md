@@ -98,6 +98,16 @@ zig build shared-lib -Dtarget=x86_64-linux-gnu  -Doptimize=ReleaseFast -Denable3
 zig build shared-lib -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast -Denable3d=false
 ```
 
+**macOS→macOS cross-arch needs the SDK as an explicit sysroot.** Zig only auto-detects the macOS
+SDK for *native* targets; for `-Dtarget=x86_64-macos` from an arm64 Mac, SDL refuses to configure and
+the framework links (miniaudio, Cocoa, wgpu's Metal deps) can't resolve without it:
+
+```bash
+zig build shared-lib -Dtarget=x86_64-macos -Doptimize=ReleaseFast --sysroot "$(xcrun --show-sdk-path)"
+```
+
+(`build/Zigote.Native.targets` passes this automatically when publishing a foreign-arch macOS RID.)
+
 Native cross-compilation of all five targets from macOS is verified; the Windows/Linux libraries are
 built but not yet run on their own hardware. **NativeAOT cross-OS is unsupported by .NET** — the C#
 game-export flow only produces AOT binaries for host-OS RIDs and falls back to a self-contained JIT
