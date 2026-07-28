@@ -730,7 +730,9 @@ pub const FreeTypeTextRenderer = struct {
 
         const hb_font = hb_ft_font_create_referenced(face) orelse return error.HarfBuzzFontCreateFailed;
         defer hb.hb_font_destroy(hb_font);
-        hb_ft_font_set_funcs(hb_font);
+        // NOTE: no hb_ft_font_set_funcs here — create_referenced already installed the FT funcs
+        // on THIS face; the extra call cloned a second face from the font blob per shaped run
+        // (an FT_New_Memory_Face each time) for identical unhinted metrics.
 
         var shaped_list: std.ArrayList(ShapedGlyph) = .empty;
         defer shaped_list.deinit(self.allocator);
@@ -849,8 +851,13 @@ pub const FreeTypeTextRenderer = struct {
         for (run.glyphs) |shaped| {
             const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, pixel_size);
             if (glyph.width > 0 and glyph.height > 0) {
-                const x0 = pen_x.* + shaped.x_offset + glyph.bearing_x;
-                const y0 = baseline_y.* - shaped.y_offset - glyph.bearing_y;
+                // Snap the quad origin to the physical pixel grid: each glyph exists as ONE
+                // integer-origin raster in the atlas, so a fractional origin makes the linear
+                // sampler resample every texel — uniform blur, worst at 1x DPI. The pen itself
+                // stays fractional (shaping accuracy); only the emitted quad is snapped, giving
+                // a 1:1 texel↔pixel mapping.
+                const x0 = @round(pen_x.* + shaped.x_offset + glyph.bearing_x);
+                const y0 = @round(baseline_y.* - shaped.y_offset - glyph.bearing_y);
                 const x1 = x0 + @as(f32, @floatFromInt(glyph.width));
                 const y1 = y0 + @as(f32, @floatFromInt(glyph.height));
                 const atlas_w: f32 = @floatFromInt(self.atlas_width);
@@ -1276,10 +1283,15 @@ pub const FreeTypeTextRenderer = struct {
         if (entry.generation != self.atlas_generation or @abs(entry.raster_scale - raster_scale) > 0.001)
             try self.reshapeLayoutEntry(allocator, entry, raster_scale);
         for (entry.glyphs) |g| {
-            const x0 = (g.x0 + draw_x) * scale_factor;
-            const y0 = (g.y0 + draw_y) * scale_factor;
-            const x1 = (g.x1 + draw_x) * scale_factor;
-            const y1 = (g.y1 + draw_y) * scale_factor;
+            // Same pixel-grid snap as the immediate path: the origin lands on a physical pixel
+            // and the quad keeps the raster's exact integer size ((x1-x0)·scale is the glyph
+            // bitmap width up to float fuzz), restoring the 1:1 texel↔pixel mapping that the
+            // linear atlas sampler needs to stay crisp — the cached-layout path is what the
+            // code editor and every CachedText widget render through.
+            const x0 = @round((g.x0 + draw_x) * scale_factor);
+            const y0 = @round((g.y0 + draw_y) * scale_factor);
+            const x1 = x0 + @round((g.x1 - g.x0) * scale_factor);
+            const y1 = y0 + @round((g.y1 - g.y0) * scale_factor);
             try appendGlyphQuad(
                 allocator,
                 vertices,
@@ -1700,7 +1712,9 @@ pub const FreeTypeTextRenderer = struct {
 
         const hb_font = hb_ft_font_create_referenced(face) orelse return error.HarfBuzzFontCreateFailed;
         defer hb.hb_font_destroy(hb_font);
-        hb_ft_font_set_funcs(hb_font);
+        // NOTE: no hb_ft_font_set_funcs here — create_referenced already installed the FT funcs
+        // on THIS face; the extra call cloned a second face from the font blob per shaped run
+        // (an FT_New_Memory_Face each time) for identical unhinted metrics.
 
         const buffer = hb.hb_buffer_create() orelse return error.HarfBuzzBufferCreateFailed;
         defer hb.hb_buffer_destroy(buffer);
@@ -2108,9 +2122,12 @@ const text_shader_source =
     \\
     \\@fragment
     \\fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    \\  // FreeType coverage is rasterized at the output's physical pixel size. Linear filtering keeps
-    \\  // fractional glyph placement smooth without re-thresholding or softening small text.
-    \\  let coverage = textureSample(text_tex, text_sampler, in.uv).r;
+    \\  // Coverage gamma (~1/1.2): the swapchain is sRGB, so straight alpha blending happens in
+    \\  // non-linear space and eats the antialiased edges — small light-on-dark text reads thin
+    \\  // and washy at 1x DPI. Boosting coverage slightly compensates without fattening solid
+    \\  // pixels (pow leaves 0 and 1 fixed). Quad origins are pixel-snapped at emit, so the
+    \\  // linear filter only ever smooths genuine sub-glyph detail, not placement error.
+    \\  let coverage = pow(textureSample(text_tex, text_sampler, in.uv).r, 1.0 / 1.2);
     \\  return vec4<f32>(in.color.rgb, in.color.a * coverage * rounded_clip_coverage(in.position.xy));
     \\}
 ;
