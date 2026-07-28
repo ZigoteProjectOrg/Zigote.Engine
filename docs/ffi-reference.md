@@ -1,9 +1,9 @@
 # FFI / ABI reference
 
-Zigote.Engine exposes a flat C ABI: **226 `zigote_*` functions**, all `callconv(.c)`, defined across
+Zigote.Engine exposes a flat C ABI: **230 `zigote_*` functions**, all `callconv(.c)`, defined across
 `src/ffi/` — **162** in [`ffi/root.zig`](../src/ffi/root.zig) (which also holds the audio and physics
-wrappers), **55** in [`ffi/ecs.zig`](../src/ffi/ecs.zig), **5** in
-[`ffi/dialogs.zig`](../src/ffi/dialogs.zig) and **4** in [`ffi/chrome.zig`](../src/ffi/chrome.zig).
+wrappers), **55** in [`ffi/ecs.zig`](../src/ffi/ecs.zig), **6** in
+[`ffi/dialogs.zig`](../src/ffi/dialogs.zig) and **7** in [`ffi/chrome.zig`](../src/ffi/chrome.zig).
 The C# frontend consumes them via
 `[LibraryImport]` P/Invoke; the bindings are **generated** from these `export fn`s — don't hand-write
 them, regenerate.
@@ -150,8 +150,8 @@ source. `ffi/root.zig` for everything except ECS, which is in `ffi/ecs.zig`.
 | **Audio** (24) | `zigote_audio_beep[_3d]`, `zigote_audio_sound_create_file`, `zigote_audio_sound_create_tone`, `zigote_audio_sound_{play,stop,set_position,set_attenuation,…}`, `zigote_audio_group_*`, `zigote_audio_set_listener`, `zigote_audio_set_master_volume`, `zigote_audio_update` | miniaudio `ma_engine`. Wrappers in `root.zig` over `ffi/audio.zig`. |
 | **Physics** (23) | `zigote_physics_init`, `zigote_physics_step`, `zigote_physics_create_body`/`add_body`, `zigote_physics_add_force[_at_point]`, `zigote_physics_add_torque`, `zigote_physics_{get,set}_*velocity`, `zigote_physics_raycast_closest`, `zigote_physics_set_gravity` | Jolt. Wrappers in `root.zig` over `ffi/physics.zig`; a no-op `physics_stub.zig` when `-Dphysics3d=false`. |
 | **ECS** (55, in `ffi/ecs.zig`) | `zigote_ecs_world_create`, `zigote_ecs_entity_create[_named]`, `zigote_ecs_{add,remove,set,get,has}`, `zigote_ecs_query_create`/`iter`/`next`, `zigote_ecs_system_create`, `zigote_ecs_observer_create`, `zigote_ecs_set_parent`, `zigote_ecs_new_prefab`, `zigote_ecs_builtin_*` | flecs. Whole module compiled out when `-Decs=false`. |
-| **File dialogs** (5, in `ffi/dialogs.zig`) | `zigote_file_dialog_begin`, `zigote_file_dialog_status`, `zigote_file_dialog_result`, `zigote_file_dialog_consume`, `zigote_file_dialog_supported` | Native OS open/save/folder dialogs (custom NSOpenPanel/NSSavePanel backend on macOS, SDL3 dialogs elsewhere), poll-based (one request outstanding). Main-thread only; C# façade is `Zigote.Core.Engine.FileDialog`. Design: [file-dialogs.md](file-dialogs.md). |
-| **Window chrome** (4, in `ffi/chrome.zig`) | `zigote_window_chrome_set`, `zigote_window_chrome_drag_rects`, `zigote_window_chrome_minimize`, `zigote_window_chrome_toggle_maximize` | In-app titlebars: macOS unified (full-size content + native traffic lights, `macos_window_chrome.m`) and borderless CSD (Adwaita-style buttons); drag rects + resize edges via SDL hit-test. Takes SDL window ids. Main-thread only. |
+| **File dialogs** (6, in `ffi/dialogs.zig`) | `zigote_file_dialog_begin`, `zigote_file_dialog_status`, `zigote_file_dialog_result`, `zigote_file_dialog_consume`, `zigote_file_dialog_supported`, `zigote_file_trash` | Native OS open/save/folder dialogs (custom NSOpenPanel/NSSavePanel backend on macOS, SDL3 dialogs elsewhere), poll-based (one request outstanding). `file_trash` = macOS NSFileManager trash (managed code covers Windows/Linux). Main-thread only; C# façade is `Zigote.Core.Engine.FileDialog`. Design: [file-dialogs.md](file-dialogs.md). |
+| **Window chrome** (7, in `ffi/chrome.zig`) | `zigote_window_chrome_set`, `zigote_window_chrome_drag_rects`, `zigote_window_chrome_set_hit_provider`, `zigote_window_chrome_minimize`, `zigote_window_chrome_toggle_maximize`, `zigote_window_chrome_sync`, `zigote_window_chrome_probe` | In-app titlebars: macOS unified (full-size content + native traffic lights, `macos_window_chrome.m`) and borderless CSD (Adwaita-style buttons); drag decided by the app-side hit provider (static rects fallback) + synthesized resize edges via SDL hit-test; `sync` re-asserts unified chrome after fullscreen/zoom drops it. Takes SDL window ids. Main-thread only. |
 
 ## Adding a binding
 

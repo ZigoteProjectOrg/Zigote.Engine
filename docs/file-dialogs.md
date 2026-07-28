@@ -223,20 +223,29 @@ titlebar** — the content view extends under a transparent titlebar and the *na
 close/minimize/zoom traffic lights float over the app-drawn strip
 (`src/platform/macos_window_chrome.m`); GNOME-family desktops get **Adwaita-style client-side
 decorations** — a borderless window with in-app minimize/maximize/close circle buttons
-(`WindowTitleBar` widget, `Zigote.UI`); Windows and KDE keep system decorations. Mechanics:
-`ApplyWindowChrome` styles the OS window, wraps the App's root in a `WindowChromeHost` (titlebar
-strip above the root — the Root setter re-wraps transparently on every assignment), cascades to
-all open secondary windows, and new windows inherit it at `CreateWindow`. The chrome close
-button routes through `App.RequestClose()` so it behaves exactly like the OS ✕ (CloseRequested →
-destroy). The native side is `src/ffi/chrome.zig` (`zigote_window_chrome_*`): per-window style,
-app-declared draggable titlebar rects turned into OS window drags via an SDL hit-test (which
-also synthesizes 8px resize edges for borderless windows), minimize/toggle-maximize for the CSD
-buttons, and a `_probe` diagnostic readback. The `WindowTitleBar` re-declares its drag rects on
-every layout, so resizes stay correct; its drag region excludes the traffic-light inset / the
-button cluster. The editor applies the mode at boot and exposes it under **Settings → Developer
-→ "Window chrome"** (`EditorConfig.WindowChromeMode`: auto/system/mac/adwaita, applied live to
-all open windows) so any look can be forced on any OS for testing — `mac` is refused off-macOS
-at the native layer and degrades to System per window.
+(`WindowTitleBar` widget, `Zigote.UI`); Windows and KDE keep system decorations.
+
+Presentation per style: **MacUnified hides the titlebar entirely** — no in-app strip either; the
+content extends to the top of the window and the app's own top row (the editor toolbar, the
+browser's navigation bar) IS the titlebar band, leading with `App.TitleBarLeftInset` (78px) for
+the native traffic lights (`App.TitleBarTopInset` for windows with no toolbar, e.g. Settings).
+**AdwaitaCsd composes a headerbar** (`WindowChromeHost` wraps the root — the Root setter
+re-wraps transparently on every assignment) because something must carry the CSD buttons.
+`ApplyWindowChrome` cascades to open secondary windows and new windows inherit at
+`CreateWindow`; the CSD close button routes through `App.RequestClose()` so it behaves exactly
+like the OS ✕ (CloseRequested → destroy).
+
+**Dragging is decided by the app, per pointer position**: the SDL hit-test calls back into the
+managed drag arbiter (`zigote_window_chrome_set_hit_provider` → `App.DragHitTest`), which walks
+the widget under the point — interactive widgets (focusable, or overriding pointer virtuals;
+reflection cached per type) stay clickable, everything else in the titlebar band drags the
+window. Static drag rects remain as the no-provider fallback, and borderless windows get
+synthesized 8px resize edges. macOS drops the unified styleMask bit on fullscreen/zoom
+round-trips — `zigote_window_chrome_sync`, called from resize events, re-asserts it (no-op when
+intact or fullscreen). The editor applies the mode at boot and exposes it under **Settings →
+Developer → "Window chrome"** (`EditorConfig.WindowChromeMode`: auto/system/mac/adwaita, applied
+live to all open windows) so any look can be forced on any OS for testing — `mac` is refused
+off-macOS at the native layer and degrades to System per window.
 
 Feature set (deliberately matched to what OS dialogs offer): places sidebar (pinned location,
 Home/Desktop/Documents/Downloads, per-OS volumes — `FileBrowserPlaces`), back/forward/up history,
@@ -247,6 +256,12 @@ change), hidden-files toggle, New Folder, Cmd/Ctrl- and Shift-multi-select, a sa
 prefill + overwrite confirmation, and full keyboard control (arrows/Home/End/PageUp/PageDown,
 Enter activates, Backspace goes up, Space toggles, type-ahead jumps by prefix, Esc cancels). The
 row list is clip-virtualized (the TreeView direct-paint pattern), so huge directories stay cheap.
+Names sort naturally (`file2` before `file10`). Beyond parity: a **right-click context menu**
+(Open, Rename…, Move to Trash — recoverable via `FileOperations.MoveToTrash`: NSFileManager /
+shell recycle / XDG Trash per OS — Copy Path, Reveal in Finder/Explorer, New Folder) and a
+**preview pane** for a single selected image, decoded through the engine's own loader
+(`FileBrowserPreview`) — so it previews `.hdr`/`.tga` engine content OS dialogs can't, with
+dimensions/size/date metadata.
 The view pipeline lives in the widget-free `FileBrowserModel` (filters → sort → visible +
 selection + history), unit-tested in `FileBrowserModelTests`.
 

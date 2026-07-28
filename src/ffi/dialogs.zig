@@ -68,6 +68,19 @@ var result: ?[:0]u8 = null;
 /// Main-thread only.
 var request: ?Request = null;
 
+extern fn zigote_mac_trash_item(path: [*c]const u8) i32;
+
+/// Move a file/folder to the OS trash (recoverable, unlike deletion). Native only on macOS
+/// (NSFileManager); returns false elsewhere — the managed layer covers Windows (shell) and
+/// Linux (XDG Trash) itself.
+export fn zigote_file_trash(path: [*c]const u8) bool {
+    if (is_macos) {
+        if (path == null or path[0] == 0) return false;
+        return zigote_mac_trash_item(path) != 0;
+    }
+    return false;
+}
+
 /// True when this build has a native dialog backend. Compile-time only: a Linux desktop without
 /// a portal or zenity can't be detected up front — it surfaces as a done-error completion.
 export fn zigote_file_dialog_supported() bool {

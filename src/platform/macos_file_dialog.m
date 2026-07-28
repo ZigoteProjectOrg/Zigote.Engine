@@ -136,6 +136,18 @@ static NSView *MakeFormatAccessory(NSSavePanel *panel, NSArray<NSString *> *name
     return container;
 }
 
+// Move a file/folder to the user's Trash (NSFileManager — undoable via Finder, unlike unlink).
+// Returns 1 on success. Backs the cross-platform zigote_file_trash export.
+ZEXPORT int32_t zigote_mac_trash_item(const char *pathC) {
+    if (pathC == NULL || pathC[0] == '\0') return 0;
+    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:pathC]];
+    NSError *error = nil;
+    BOOL ok = [[NSFileManager defaultManager] trashItemAtURL:url
+                                           resultingItemURL:nil
+                                                      error:&error];
+    return ok ? 1 : 0;
+}
+
 // kind: 0 = open file, 1 = pick folder, 2 = save file. Strings are optional (NULL/empty);
 // they are copied into Cocoa objects before returning. nswindowPtr: NSWindow* to sheet onto
 // (NULL = key window, standalone panel when there is none). Returns 0 when the panel is up.

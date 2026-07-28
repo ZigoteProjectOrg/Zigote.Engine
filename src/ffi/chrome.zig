@@ -17,6 +17,22 @@ const is_macos = builtin.os.tag == .macos;
 extern fn zigote_macwin_set_unified(nswindow: ?*anyopaque, enabled: i32) void;
 extern fn zigote_macwin_get_unified(nswindow: ?*anyopaque) i32;
 
+/// Re-assert a window's chrome if the OS dropped it. macOS clears the FullSizeContentView
+/// styleMask bit on fullscreen/zoom round-trips, silently reverting a unified titlebar to
+/// system chrome — the app calls this on window-resize events (cheap: a probe, and a no-op
+/// while fullscreen or when the chrome is intact).
+export fn zigote_window_chrome_sync(window_id: u32) void {
+    if (is_macos) {
+        const entry = entryFor(window_id, false) orelse return;
+        if (entry.style != STYLE_MAC_UNIFIED) return;
+        const win = sdlWindow(window_id) orelse return;
+        if (sdl3.c.SDL_GetWindowFlags(win) & sdl3.c.SDL_WINDOW_FULLSCREEN != 0) return;
+        const ns = nsWindowOf(win) orelse return;
+        if (zigote_macwin_get_unified(ns) == 1) return;
+        _ = zigote_window_chrome_set(window_id, STYLE_MAC_UNIFIED);
+    }
+}
+
 /// Diagnostic: report the actually-applied chrome for a window. -3 = not macOS, -2 = unknown
 /// SDL window id, -1 = no NSWindow behind it, 0 = system chrome, 1 = unified titlebar live.
 export fn zigote_window_chrome_probe(window_id: u32) i32 {
@@ -34,6 +50,20 @@ const STYLE_BORDERLESS_CSD: u32 = 2;
 
 const max_windows = 8;
 const max_rects = 4;
+
+/// App-side drag arbiter: given a window id + window-relative logical point, returns 1 =
+/// draggable titlebar area, 0 = normal content, -1 = no opinion (fall through to the static
+/// drag rects). Lets a titlebar host arbitrary widgets: buttons stay clickable, gaps drag.
+const HitTestProvider = *const fn (window_id: u32, x: f32, y: f32) callconv(.c) i32;
+
+var hit_provider: ?HitTestProvider = null;
+
+/// Install (or clear, with null) the app-side drag arbiter consulted by the SDL hit-test.
+export fn zigote_window_chrome_set_hit_provider(
+    provider: ?*const fn (window_id: u32, x: f32, y: f32) callconv(.c) i32,
+) void {
+    hit_provider = provider;
+}
 
 const Entry = struct {
     window_id: u32 = 0, // 0 = free slot
@@ -188,6 +218,16 @@ fn hitTest(
         if (b) return sdl3.c.SDL_HITTEST_RESIZE_BOTTOM;
         if (l) return sdl3.c.SDL_HITTEST_RESIZE_LEFT;
         if (r) return sdl3.c.SDL_HITTEST_RESIZE_RIGHT;
+    }
+
+    // Dynamic arbiter first — it sees the live widget tree (buttons vs gaps); the static rects
+    // remain the fallback for hosts that never install one.
+    if (hit_provider) |provider| {
+        switch (provider(id, x, y)) {
+            1 => return sdl3.c.SDL_HITTEST_DRAGGABLE,
+            0 => return sdl3.c.SDL_HITTEST_NORMAL,
+            else => {},
+        }
     }
 
     for (0..entry.rect_count) |i| {
