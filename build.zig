@@ -483,6 +483,19 @@ pub fn build(b: *std.Build) void {
             .file = b.path("src/platform/macos_drag.m"),
             .flags = &.{"-fno-objc-arc"},
         });
+        // Native macOS file dialogs (NSOpenPanel/NSSavePanel) — the full-featured backend
+        // src/ffi/dialogs.zig dispatches to on macOS (UniformTypeIdentifiers arrives weak-linked
+        // via SDL; UTType use is @available-guarded).
+        ffi_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_file_dialog.m"),
+            .flags = &.{"-fno-objc-arc"},
+        });
+        // macOS unified titlebar (full-size content view + native traffic lights) — backs
+        // src/ffi/chrome.zig's mac_unified style.
+        ffi_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_window_chrome.m"),
+            .flags = &.{"-fno-objc-arc"},
+        });
         ffi_mod.linkFramework("Cocoa", .{});
         addMacosSdkPaths(b, ffi_mod);
         // Metal/QuartzCore/Foundation arrive transitively via SDL + wgpu-native (wgpu renders

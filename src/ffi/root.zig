@@ -35,6 +35,16 @@ const audio_ffi = @import("audio.zig");
 comptime {
     if (@import("build_options").enable_ecs) _ = @import("ecs.zig");
 }
+// The `zigote_file_dialog_*` C-ABI exports (native OS open/save/folder dialogs over SDL3's
+// dialog subsystem) live in dialogs.zig — force-reference for the same reason as ecs.zig above.
+comptime {
+    _ = @import("dialogs.zig");
+}
+// The `zigote_window_chrome_*` exports (unified/CSD titlebars, drag regions, minimize/maximize)
+// live in chrome.zig.
+comptime {
+    _ = @import("chrome.zig");
+}
 const build_options = @import("build_options");
 /// Gates 3D-game-only native subsystems (Assimp model import). Lean 2D-only builds
 /// (`-Denable3d=false`) compile these out and don't link Assimp — see build.zig.
