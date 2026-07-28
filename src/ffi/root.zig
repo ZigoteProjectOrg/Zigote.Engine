@@ -667,7 +667,9 @@ fn createNativeSurface(instance: *wgpu.Instance, window: sdl3.video.Window, meta
     const props = sdl3.c.SDL_GetWindowProperties(window.value);
 
     switch (@import("builtin").os.tag) {
-        .macos => {
+        // iOS shares the macOS path: SDL's MetalView wraps a CAMetalLayer on both (the comment
+        // at the MetalView creation site notes it exists exactly for macOS/iOS).
+        .macos, .ios => {
             var src = wgpu.SurfaceSourceMetalLayer{ .layer = metal_layer orelse return error.MetalLayerUnavailable };
             return instance.createSurface(&.{ .next_in_chain = @ptrCast(&src.chain), .label = label }) orelse error.WgpuSurfaceUnavailable;
         },
@@ -678,6 +680,15 @@ fn createNativeSurface(instance: *wgpu.Instance, window: sdl3.video.Window, meta
             return instance.createSurface(&.{ .next_in_chain = @ptrCast(&src.chain), .label = label }) orelse error.WgpuSurfaceUnavailable;
         },
         .linux => {
+            // Android rides the linux OS tag (aarch64-linux-android): the surface wraps SDL's
+            // ANativeWindow. NOTE: on Android that window handle dies on every backgrounding —
+            // surface recreation on EVT_APP_FOREGROUND is part of the mobile bring-up.
+            if (comptime @import("builtin").abi.isAndroid()) {
+                const a_window = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, null) orelse return error.NoNativeWindowHandle;
+                var src = wgpu.SurfaceSourceAndroidNativeWindow{ .window = a_window };
+                return instance.createSurface(&.{ .next_in_chain = @ptrCast(&src.chain), .label = label }) orelse error.WgpuSurfaceUnavailable;
+            }
+
             // Wayland first, then X11 — SDL exposes whichever driver is active.
             if (sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, null)) |wl_display| {
                 const wl_surface = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, null) orelse return error.NoNativeWindowHandle;
@@ -745,10 +756,10 @@ fn zigote_init_impl(
     );
     errdefer window.deinit();
 
-    // The SDL Metal view / CAMetalLayer exists only on macOS/iOS — it backs the macOS wgpu
-    // surface (wgpu renders through Metal under the hood). On Windows/Linux the wgpu surface comes
+    // The SDL Metal view / CAMetalLayer exists only on macOS/iOS — it backs the wgpu surface on
+    // both (wgpu renders through Metal under the hood). On Windows/Linux the wgpu surface comes
     // from the HWND/X11/Wayland handle instead (see createNativeSurface), so we don't create one there.
-    const metal_view: ?sdl3.MetalView = if (@import("builtin").os.tag == .macos)
+    const metal_view: ?sdl3.MetalView = if (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .ios)
         (sdl3.MetalView.init(window) orelse return error.MetalViewUnavailable)
     else
         null;
@@ -779,9 +790,12 @@ fn zigote_init_impl(
     // a whole second adapter chain. Same policy as the SDL gpu_driver=none hint above.
     var instance_extras = wgpu.InstanceExtras{
         .backends = switch (@import("builtin").os.tag) {
-            .macos => wgpu.InstanceBackends.metal,
+            // iOS is Metal-only — falling into the generic arm would ask for Vulkan/GL and
+            // find neither.
+            .macos, .ios => wgpu.InstanceBackends.metal,
             .windows => wgpu.InstanceBackends.dx12 | wgpu.InstanceBackends.vulkan,
-            // Linux (and anything else): Vulkan with the GL fallback wgpu would resolve anyway.
+            // Linux and Android (and anything else): Vulkan with the GL(ES) fallback wgpu
+            // would resolve anyway.
             else => wgpu.InstanceBackends.vulkan | wgpu.InstanceBackends.gl,
         },
     };
@@ -3477,7 +3491,7 @@ fn createSecondaryWindowImpl(
     );
     errdefer window.deinit();
 
-    const metal_view: ?sdl3.MetalView = if (@import("builtin").os.tag == .macos)
+    const metal_view: ?sdl3.MetalView = if (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .ios)
         (sdl3.MetalView.init(window) orelse return error.MetalViewUnavailable)
     else
         null;

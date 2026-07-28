@@ -27,10 +27,24 @@ fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resol
             .x86_64 => "wgpu_windows_x86_64",
             else => std.debug.panic("wgpu-native: unsupported Windows arch {s}", .{@tagName(arch)}),
         },
-        .linux => switch (arch) {
+        // Android is not its own OS tag — it is the `android` ABI of linux (aarch64-linux-android).
+        .linux => if (target.result.abi.isAndroid()) switch (arch) {
+            .aarch64 => "wgpu_android_aarch64",
+            .x86_64 => "wgpu_android_x86_64", // emulator
+            else => std.debug.panic("wgpu-native: unsupported Android arch {s}", .{@tagName(arch)}),
+        } else switch (arch) {
             .x86_64 => "wgpu_linux_x86_64",
             .aarch64 => "wgpu_linux_aarch64",
             else => std.debug.panic("wgpu-native: unsupported Linux arch {s}", .{@tagName(arch)}),
+        },
+        // Device and simulator are distinct platforms with distinct archives; the simulator is
+        // selected by the `simulator` target ABI (aarch64-ios-simulator).
+        .ios => switch (arch) {
+            .aarch64 => if (target.result.abi == .simulator)
+                "wgpu_ios_aarch64_simulator"
+            else
+                "wgpu_ios_aarch64",
+            else => std.debug.panic("wgpu-native: unsupported iOS arch {s}", .{@tagName(arch)}),
         },
         else => std.debug.panic("wgpu-native: unsupported OS {s}", .{@tagName(os)}),
     };
@@ -62,13 +76,27 @@ fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resol
             mod.linkSystemLibrary("iconv", .{});
             addMacosSdkPaths(b, mod);
         },
-        .linux => {
+        .linux => if (target.result.abi.isAndroid()) {
+            // Vulkan is dlopen'd at runtime; the archive's hard deps are the NDK log and
+            // android (ANativeWindow) libs, resolved against the NDK sysroot.
+            mod.linkSystemLibrary("log", .{});
+            mod.linkSystemLibrary("android", .{});
+        } else {
             // libc (link_libc) already covers pthread/dl/m; Rust's panic/unwind path needs unwind.
             mod.linkSystemLibrary("unwind", .{});
         },
         .windows => {
             // Using wgpu_native.dll's import lib (above), so the DLL resolves its own d3d12/dxgi/
             // WinRT/CRT dependencies at load — nothing extra to link statically here.
+        },
+        .ios => {
+            // Same Metal stack as macOS, resolved against the iOS SDK sysroot. No iconv — the
+            // iOS archive doesn't pull it.
+            mod.linkFramework("Metal", .{});
+            mod.linkFramework("QuartzCore", .{});
+            mod.linkFramework("Foundation", .{});
+            mod.linkFramework("CoreFoundation", .{});
+            mod.linkSystemLibrary("objc", .{});
         },
         else => {},
     }
