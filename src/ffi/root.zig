@@ -230,6 +230,34 @@ pub const EVT_DROP_FILE: u8 = 14;
 pub const EVT_DROP_TEXT: u8 = 15;
 pub const EVT_DROP_POSITION: u8 = 16;
 pub const EVT_DROP_COMPLETE: u8 = 17;
+// Touchscreen fingers. Only DIRECT touch devices (screens) arrive here — trackpads are
+// indirect and stay cursor/wheel input, and SDL's mouse/pen simulated-touch ids are filtered
+// (pen contact is treated as a direct touch: a stylus drives the UI like a finger). x/y carry
+// the window-local position in window coordinates (the same space as mouse events; SDL reports
+// fingers normalized 0..1, de-normalized here against the event's window). key_scancode
+// carries the finger slot — a compact id (0..MAX_TOUCH_FINGERS-1) stable while that finger
+// stays down, so C# can key per-pointer state on it. scroll_x carries pressure (0..1).
+// TOUCH_CANCEL ends a sequence with no logical "up": OS gesture takeover, palm rejection, or
+// the app being backgrounded — the UI must abandon (not commit) whatever the finger was doing.
+pub const EVT_TOUCH_DOWN: u8 = 18;
+pub const EVT_TOUCH_MOVE: u8 = 19;
+pub const EVT_TOUCH_UP: u8 = 20;
+pub const EVT_TOUCH_CANCEL: u8 = 21;
+// Mobile app lifecycle. BACKGROUND is SDL's will_enter_background — it arrives BEFORE the OS
+// suspends the app, and on iOS the app must stop presenting to the drawable before returning
+// to the pump (rendering while backgrounded is a watchdog kill). FOREGROUND is
+// did_enter_foreground: safe to render again. LOW_MEMORY asks the app to drop caches.
+// SDL's `terminating` already maps to EVT_QUIT. Note for the eventual iOS port: SDL delivers
+// these synchronously via event watches at the transition moment (the poll loop may never run
+// again before suspension), so the resize-style event watch must flush/stop GPU work directly;
+// the polled copies here remain correct for Android and desktop.
+pub const EVT_APP_BACKGROUND: u8 = 22;
+pub const EVT_APP_FOREGROUND: u8 = 23;
+pub const EVT_LOW_MEMORY: u8 = 24;
+
+/// Simultaneous touch fingers tracked; fingers beyond this are ignored at down and never
+/// surface. 10 matches the practical ceiling of phone/tablet digitizers.
+pub const MAX_TOUCH_FINGERS = 10;
 
 /// Modifier bits in ZgEvent.modifiers.
 pub const MOD_SHIFT: u8 = 1;
@@ -472,6 +500,14 @@ const EngineState = struct {
     // here and serve zigote_get_scroll_orientation from it.
     scroll_orientation: u8 = 0,
 
+    // Active touch fingers: slot index (reported to C# in key_scancode) → the SDL
+    // (touch device id, finger id) pair it stands for. SDL finger ids are u64s that may be
+    // pointers or indices depending on the platform; C# gets the compact slot instead so its
+    // per-pointer maps stay small and the 44-byte ZgEvent needs no u64 field. A slot lives
+    // from finger_down to finger_up/finger_canceled; fingers arriving with all slots taken
+    // are dropped entirely (their motion/up never surfaces either, since lookups miss).
+    touch_fingers: [MAX_TOUCH_FINGERS]?TouchFingerSlot = @splat(null),
+
     // miniaudio software synth for UI/game sound. Opened lazily on first use (see ensureAudio); a
     // machine with no audio device leaves this null and the engine runs silently.
     audio: ?*audio_ffi.AudioState = null,
@@ -681,6 +717,14 @@ fn zigote_init_impl(
     // SDL_CreateGPUDevice reads this hint and now fails fast instead of selecting Metal/Vulkan.
     // Inert today (nothing calls SDL_GPU), so failure to set it is harmless.
     sdl3.hints.set(.gpu_driver, "none") catch {};
+
+    // Touch is first-class input: fingers surface as EVT_TOUCH_* and the C# side routes them
+    // as pointers. Without pinning these off, SDL would ALSO synthesize mouse events from
+    // touches (its default), so every tap would fire twice — once as touch, once as a fake
+    // click. The reverse simulation (mouse → fake touch) stays off too: real mice must keep
+    // hover/right-click semantics instead of masquerading as fingers.
+    sdl3.hints.set(.touch_mouse_events, "0") catch {};
+    sdl3.hints.set(.mouse_touch_events, "0") catch {};
 
     // Only the subsystems window creation needs. The gamepad subsystem is initialized lazily on
     // first query (see ensureGamepad) — NOT here — because a connected controller can make SDL's
@@ -1206,6 +1250,55 @@ export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
                 buf[count] = zge;
                 count += 1;
             },
+            .finger_down => |tf| {
+                if (touchIsDirect(tf.id)) {
+                    if (touchSlotAcquire(state, tf.id.value, tf.finger_id.value)) |slot| {
+                        fillTouchEvent(state, &zge, tf, EVT_TOUCH_DOWN, slot);
+                        buf[count] = zge;
+                        count += 1;
+                    }
+                }
+            },
+            .finger_motion => |tf| {
+                // No touchIsDirect re-check: only direct fingers ever get a slot, so the
+                // lookup itself is the filter (and skips SDL's per-event device-type query).
+                if (touchSlotFind(state, tf.id.value, tf.finger_id.value)) |slot| {
+                    fillTouchEvent(state, &zge, tf, EVT_TOUCH_MOVE, slot);
+                    buf[count] = zge;
+                    count += 1;
+                }
+            },
+            .finger_up => |tf| {
+                if (touchSlotFind(state, tf.id.value, tf.finger_id.value)) |slot| {
+                    fillTouchEvent(state, &zge, tf, EVT_TOUCH_UP, slot);
+                    state.touch_fingers[slot] = null;
+                    buf[count] = zge;
+                    count += 1;
+                }
+            },
+            .finger_canceled => |tf| {
+                if (touchSlotFind(state, tf.id.value, tf.finger_id.value)) |slot| {
+                    fillTouchEvent(state, &zge, tf, EVT_TOUCH_CANCEL, slot);
+                    state.touch_fingers[slot] = null;
+                    buf[count] = zge;
+                    count += 1;
+                }
+            },
+            .will_enter_background => {
+                zge.kind = EVT_APP_BACKGROUND;
+                buf[count] = zge;
+                count += 1;
+            },
+            .did_enter_foreground => {
+                zge.kind = EVT_APP_FOREGROUND;
+                buf[count] = zge;
+                count += 1;
+            },
+            .low_memory => {
+                zge.kind = EVT_LOW_MEMORY;
+                buf[count] = zge;
+                count += 1;
+            },
             else => {},
         }
     }
@@ -1239,6 +1332,69 @@ fn systemThemeValue() u8 {
         .light => 1,
         .dark => 2,
     };
+}
+
+/// One entry of EngineState.touch_fingers: the SDL identity of the finger occupying a slot.
+const TouchFingerSlot = struct { touch_id: u64, finger_id: u64 };
+
+/// Whether finger events from this SDL touch device should become EVT_TOUCH_* pointer input.
+/// Direct devices (touchscreens) qualify; trackpads (indirect) must not — their resting
+/// fingers would ghost-tap the UI, and they already speak through cursor + wheel events.
+/// SDL's simulated-touch ids: mouse-simulated touches are skipped (the real mouse events
+/// cover them; letting both through would double-fire), pen-simulated ones pass (a stylus
+/// on a tablet screen is direct input with no other event channel here).
+fn touchIsDirect(id: sdl3.touch.Id) bool {
+    if (id.value == sdl3.touch.Id.mouse.value) return false;
+    if (id.value == sdl3.touch.Id.pen.value) return true;
+    return (id.getType() orelse return false) == .direct;
+}
+
+/// Slot already assigned to this finger, if any.
+fn touchSlotFind(state: *EngineState, touch_id: u64, finger_id: u64) ?u32 {
+    for (state.touch_fingers, 0..) |maybe, i| {
+        const slot = maybe orelse continue;
+        if (slot.touch_id == touch_id and slot.finger_id == finger_id) return @intCast(i);
+    }
+    return null;
+}
+
+/// Assign the lowest free slot to a new finger; null when all MAX_TOUCH_FINGERS are down.
+fn touchSlotAcquire(state: *EngineState, touch_id: u64, finger_id: u64) ?u32 {
+    for (&state.touch_fingers, 0..) |*maybe, i| {
+        if (maybe.* == null) {
+            maybe.* = .{ .touch_id = touch_id, .finger_id = finger_id };
+            return @intCast(i);
+        }
+    }
+    return null;
+}
+
+/// Size in window coordinates of the window a finger event targets — the factor that turns
+/// SDL's normalized 0..1 finger position into the same space mouse events use. Falls back to
+/// the main window when the event carries no/an unknown window id (matches how window_id 0 is
+/// treated as "main" across the FFI).
+fn touchWindowPointSize(state: *EngineState, sdl_id: u32) [2]f32 {
+    if (sdl_id != 0) {
+        if (sdl3.video.Window.fromId(sdl_id)) |win| {
+            const w, const h = win.getSize() catch return .{ 0, 0 };
+            return .{ @floatFromInt(w), @floatFromInt(h) };
+        } else |_| {}
+    }
+    const w, const h = state.window.getSize() catch return .{ 0, 0 };
+    return .{ @floatFromInt(w), @floatFromInt(h) };
+}
+
+/// Fill the shared fields of an EVT_TOUCH_* event from an SDL finger event. `slot` was
+/// resolved by the caller (acquire on down, find on move/up/cancel) so this stays a pure
+/// formatter.
+fn fillTouchEvent(state: *EngineState, zge: *ZgEvent, tf: anytype, kind: u8, slot: u32) void {
+    const size = touchWindowPointSize(state, tf.window_id orelse 0);
+    zge.kind = kind;
+    zge.x = tf.x * size[0];
+    zge.y = tf.y * size[1];
+    zge.key_scancode = slot;
+    zge.scroll_x = tf.pressure;
+    zge.window_id = tf.window_id orelse 0;
 }
 
 // ── Lazy 3D renderer ──────────────────────────────────────────────────────────
@@ -3590,6 +3746,24 @@ export fn zigote_get_system_theme(handle: u64) u32 {
 export fn zigote_get_scroll_orientation(handle: u64) u32 {
     const state = stateFromHandle(handle) orelse return 0;
     return state.scroll_orientation;
+}
+
+/// Main-window safe-area insets in window coordinates, written as [left, top, right, bottom]
+/// into `insets` (4 floats). The safe area is the region free of OS obstructions — notches,
+/// rounded corners, home indicators, TV overscan. All-zero on desktop and on any query
+/// failure, so callers can apply the insets unconditionally.
+export fn zigote_get_safe_area(handle: u64, insets: [*]f32) void {
+    insets[0] = 0;
+    insets[1] = 0;
+    insets[2] = 0;
+    insets[3] = 0;
+    const state = stateFromHandle(handle) orelse return;
+    const safe = state.window.getSafeArea() catch return;
+    const w, const h = state.window.getSize() catch return;
+    insets[0] = @floatFromInt(safe.x);
+    insets[1] = @floatFromInt(safe.y);
+    insets[2] = @max(0, @as(f32, @floatFromInt(@as(i64, @intCast(w)) - (safe.x + safe.w))));
+    insets[3] = @max(0, @as(f32, @floatFromInt(@as(i64, @intCast(h)) - (safe.y + safe.h))));
 }
 
 /// Drop all text caches (shaped runs, glyph atlases) on the main window AND every secondary
