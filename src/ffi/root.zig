@@ -1028,6 +1028,37 @@ fn zigote_init_impl(
     return state;
 }
 
+/// Rebuild the main window's wgpu surface against the CURRENT ANativeWindow.
+///
+/// Android destroys the window's native surface when the app is backgrounded and hands back a
+/// NEW one on resume, so the surface wgpu holds is dead from that moment: presenting to it draws
+/// nothing (the symptom is a black screen with only freshly-damaged regions visible). No SDL
+/// event reports the loss on this path — RENDER_DEVICE_RESET is GL-only — so the
+/// background/foreground transition IS the protocol. SDL only resumes the app thread once the
+/// new surface is ready, so the window property already points at it by the time this runs.
+fn recreateAndroidSurface(state: *EngineState) void {
+    const new_surface = createNativeSurface(state.instance, state.window, null) catch |err| {
+        std.log.err("android: surface recreation failed: {}", .{err});
+        return;
+    };
+
+    state.surface.unconfigure();
+    state.surface.release();
+    state.surface = new_surface;
+
+    // Rotation while backgrounded changes the drawable size, so re-read it rather than reusing
+    // the stale extent; format/present/alpha stay as chosen at boot.
+    if (state.window.getSizeInPixels()) |size| {
+        state.wgpu_config.width = @max(1, @as(u32, @intCast(size[0])));
+        state.wgpu_config.height = @max(1, @as(u32, @intCast(size[1])));
+    } else |_| {}
+    state.surface.configure(&state.wgpu_config);
+
+    // The backend holds the surface BY VALUE; without this it keeps presenting to the dead one.
+    state.wgpu_backend.surface = state.surface;
+    std.log.info("android: surface recreated ({d}x{d})", .{ state.wgpu_config.width, state.wgpu_config.height });
+}
+
 /// Reconfigure the wgpu surface for whichever window changed size. The main window owns the engine's
 /// wgpu_config; a secondary window owns its own. Shared by the poll path and the live-resize watch.
 fn reconfigureSurfaceForWindow(state: *EngineState, win_id: u32, new_w: u32, new_h: u32) void {
@@ -1311,7 +1342,27 @@ export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
                 }
             },
             .window_restored => |w| {
+                // Android does NOT send will_enter_background/did_enter_foreground: the app
+                // lifecycle arrives as window minimize/restore. This is also where the surface
+                // must be rebuilt — the ANativeWindow the app was rendering into died when it
+                // was backgrounded, and presenting to it silently draws nothing (the symptom is
+                // a black screen showing only whatever repainted since).
+                if (comptime @import("builtin").abi.isAndroid()) {
+                    recreateAndroidSurface(state);
+                    zge.kind = EVT_APP_FOREGROUND;
+                    buf[count] = zge;
+                    count += 1;
+                    if (count >= capacity) break;
+                    zge = std.mem.zeroes(ZgEvent);
+                }
                 if (emitWindowRefresh(state, w.id, &zge)) {
+                    buf[count] = zge;
+                    count += 1;
+                }
+            },
+            .window_minimized => {
+                if (comptime @import("builtin").abi.isAndroid()) {
+                    zge.kind = EVT_APP_BACKGROUND;
                     buf[count] = zge;
                     count += 1;
                 }
@@ -1426,6 +1477,9 @@ export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
                 count += 1;
             },
             .did_enter_foreground => {
+                // Must happen before the host resumes rendering: it is still holding the surface
+                // that died when the app was backgrounded.
+                if (comptime @import("builtin").abi.isAndroid()) recreateAndroidSurface(state);
                 zge.kind = EVT_APP_FOREGROUND;
                 buf[count] = zge;
                 count += 1;
@@ -1517,26 +1571,30 @@ fn touchSlotAcquire(state: *EngineState, touch_id: u64, finger_id: u64) ?u32 {
     return null;
 }
 
-/// Size in window coordinates of the window a finger event targets — the factor that turns
-/// SDL's normalized 0..1 finger position into the same space mouse events use. Falls back to
-/// the main window when the event carries no/an unknown window id (matches how window_id 0 is
-/// treated as "main" across the FFI).
-fn touchWindowPointSize(state: *EngineState, sdl_id: u32) [2]f32 {
-    if (sdl_id != 0) {
-        if (sdl3.video.Window.fromId(sdl_id)) |win| {
-            const w, const h = win.getSize() catch return .{ 0, 0 };
-            return .{ @floatFromInt(w), @floatFromInt(h) };
-        } else |_| {}
-    }
-    const w, const h = state.window.getSize() catch return .{ 0, 0 };
-    return .{ @floatFromInt(w), @floatFromInt(h) };
+/// LOGICAL size of the window a finger event targets — the factor that turns SDL's normalized
+/// 0..1 finger position into the coordinate space the UI lays out in.
+///
+/// Derived as pixels / display scale rather than from SDL's window size, because those two agree
+/// only on desktop. On Android SDL reports the window size in PIXELS (1080 wide) while the
+/// display scale is ~2.75, so using the window size directly put every touch ~2.75x too far out
+/// and nothing was hittable. macOS/iOS are unaffected: there the window size already equals
+/// pixels / scale.
+fn touchWindowLogicalSize(state: *EngineState, sdl_id: u32) [2]f32 {
+    const win = if (sdl_id != 0)
+        sdl3.video.Window.fromId(sdl_id) catch state.window
+    else
+        state.window;
+    const w, const h = win.getSizeInPixels() catch return .{ 0, 0 };
+    const scale = win.getDisplayScale() catch 1.0;
+    const safe_scale = if (scale > 0.0) scale else 1.0;
+    return .{ @as(f32, @floatFromInt(w)) / safe_scale, @as(f32, @floatFromInt(h)) / safe_scale };
 }
 
 /// Fill the shared fields of an EVT_TOUCH_* event from an SDL finger event. `slot` was
 /// resolved by the caller (acquire on down, find on move/up/cancel) so this stays a pure
 /// formatter.
 fn fillTouchEvent(state: *EngineState, zge: *ZgEvent, tf: anytype, kind: u8, slot: u32) void {
-    const size = touchWindowPointSize(state, tf.window_id orelse 0);
+    const size = touchWindowLogicalSize(state, tf.window_id orelse 0);
     zge.kind = kind;
     zge.x = tf.x * size[0];
     zge.y = tf.y * size[1];
