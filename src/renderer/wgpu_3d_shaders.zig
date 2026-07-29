@@ -1,7 +1,44 @@
 //! WGSL shader sources for the 3D renderer (wgpu_3d.zig).
 //! Extracted verbatim so the renderer module stays focused on pipeline wiring.
 
-pub const mesh_shader_source = @embedFile("shaders/mesh_shader_source.wgsl");
+const std = @import("std");
+const builtin = @import("builtin");
+
+/// The iOS simulator's paravirtual Metal GPU has no cube-array textures; they are WebGPU-core
+/// on every other adapter we target (real iOS devices included), and wgpu-native's C API exposes
+/// no downlevel-capability query — so this is a comptime target check, not a runtime probe.
+/// When false, the point-shadow cube ARRAY degrades to a single depth cube (see wgpu_3d.zig's
+/// MAX_POINT_SHADOWS): point light 0 keeps its shadow, further point lights cast none.
+pub const cube_array_supported = !(builtin.os.tag == .ios and builtin.abi == .simulator);
+
+pub const mesh_shader_source = if (cube_array_supported)
+    @embedFile("shaders/mesh_shader_source.wgsl")
+else
+    comptimeReplace(
+        comptimeReplace(
+            @embedFile("shaders/mesh_shader_source.wgsl"),
+            "texture_depth_cube_array",
+            "texture_depth_cube",
+        ),
+        // The one sample site: drop the array-layer argument (always 0 with a single cube).
+        "normalize(nd + o), pidx, ",
+        "normalize(nd + o), ",
+    );
+
+fn comptimeReplace(
+    comptime src: []const u8,
+    comptime needle: []const u8,
+    comptime replacement: []const u8,
+) []const u8 {
+    comptime {
+        @setEvalBranchQuota(100_000_000);
+        const n = std.mem.replacementSize(u8, src, needle, replacement);
+        var buf: [n]u8 = undefined;
+        _ = std.mem.replace(u8, src, needle, replacement, &buf);
+        const final = buf;
+        return &final;
+    }
+}
 
 // VFX particle billboards. Vertex-pulled camera-facing quads (additive / premultiplied-alpha),
 // drawn in the geometry pass after the transparent meshes. See wgpu_particles.zig.

@@ -904,7 +904,14 @@ fn zigote_init_impl(
     } else {
         std.log.warn("zigote: adapter lacks the immediates feature; UI pipeline may fail", .{});
     }
-    const msaa2_supported = adapter.hasFeature(.texture_adapter_specific_format_features);
+    // The feature only unlocks ADAPTER-SPECIFIC sample counts — it does not promise 2×. Both the
+    // iOS simulator's paravirtual GPU and the Android emulator's Vulkan-over-host-Metal grant it
+    // yet support only [1,4] for rgba16float (pipeline creation then hard-fails), and there is no
+    // per-format count query in the C API — so mobile targets stay at the spec-guaranteed 4×.
+    const mobile_target = @import("builtin").os.tag == .ios or
+        @import("builtin").abi.isAndroid();
+    const msaa2_supported = adapter.hasFeature(.texture_adapter_specific_format_features) and
+        !mobile_target;
     if (msaa2_supported) {
         wanted_features[feature_count] = .texture_adapter_specific_format_features;
         feature_count += 1;
@@ -924,6 +931,19 @@ fn zigote_init_impl(
     // The device was created with the feature granted → 2× rgba16float MSAA is legal. Lower the
     // 3D renderer's sample count before any Gpu3d is created (its pipelines + targets read this).
     if (msaa2_supported) wgpu_renderer.wgpu_3d.MSAA_SAMPLES = 2;
+
+    // Software rasterizer (the Android emulator's Vulkan is SwiftShader on every host): the
+    // full-size environment-IBL bake runs long enough on a CPU that the emulator's fence
+    // watchdog kills the device ("Parent device is lost" on the next acquire). Shrink it to
+    // something a CPU finishes comfortably; real GPUs keep full quality.
+    var adapter_info = std.mem.zeroes(wgpu.AdapterInfo);
+    if (adapter.getInfo(&adapter_info) == .success) {
+        defer adapter_info.freeMembers();
+        if (adapter_info.adapter_type == .cpu) {
+            wgpu_renderer.wgpu_3d.ENV_SIZE = 64;
+            std.log.warn("zigote: software GPU adapter detected — reducing environment bake to 64px", .{});
+        }
+    }
 
     const queue = device.getQueue() orelse return error.WgpuQueueUnavailable;
     errdefer queue.release();
@@ -1195,9 +1215,53 @@ export fn zigote_android_main(argc: i32, argv: usize) i32 {
     // binding generator can map (it does not know c_int or [*c][*c]u8).
     _ = argc;
     _ = argv;
+    installAndroidStderrForwarder();
     const cb = android_main orelse return 1;
     cb();
     return 0;
+}
+
+/// Rust panics inside wgpu-native print their explanation to raw STDERR, which Android discards —
+/// leaving a SIGABRT with no message as the only trace of a fatal GPU error. Redirect fds 1/2
+/// into a pipe drained onto logcat so that text survives. Android-only, installed once before
+/// the app body runs.
+fn installAndroidStderrForwarder() void {
+    if (comptime !@import("builtin").abi.isAndroid()) return;
+    const linux = std.os.linux;
+    var fds: [2]i32 = undefined;
+    if (linux.pipe2(&fds, .{}) != 0) return;
+    _ = linux.dup2(fds[1], 1);
+    _ = linux.dup2(fds[1], 2);
+    _ = linux.close(fds[1]);
+    const t = std.Thread.spawn(.{}, drainStderrPipe, .{fds[0]}) catch return;
+    t.detach();
+}
+
+fn drainStderrPipe(fd: i32) void {
+    const linux = std.os.linux;
+    var buf: [4096]u8 = undefined;
+    var line: [4096]u8 = undefined;
+    var len: usize = 0;
+    while (true) {
+        const n = linux.read(fd, &buf, buf.len);
+        if (n == 0 or n > buf.len) return; // 0 = EOF; > len = negative errno bit-cast
+        for (buf[0..n]) |ch| {
+            if (ch == '\n' or len == line.len - 1) {
+                if (len > 0) {
+                    line[len] = 0;
+                    android_log.write(.err, line[0..len :0].ptr);
+                }
+                len = 0;
+                if (ch != '\n') {
+                    line[len] = ch;
+                    len += 1;
+                }
+            } else {
+                line[len] = ch;
+                len += 1;
+            }
+        }
+    }
 }
 
 /// Base pointer of the out-of-band UTF-8 text buffer filled by the most recent zigote_poll_events.
@@ -1714,6 +1778,14 @@ export fn zigote_input_gamepad_button(handle: u64, button: u8) u32 {
 fn ensureAudio(state: *EngineState) ?*audio_ffi.AudioState {
     if (state.audio) |a| return a;
     if (state.audio_scanned) return null;
+    // The iOS SIMULATOR's AudioToolbox abort()s the process on an XPC timeout inside
+    // AURemoteIO::Initialize (audio-daemon wedge; deterministic on current runtimes, and an
+    // abort cannot be caught) — a silent simulator beats a dead app. Devices keep audio.
+    if (comptime @import("builtin").os.tag == .ios and @import("builtin").abi == .simulator) {
+        state.audio_scanned = true;
+        std.log.warn("zigote: audio disabled on the iOS simulator (AudioToolbox XPC abort)", .{});
+        return null;
+    }
     // Latch before touching SDL so a one-time failure never retries every call.
     state.audio_scanned = true;
     std.log.info("zigote: initializing audio subsystem…", .{});
