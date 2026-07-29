@@ -112,6 +112,10 @@ fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resol
             // android (ANativeWindow) libs, resolved against the NDK sysroot.
             mod.linkSystemLibrary("log", .{});
             mod.linkSystemLibrary("android", .{});
+            // bionic keeps dlopen in its own library; SDL's loadso path needs it. Linked here
+            // rather than on the SDL static archive, where zig would record it as an archive
+            // member and the final link would warn about it.
+            mod.linkSystemLibrary("dl", .{});
             // The wgpu archive's Rust panic path references the _Unwind_* set, which bionic does
             // not export; zig satisfies it from its bundled LLVM libunwind.
             mod.linkSystemLibrary("unwind", .{});
@@ -649,7 +653,9 @@ pub fn build(b: *std.Build) void {
         .name = "zigote",
         .root_module = ffi_mod,
         .linkage = .dynamic,
-        .version = .{ .major = 0, .minor = 1, .patch = 0 },
+        // Android takes an UNVERSIONED library: an APK's lib/<abi>/ entry must be exactly
+        // libzigote.so, and System.loadLibrary resolves by that name.
+        .version = if (target.result.abi.isAndroid()) null else .{ .major = 0, .minor = 1, .patch = 0 },
     });
     // Mach-O: leave room for install-name rewrites. The .NET iOS packager runs
     // install_name_tool on bundled dylibs and fails outright when the header has no padding.

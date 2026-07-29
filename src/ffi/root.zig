@@ -1099,7 +1099,9 @@ export fn zigote_set_android_main(main_fn: ?*const fn () callconv(.c) void) void
 
 /// SDL's `nativeRunMain` entry point. Returns non-zero when no app-main was registered, which
 /// surfaces as a non-zero exit code rather than a silent blank window.
-export fn zigote_android_main(argc: c_int, argv: [*c][*c]u8) c_int {
+export fn zigote_android_main(argc: i32, argv: usize) i32 {
+    // Signature is ABI-identical to SDL_main_func (int, char**); spelled with types the C#
+    // binding generator can map (it does not know c_int or [*c][*c]u8).
     _ = argc;
     _ = argv;
     const cb = android_main orelse return 1;
