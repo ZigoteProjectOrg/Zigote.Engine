@@ -542,9 +542,12 @@ const EngineState = struct {
     blur_requests: std.ArrayListUnmanaged(BlurRequest),
     gaussian_blur: ?wgpu_blur.GaussianBlur,
 
-    // First opened game controller, or null. Scanned once on first query (connect it before launch).
-    gamepad: ?sdl3.gamepad.Gamepad = null,
+    // Opened game controllers by player slot (0-7), packed from slot 0. First query brings the
+    // subsystem up and scans; SDL gamepad_added/removed events request a rescan (hotplug).
+    gamepads: [8]?sdl3.gamepad.Gamepad = @splat(null),
     gamepad_scanned: bool = false,
+    gamepad_sub_ready: bool = false,
+    gamepad_rescan: bool = false,
 
     // Host scroll orientation, learned from the last mouse-wheel event's SDL direction flag
     // (0 unknown until the first scroll, 1 normal, 2 flipped/natural). SDL exposes the OS
@@ -1569,6 +1572,11 @@ export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
                 buf[count] = zge;
                 count += 1;
             },
+            // Controller hotplug: rescan lazily on the next gamepad query. Only meaningful once
+            // the subsystem is up (before that, the first query scans anyway).
+            .gamepad_added, .gamepad_removed => {
+                state.gamepad_rescan = true;
+            },
             else => {},
         }
     }
@@ -1705,9 +1713,32 @@ fn ensure3d(state: *EngineState) ?*wgpu_renderer.wgpu_3d.Gpu3d {
 
 // ── Game controller (SDL gamepad) ─────────────────────────────────────────────
 
-fn ensureGamepad(state: *EngineState) ?sdl3.gamepad.Gamepad {
-    if (state.gamepad) |g| return g;
-    if (state.gamepad_scanned) return null;
+fn rescanGamepads(state: *EngineState) void {
+    for (&state.gamepads) |*slot| {
+        if (slot.*) |g| g.deinit();
+        slot.* = null;
+    }
+    const pads = sdl3.gamepad.getGamepads() catch {
+        std.log.warn("zigote: gamepad enumeration failed", .{});
+        return;
+    };
+    var slot: usize = 0;
+    for (pads) |id| {
+        if (slot >= state.gamepads.len) break;
+        state.gamepads[slot] = sdl3.gamepad.Gamepad.init(id) catch continue;
+        slot += 1;
+    }
+    std.log.info("zigote: {d} game controller(s) connected", .{slot});
+}
+
+fn ensureGamepads(state: *EngineState) void {
+    if (state.gamepad_scanned) {
+        if (state.gamepad_rescan and state.gamepad_sub_ready) {
+            state.gamepad_rescan = false;
+            rescanGamepads(state);
+        }
+        return;
+    }
     // Latch the attempt BEFORE touching SDL so a failure (or a one-time stall) never repeats every
     // frame: gamepad support is best-effort, and the engine must keep running without it.
     state.gamepad_scanned = true;
@@ -1728,36 +1759,41 @@ fn ensureGamepad(state: *EngineState) ?sdl3.gamepad.Gamepad {
     std.log.info("zigote: initializing gamepad subsystem…", .{});
     sdl3.init(.{ .gamepad = true }) catch {
         std.log.warn("zigote: gamepad subsystem init failed; controller input disabled", .{});
-        return null;
+        return;
     };
-    const pads = sdl3.gamepad.getGamepads() catch {
-        std.log.warn("zigote: gamepad enumeration failed; controller input disabled", .{});
-        return null;
-    };
-    if (pads.len == 0) {
-        std.log.info("zigote: gamepad subsystem ready; no controllers detected", .{});
-        return null;
-    }
-    state.gamepad = sdl3.gamepad.Gamepad.init(pads[0]) catch {
-        std.log.warn("zigote: failed to open controller 0; controller input disabled", .{});
-        return null;
-    };
-    std.log.info("zigote: game controller connected", .{});
-    return state.gamepad;
+    state.gamepad_sub_ready = true;
+    rescanGamepads(state);
 }
 
-/// 1 if a game controller is connected (and opened), else 0.
-export fn zigote_input_gamepad_connected(handle: u64) u32 {
+fn gamepadAt(state: *EngineState, pad: u8) ?sdl3.gamepad.Gamepad {
+    ensureGamepads(state);
+    if (pad >= state.gamepads.len) return null;
+    return state.gamepads[pad];
+}
+
+/// Number of connected (opened) game controllers, 0-8. Player slots are packed from 0.
+export fn zigote_input_gamepad_count(handle: u64) u32 {
     const state = stateFromHandle(handle) orelse return 0;
-    return if (ensureGamepad(state) != null) 1 else 0;
+    ensureGamepads(state);
+    var n: u32 = 0;
+    for (state.gamepads) |slot| {
+        if (slot != null) n += 1;
+    }
+    return n;
+}
+
+/// 1 if the game controller in slot `pad` (0-7) is connected (and opened), else 0.
+export fn zigote_input_gamepad_connected(handle: u64, pad: u8) u32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    return if (gamepadAt(state, pad) != null) 1 else 0;
 }
 
 /// Read a controller axis, normalised to [-1, 1] (triggers report [0, 1]). SDL axis order:
 /// 0 left-X, 1 left-Y, 2 right-X, 3 right-Y, 4 left-trigger, 5 right-trigger.
-export fn zigote_input_gamepad_axis(handle: u64, axis: u8) f32 {
+export fn zigote_input_gamepad_axis(handle: u64, pad: u8, axis: u8) f32 {
     if (axis >= 6) return 0;
     const state = stateFromHandle(handle) orelse return 0;
-    const g = ensureGamepad(state) orelse return 0;
+    const g = gamepadAt(state, pad) orelse return 0;
     const ax = sdl3.gamepad.Axis.fromSdl(@intCast(axis)) orelse return 0;
     const v = @as(f32, @floatFromInt(g.getAxis(ax))) / 32767.0;
     return std.math.clamp(v, -1.0, 1.0);
@@ -1765,10 +1801,10 @@ export fn zigote_input_gamepad_axis(handle: u64, axis: u8) f32 {
 
 /// 1 while a controller button is held. SDL button order: 0 south(A), 1 east(B), 2 west(X),
 /// 3 north(Y), 4 back, 5 guide, 6 start, 7 L-stick, 8 R-stick, 9 LB, 10 RB, 11-14 d-pad.
-export fn zigote_input_gamepad_button(handle: u64, button: u8) u32 {
+export fn zigote_input_gamepad_button(handle: u64, pad: u8, button: u8) u32 {
     if (button >= 21) return 0;
     const state = stateFromHandle(handle) orelse return 0;
-    const g = ensureGamepad(state) orelse return 0;
+    const g = gamepadAt(state, pad) orelse return 0;
     const btn = sdl3.gamepad.Button.fromSdl(@intCast(button)) orelse return 0;
     return if (g.getButton(btn)) 1 else 0;
 }
