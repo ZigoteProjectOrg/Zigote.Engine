@@ -45,6 +45,15 @@ comptime {
 comptime {
     _ = @import("chrome.zig");
 }
+// The native menu bar and OS drag-out are implemented in Objective-C for macOS
+// (src/platform/macos_{menu,drag}.m, compiled only there). Everywhere else this stub supplies
+// the same exports as no-ops, so the FFI surface — and therefore the generated, platform-
+// independent C# P/Invoke set — resolves on every target. That matters most on iOS, where the
+// engine is linked statically into the app binary and an undeclared symbol is a link error even
+// if unreachable.
+comptime {
+    if (@import("builtin").os.tag != .macos) _ = @import("desktop_shims_stub.zig");
+}
 const build_options = @import("build_options");
 /// Gates 3D-game-only native subsystems (Assimp model import). Lean 2D-only builds
 /// (`-Denable3d=false`) compile these out and don't link Assimp — see build.zig.

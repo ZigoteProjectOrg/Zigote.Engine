@@ -306,6 +306,34 @@ fn buildMeshoptimizer(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
     return lib;
 }
 
+/// Every dependency static archive linked into the engine, collected so the `static-lib` step can
+/// merge them into ONE self-contained libzigote.a. A static library does not link its dependencies
+/// — it is just an archive of its own objects — so an app linking libzigote.a would otherwise face
+/// thousands of undefined SDL/freetype/harfbuzz/… symbols. (wgpu-native needs no entry here: it is
+/// attached with addObjectFile, which zig already archives into the output.)
+const StaticDepArchive = struct { name: []const u8, path: std.Build.LazyPath };
+var static_dep_archives: std.ArrayListUnmanaged(StaticDepArchive) = .empty;
+
+/// linkLibrary + remember the archive for the static-lib merge.
+fn linkAndCollect(b: *std.Build, mod: *std.Build.Module, lib: *std.Build.Step.Compile) void {
+    mod.linkLibrary(lib);
+    static_dep_archives.append(b.allocator, .{ .name = lib.name, .path = lib.getEmittedBin() }) catch @panic("OOM");
+}
+
+/// Remember a dependency's static archive by artifact name, chosen from its install list (rather
+/// than `Dependency.artifact`, which panics when a name is registered more than once).
+fn collectNamedStaticLib(b: *std.Build, dep: *std.Build.Dependency, name: []const u8) void {
+    for (dep.builder.install_tls.step.dependencies.items) |step| {
+        const install = step.cast(std.Build.Step.InstallArtifact) orelse continue;
+        const lib = install.artifact;
+        if (!std.mem.eql(u8, lib.name, name)) continue;
+        if (lib.isDynamicLibrary()) continue;
+        static_dep_archives.append(b.allocator, .{ .name = lib.name, .path = lib.getEmittedBin() }) catch @panic("OOM");
+        return;
+    }
+    std.debug.panic("static-lib merge: no static artifact named '{s}' in dependency", .{name});
+}
+
 /// Wire the renderer/core native dependencies onto `mod`: freetype + harfbuzz (allyourcodebase, built
 /// from source) and the pinned static wgpu-native. linkLibrary propagates freetype/harfbuzz headers for
 /// freetype_text.zig's @cImport. Image decode (webp) and model import (assimp) are wired on the FFI
@@ -316,8 +344,16 @@ fn linkNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resol
     // is built with freetype support (default), providing the hb_ft_* used by freetype_text.zig.
     const freetype_dep = b.dependency("freetype", .{ .target = target, .optimize = optimize, .@"enable-libpng" = true });
     const harfbuzz_dep = b.dependency("harfbuzz", .{ .target = target, .optimize = optimize });
-    mod.linkLibrary(freetype_dep.artifact("freetype"));
-    mod.linkLibrary(harfbuzz_dep.artifact("harfbuzz"));
+    linkAndCollect(b, mod, freetype_dep.artifact("freetype"));
+    linkAndCollect(b, mod, harfbuzz_dep.artifact("harfbuzz"));
+    // freetype's own dependencies: libpng (embedded-bitmap decode) and zlib. They are separate
+    // archives — freetype.a does not absorb them — so a static consumer needs them listed too.
+    // Reached through freetype's OWN builder with the same arguments its build.zig passes, so
+    // these resolve to the very instances it linked (not fresh copies).
+    const ft_zlib = freetype_dep.builder.dependency("zlib", .{ .target = target, .optimize = optimize });
+    const ft_libpng = freetype_dep.builder.dependency("libpng", .{ .target = target, .optimize = optimize });
+    static_dep_archives.append(b.allocator, .{ .name = "z", .path = ft_zlib.artifact("z").getEmittedBin() }) catch @panic("OOM");
+    static_dep_archives.append(b.allocator, .{ .name = "png", .path = ft_libpng.artifact("png").getEmittedBin() }) catch @panic("OOM");
 
     // wgpu-native: pinned prebuilt static binary, selected per target.
     linkWgpuNative(b, mod, target);
@@ -367,6 +403,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // The SDL3 C library itself (the binding module links it internally) — needed by the
+    // static-lib merge just like the rest. Not via `artifact("SDL3")`: the binding registers the
+    // name more than once and that helper panics on ambiguity, so walk its install list and take
+    // the static archive.
+    collectNamedStaticLib(b, sdl3_dep, "SDL3");
     const zigimg_dep = b.dependency("zigimg", .{
         .target = target,
         .optimize = optimize,
@@ -489,15 +530,15 @@ pub fn build(b: *std.Build) void {
     });
     ffi_mod.addOptions("build_options", build_opts);
     // miniaudio static archive — backs `src/ffi/audio.zig`'s zaudio.Device usage.
-    ffi_mod.linkLibrary(buildMiniaudio(b, target, optimize));
+    linkAndCollect(b, ffi_mod, buildMiniaudio(b, target, optimize));
     // flecs static archive — backs `src/ffi/ecs.zig`'s @cImport("flecs.h") usage. Gated by -Decs:
     // when off, ecs.zig isn't compiled (see root.zig) so neither the header nor the archive is needed.
     if (enable_ecs) {
-        ffi_mod.linkLibrary(buildFlecs(b, target, optimize));
+        linkAndCollect(b, ffi_mod, buildFlecs(b, target, optimize));
         ffi_mod.addIncludePath(b.path("libraries/zflecs/libs/flecs"));
     }
     // meshoptimizer static archive — backs `zmesh_opt`'s mesh-upload cache optimization.
-    ffi_mod.linkLibrary(buildMeshoptimizer(b, target, optimize));
+    linkAndCollect(b, ffi_mod, buildMeshoptimizer(b, target, optimize));
     // Jolt (JoltC) 3D physics — backs `src/ffi/physics.zig`. Gated by -Dphysics3d: when off, root.zig
     // swaps in physics_stub.zig, so neither the JoltC header nor its archive is needed.
     if (enable_physics3d) {
@@ -507,13 +548,13 @@ pub fn build(b: *std.Build) void {
             .enable_asserts = optimize == .Debug,
         });
         ffi_mod.addIncludePath(zphysics_dep.path("libs/JoltC"));
-        ffi_mod.linkLibrary(zphysics_dep.artifact("joltc"));
+        linkAndCollect(b, ffi_mod, zphysics_dep.artifact("joltc"));
     }
     // freetype/harfbuzz + wgpu-native arrive (statically, from source) via `zigote_mod` which this
     // module imports — no Homebrew link here. webp + assimp are this module's own loaders:
     // webp decode (vendored libraries/libwebp, from source) — root.zig's image loader is its only
     // consumer; the src/ include resolves @cInclude("webp/decode.h").
-    ffi_mod.linkLibrary(buildWebp(b, target, optimize));
+    linkAndCollect(b, ffi_mod, buildWebp(b, target, optimize));
     ffi_mod.addIncludePath(b.path("libraries/libwebp/src"));
     // Assimp (Open Asset Import Library) — model import for every supported format. Built from source
     // (allyourcodebase/assimp), formats trimmed to what GltfLoader imports. linkLibrary propagates its
@@ -524,7 +565,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .formats = @as([]const u8, "glTF2,glTF,FBX,Obj,Collada,Ply,STL"),
         });
-        ffi_mod.linkLibrary(assimp_dep.artifact("assimp"));
+        linkAndCollect(b, ffi_mod, assimp_dep.artifact("assimp"));
     }
     if (target.result.os.tag == .macos) {
         // Native macOS menu bar (NSMenu) — Objective-C, linked against Cocoa.
@@ -582,6 +623,14 @@ pub fn build(b: *std.Build) void {
     const install_static = b.addInstallArtifact(static_lib, .{});
     const static_step = b.step("static-lib", "Build the static library (iOS embeds the engine in the app binary)");
     static_step.dependOn(&install_static.step);
+    // A static library archives only its OWN objects — linkLibrary dependencies are recorded, not
+    // absorbed — so the host app must link the dependency archives too. Install each one next to
+    // libzigote.a; the app build links every zig-out/lib/*.a it finds. (Merging them into a single
+    // archive with libtool silently dropped members, so they stay separate and explicit.)
+    for (static_dep_archives.items) |dep| {
+        const install_dep = b.addInstallLibFile(dep.path, b.fmt("lib{s}.a", .{dep.name}));
+        static_step.dependOn(&install_dep.step);
+    }
 
     // On Windows, ship wgpu_native.dll alongside zigote.dll (we link its import lib, not the static
     // MSVC archive — see linkWgpuNative). Installed into zig-out/lib so the C# build copies it too.
