@@ -1085,6 +1085,28 @@ export fn zigote_run_app(main_fn: ?*const fn () callconv(.c) void) i32 {
     return @intCast(sdl3.c.SDL_RunApp(1, @ptrCast(&argv), &runAppTrampoline, null));
 }
 
+/// Android inverts the other way round from iOS: Java owns the entry point, and SDL's
+/// `nativeRunMain` dlsyms a named C function out of the app's .so and runs it on the SDL thread
+/// (already wrapped in SDL_RunApp). So the managed host does NOT call zigote_run_app there — it
+/// registers its app-main here during process startup, and Java calls zigote_android_main later.
+var android_main: ?*const fn () callconv(.c) void = null;
+
+/// Register the managed app-main. Must be called before the SDL activity starts the app thread
+/// (the managed Application object's startup runs first, which is what makes this ordering hold).
+export fn zigote_set_android_main(main_fn: ?*const fn () callconv(.c) void) void {
+    android_main = main_fn;
+}
+
+/// SDL's `nativeRunMain` entry point. Returns non-zero when no app-main was registered, which
+/// surfaces as a non-zero exit code rather than a silent blank window.
+export fn zigote_android_main(argc: c_int, argv: [*c][*c]u8) c_int {
+    _ = argc;
+    _ = argv;
+    const cb = android_main orelse return 1;
+    cb();
+    return 0;
+}
+
 /// Base pointer of the out-of-band UTF-8 text buffer filled by the most recent zigote_poll_events.
 /// text_input / text_editing events carry (text_off, text_len) into this buffer. Valid only until the
 /// next poll; the caller must read all text payloads from the just-polled batch before polling again.

@@ -112,6 +112,28 @@ pub fn prepareSdl(
 
     if (cfg.sdl_system_include_path) |val|
         translate_c.addSystemIncludePath(val);
+    // Android: translate-c does not inherit `--libc`, and bionic splits its arch-specific
+    // headers (asm/, reached from linux/types.h) into a per-triple subdirectory — so the NDK
+    // sysroot's include root alone is not enough to translate the SDL headers.
+    if (target.result.abi.isAndroid()) {
+        if (b.sysroot) |sysroot| {
+            const arch_dir = switch (target.result.cpu.arch) {
+                .aarch64 => "aarch64-linux-android",
+                .x86_64 => "x86_64-linux-android",
+                else => @panic("sdl3: unsupported Android arch"),
+            };
+            translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
+            translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include", arch_dir }) });
+            // Two bionic-isms translate-c cannot parse, neutralized for the translation only
+            // (the SDL C sources still compile with the real headers): the _FORTIFY_SOURCE
+            // overload set redefines sprintf & co with different types, and the nullability
+            // qualifiers are rejected where bionic applies them to array parameters.
+            translate_c.defineCMacro("_FORTIFY_SOURCE", "0");
+            translate_c.defineCMacro("_Nullable", "");
+            translate_c.defineCMacro("_Nonnull", "");
+            translate_c.defineCMacro("_Null_unspecified", "");
+        }
+    }
 
     const c_module = translate_c.createModule();
 

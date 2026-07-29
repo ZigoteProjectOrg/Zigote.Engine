@@ -17,6 +17,33 @@ fn addAppleSdkPaths(b: *std.Build, mod: *std.Build.Module) void {
     mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
 }
 
+/// Point a module at the NDK sysroot's per-architecture pieces — neither is derived from
+/// `--sysroot`. The library path stays sysroot-RELATIVE because the linker prepends the sysroot
+/// to -L paths itself (same trap as addAppleSdkPaths). The API level must match the one the
+/// target triple pins (…-android.34).
+fn addAndroidSysrootPaths(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    // Two bionic-isms clang's C-header translation cannot parse, neutralized for translation
+    // only (the C sources still compile against the real headers): the _FORTIFY_SOURCE overload
+    // set redefines sprintf & co with different types, and the nullability qualifiers are
+    // rejected where bionic applies them to array parameters. Every module that @cImports an
+    // NDK header needs these, so they live with the rest of the android module setup.
+    // Android shared objects must be position-independent throughout; zig only infers PIC for
+    // the compilation that produces the .so, not for statically-built dependencies.
+    mod.pic = true;
+    mod.addCMacro("_FORTIFY_SOURCE", "0");
+    mod.addCMacro("_Nullable", "");
+    mod.addCMacro("_Nonnull", "");
+    mod.addCMacro("_Null_unspecified", "");
+    if (b.sysroot == null) return;
+    const arch_dir = switch (target.result.cpu.arch) {
+        .aarch64 => "aarch64-linux-android",
+        .x86_64 => "x86_64-linux-android",
+        else => std.debug.panic("android: unsupported arch {s}", .{@tagName(target.result.cpu.arch)}),
+    };
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ b.sysroot.?, "usr/include", arch_dir }) });
+    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ "/usr/lib", arch_dir, "34" }) });
+}
+
 fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     const os = target.result.os.tag;
     const arch = target.result.cpu.arch;
@@ -85,6 +112,10 @@ fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resol
             // android (ANativeWindow) libs, resolved against the NDK sysroot.
             mod.linkSystemLibrary("log", .{});
             mod.linkSystemLibrary("android", .{});
+            // The wgpu archive's Rust panic path references the _Unwind_* set, which bionic does
+            // not export; zig satisfies it from its bundled LLVM libunwind.
+            mod.linkSystemLibrary("unwind", .{});
+            addAndroidSysrootPaths(b, mod, target);
         } else {
             // libc (link_libc) already covers pthread/dl/m; Rust's panic/unwind path needs unwind.
             mod.linkSystemLibrary("unwind", .{});
@@ -222,7 +253,7 @@ fn buildMiniaudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             lib.root_module.linkFramework("Foundation", .{});
             addAppleSdkPaths(b, lib.root_module);
         },
-        .linux => {
+        .linux => if (!target.result.abi.isAndroid()) {
             lib.root_module.linkSystemLibrary("pthread", .{});
             lib.root_module.linkSystemLibrary("m", .{});
             lib.root_module.linkSystemLibrary("dl", .{});
@@ -316,6 +347,7 @@ var static_dep_archives: std.ArrayListUnmanaged(StaticDepArchive) = .empty;
 
 /// linkLibrary + remember the archive for the static-lib merge.
 fn linkAndCollect(b: *std.Build, mod: *std.Build.Module, lib: *std.Build.Step.Compile) void {
+    if (lib.rootModuleTarget().abi.isAndroid()) lib.root_module.pic = true;
     mod.linkLibrary(lib);
     static_dep_archives.append(b.allocator, .{ .name = lib.name, .path = lib.getEmittedBin() }) catch @panic("OOM");
 }
@@ -328,6 +360,7 @@ fn collectNamedStaticLib(b: *std.Build, dep: *std.Build.Dependency, name: []cons
         const lib = install.artifact;
         if (!std.mem.eql(u8, lib.name, name)) continue;
         if (lib.isDynamicLibrary()) continue;
+        if (lib.rootModuleTarget().abi.isAndroid()) lib.root_module.pic = true;
         static_dep_archives.append(b.allocator, .{ .name = lib.name, .path = lib.getEmittedBin() }) catch @panic("OOM");
         return;
     }
@@ -352,8 +385,14 @@ fn linkNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resol
     // these resolve to the very instances it linked (not fresh copies).
     const ft_zlib = freetype_dep.builder.dependency("zlib", .{ .target = target, .optimize = optimize });
     const ft_libpng = freetype_dep.builder.dependency("libpng", .{ .target = target, .optimize = optimize });
-    static_dep_archives.append(b.allocator, .{ .name = "z", .path = ft_zlib.artifact("z").getEmittedBin() }) catch @panic("OOM");
-    static_dep_archives.append(b.allocator, .{ .name = "png", .path = ft_libpng.artifact("png").getEmittedBin() }) catch @panic("OOM");
+    const zlib_lib = ft_zlib.artifact("z");
+    const png_lib = ft_libpng.artifact("png");
+    if (target.result.abi.isAndroid()) {
+        zlib_lib.root_module.pic = true;
+        png_lib.root_module.pic = true;
+    }
+    static_dep_archives.append(b.allocator, .{ .name = "z", .path = zlib_lib.getEmittedBin() }) catch @panic("OOM");
+    static_dep_archives.append(b.allocator, .{ .name = "png", .path = png_lib.getEmittedBin() }) catch @panic("OOM");
 
     // wgpu-native: pinned prebuilt static binary, selected per target.
     linkWgpuNative(b, mod, target);
@@ -393,7 +432,7 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "enable_physics3d", enable_physics3d);
     build_opts.addOption(bool, "enable_ecs", enable_ecs);
 
-    const sdl3_dep = if (target.result.os.tag == .ios and b.sysroot != null) b.dependency("sdl3", .{
+    const sdl3_dep = if ((target.result.os.tag == .ios or target.result.abi.isAndroid()) and b.sysroot != null) b.dependency("sdl3", .{
         .target = target,
         .optimize = optimize,
         // The binding's translate-c of the SDL headers needs the SDK's libc headers
@@ -567,6 +606,15 @@ pub fn build(b: *std.Build) void {
         });
         linkAndCollect(b, ffi_mod, assimp_dep.artifact("assimp"));
     }
+    if (target.result.abi.isAndroid()) {
+        // Every module that reaches an NDK header through @cImport needs the bionic translation
+        // workarounds and the sysroot's per-architecture paths.
+        for ([_]*std.Build.Module{
+            wgpu_mod,   zaudio_mod, zmath_mod, zpool_mod, zmesh_opt_mod,
+            core_mod,   ui_mod,     engine_mod, zigote_mod, ffi_mod,
+        }) |mod| addAndroidSysrootPaths(b, mod, target);
+    }
+
     if (target.result.os.tag == .macos) {
         // Native macOS menu bar (NSMenu) — Objective-C, linked against Cocoa.
         ffi_mod.addCSourceFile(.{
