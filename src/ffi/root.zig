@@ -787,6 +787,10 @@ fn zigote_init_impl(
     // click. The reverse simulation (mouse → fake touch) stays off too: real mice must keep
     // hover/right-click semantics instead of masquerading as fingers.
     sdl3.hints.set(.touch_mouse_events, "0") catch {};
+    // Android's back gesture/button must reach the app as a key event (AC_BACK) instead of
+    // finishing the activity behind our back — the UI decides whether there is somewhere to go
+    // back TO, and only closes the app when there is not.
+    sdl3.hints.set(.android_trap_back_button, "1") catch {};
     sdl3.hints.set(.mouse_touch_events, "0") catch {};
 
     // Only the subsystems window creation needs. The gamepad subsystem is initialized lazily on
