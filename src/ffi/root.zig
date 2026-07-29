@@ -1043,6 +1043,34 @@ export fn zigote_wait_events(timeout_ms: u32) void {
     _ = sdl3.events.waitTimeout(@intCast(timeout_ms));
 }
 
+/// The host callback zigote_run_app runs as the app's real main (single-shot; the process
+/// lives inside it on iOS, so a global is fine).
+var run_app_main: ?*const fn () callconv(.c) void = null;
+
+fn runAppTrampoline(argc: c_int, argv: [*c][*c]u8) callconv(.c) c_int {
+    _ = argc;
+    _ = argv;
+    if (run_app_main) |cb| cb();
+    return 0;
+}
+
+/// Hand the process to SDL's platform main wrapper and run `main_fn` as the app's real main.
+/// On iOS this calls UIApplicationMain and invokes the callback after didFinishLaunching, on
+/// the main thread, with the UIKit runloop serviced from inside SDL's event pump — so the
+/// managed host's classic `while (!quit) Frame()` loop keeps working. On desktop platforms
+/// SDL's generic wrapper just calls the function directly, so hosts may use this entry
+/// unconditionally. The callback must contain the WHOLE app lifetime (init → loop →
+/// shutdown); on iOS this function never returns (SDL exits the process when main_fn does).
+/// Takes a zero-arg callback (argc/argv are meaningless to a managed host) so the generated
+/// C# binding stays a plain `delegate* unmanaged[Cdecl]<void>`.
+export fn zigote_run_app(main_fn: ?*const fn () callconv(.c) void) i32 {
+    run_app_main = main_fn;
+    // Synthesized argv: UIApplicationMain and some SDL internals expect a non-null argv0.
+    const argv0: [*c]u8 = @constCast(@ptrCast("zigote"));
+    var argv = [_][*c]u8{ argv0, null };
+    return @intCast(sdl3.c.SDL_RunApp(1, @ptrCast(&argv), &runAppTrampoline, null));
+}
+
 /// Base pointer of the out-of-band UTF-8 text buffer filled by the most recent zigote_poll_events.
 /// text_input / text_editing events carry (text_off, text_len) into this buffer. Valid only until the
 /// next poll; the caller must read all text payloads from the just-polled batch before polling again.

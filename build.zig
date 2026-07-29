@@ -562,6 +562,9 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
         .version = .{ .major = 0, .minor = 1, .patch = 0 },
     });
+    // Mach-O: leave room for install-name rewrites. The .NET iOS packager runs
+    // install_name_tool on bundled dylibs and fails outright when the header has no padding.
+    if (target.result.os.tag.isDarwin()) shared_lib.headerpad_max_install_names = true;
     const install_lib = b.addInstallArtifact(shared_lib, .{});
 
     const lib_step = b.step("shared-lib", "Build the shared library for C# FFI");
