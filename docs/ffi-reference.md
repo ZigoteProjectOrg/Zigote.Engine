@@ -120,7 +120,7 @@ poll; single-threaded drain-decode).
 10 `WINDOW_FOCUS` (button: 1 gained / 0 lost) · 11 `WINDOW_CLOSE` · 12 `SYSTEM_THEME` (button: 0
 unknown / 1 light / 2 dark) · 13 `DROP_BEGIN` · 14 `DROP_FILE` · 15 `DROP_TEXT` · 16 `DROP_POSITION` ·
 17 `DROP_COMPLETE` · 18 `TOUCH_DOWN` · 19 `TOUCH_MOVE` · 20 `TOUCH_UP` · 21 `TOUCH_CANCEL` ·
-22 `APP_BACKGROUND` · 23 `APP_FOREGROUND` · 24 `LOW_MEMORY`.
+22 `APP_BACKGROUND` · 23 `APP_FOREGROUND` · 24 `LOW_MEMORY` · 25 `SCREEN_KEYBOARD_SHOWN` · 26 `SCREEN_KEYBOARD_HIDDEN` (mobile on-screen keyboard; occlusion is handled natively — the backend pans the view against the SetTextInputArea rect).
 
 A file/text drop arrives as `DROP_BEGIN` → N × `DROP_FILE`/`DROP_TEXT` → `DROP_COMPLETE`, with the
 payload out-of-band in `poll_text` exactly like text input. **New drop event kinds reused existing

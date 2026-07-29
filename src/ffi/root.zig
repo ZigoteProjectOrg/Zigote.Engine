@@ -254,6 +254,11 @@ pub const EVT_TOUCH_CANCEL: u8 = 21;
 pub const EVT_APP_BACKGROUND: u8 = 22;
 pub const EVT_APP_FOREGROUND: u8 = 23;
 pub const EVT_LOW_MEMORY: u8 = 24;
+// The mobile on-screen keyboard appeared/disappeared. Occlusion itself needs no app work —
+// the platform backends pan the view so the SDL_SetTextInputArea rect (already fed from the
+// text widgets) stays visible — but the app layer wants the state for layout/scroll polish.
+pub const EVT_SCREEN_KEYBOARD_SHOWN: u8 = 25;
+pub const EVT_SCREEN_KEYBOARD_HIDDEN: u8 = 26;
 
 /// Simultaneous touch fingers tracked; fingers beyond this are ignored at down and never
 /// surface. 10 matches the practical ceiling of phone/tablet digitizers.
@@ -1338,6 +1343,18 @@ export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
             },
             .low_memory => {
                 zge.kind = EVT_LOW_MEMORY;
+                buf[count] = zge;
+                count += 1;
+            },
+            // Bare notifications (no window id in the SDL payload); window_id 0 = main window,
+            // which is the only window that exists on the mobile platforms that send these.
+            .screen_keyboard_shown => {
+                zge.kind = EVT_SCREEN_KEYBOARD_SHOWN;
+                buf[count] = zge;
+                count += 1;
+            },
+            .screen_keyboard_hidden => {
+                zge.kind = EVT_SCREEN_KEYBOARD_HIDDEN;
                 buf[count] = zge;
                 count += 1;
             },
