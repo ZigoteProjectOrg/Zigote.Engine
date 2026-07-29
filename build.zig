@@ -1,12 +1,16 @@
 const std = @import("std");
 
-/// Cross-compiling to macOS (`-Dtarget=x86_64-macos --sysroot "$(xcrun --show-sdk-path)"`) does not
-/// derive the SDK search paths from the sysroot the way a native build auto-detects them, so every
-/// module that compiles against or links Apple frameworks needs them added explicitly. No-op when
-/// no `--sysroot` is passed (native builds).
-fn addMacosSdkPaths(b: *std.Build, mod: *std.Build.Module) void {
+/// Cross-compiling to an Apple target (`-Dtarget=x86_64-macos` / `-Dtarget=aarch64-ios-simulator`
+/// with `--sysroot "$(xcrun --sdk … --show-sdk-path)"`) does not derive the SDK search paths from
+/// the sysroot the way a native build auto-detects them, so every module that compiles against or
+/// links Apple frameworks needs them added explicitly. No-op when no `--sysroot` is passed
+/// (native builds). iOS builds are always cross builds and always need this.
+fn addAppleSdkPaths(b: *std.Build, mod: *std.Build.Module) void {
     const sysroot = b.sysroot orelse return;
     mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) });
+    // Xcode 26 SDKs split some framework dependencies (e.g. UIKit's UIUtilities) into a separate
+    // SubFrameworks directory that is on the default search path in Xcode but not for us.
+    mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/SubFrameworks" }) });
     mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
     // The linker prepends the sysroot to -L paths itself, so this one stays sysroot-relative
     // (an absolute path would be doubled into <sdk>/<sdk>/usr/lib).
@@ -74,7 +78,7 @@ fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resol
             mod.linkFramework("CoreFoundation", .{});
             mod.linkSystemLibrary("objc", .{});
             mod.linkSystemLibrary("iconv", .{});
-            addMacosSdkPaths(b, mod);
+            addAppleSdkPaths(b, mod);
         },
         .linux => if (target.result.abi.isAndroid()) {
             // Vulkan is dlopen'd at runtime; the archive's hard deps are the NDK log and
@@ -97,6 +101,7 @@ fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resol
             mod.linkFramework("Foundation", .{});
             mod.linkFramework("CoreFoundation", .{});
             mod.linkSystemLibrary("objc", .{});
+            addAppleSdkPaths(b, mod);
         },
         else => {},
     }
@@ -182,16 +187,23 @@ fn buildMiniaudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         .flags = &.{ "-std=c99", "-fno-sanitize=undefined" },
     });
     lib.root_module.addCSourceFile(.{
-        .file = b.path("libraries/zaudio/libs/miniaudio/miniaudio.c"),
+        // On iOS the implementation must be compiled as Objective-C (miniaudio manages the
+        // AVAudioSession there) — the .m wrapper includes the same miniaudio.c; a `-x` flag
+        // can't do it because zig places per-file flags after the input file.
+        .file = if (target.result.os.tag == .ios)
+            b.path("libraries/zaudio/src/miniaudio_objc.m")
+        else
+            b.path("libraries/zaudio/libs/miniaudio/miniaudio.c"),
         .flags = &.{
             "-DMA_NO_WEBAUDIO",
             "-DMA_NO_NULL",
             "-DMA_NO_JACK",
             "-DMA_NO_DSOUND",
             "-DMA_NO_WINMM",
-            "-std=c99",
             "-fno-sanitize=undefined",
-            if (target.result.os.tag == .macos) "-DMA_NO_RUNTIME_LINKING" else "",
+            if (target.result.os.tag.isDarwin()) "-DMA_NO_RUNTIME_LINKING" else "",
+            // ObjC (iOS) compiles without -std=c99 (miniaudio detects ARC itself); C elsewhere.
+            if (target.result.os.tag == .ios) "" else "-std=c99",
         },
     });
     switch (target.result.os.tag) {
@@ -200,7 +212,15 @@ fn buildMiniaudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
             lib.root_module.linkFramework("CoreFoundation", .{});
             lib.root_module.linkFramework("AudioUnit", .{});
             lib.root_module.linkFramework("AudioToolbox", .{});
-            addMacosSdkPaths(b, lib.root_module);
+            addAppleSdkPaths(b, lib.root_module);
+        },
+        .ios => {
+            lib.root_module.linkFramework("CoreAudio", .{});
+            lib.root_module.linkFramework("CoreFoundation", .{});
+            lib.root_module.linkFramework("AudioToolbox", .{});
+            lib.root_module.linkFramework("AVFoundation", .{});
+            lib.root_module.linkFramework("Foundation", .{});
+            addAppleSdkPaths(b, lib.root_module);
         },
         .linux => {
             lib.root_module.linkSystemLibrary("pthread", .{});
@@ -337,7 +357,13 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "enable_physics3d", enable_physics3d);
     build_opts.addOption(bool, "enable_ecs", enable_ecs);
 
-    const sdl3_dep = b.dependency("sdl3", .{
+    const sdl3_dep = if (target.result.os.tag == .ios and b.sysroot != null) b.dependency("sdl3", .{
+        .target = target,
+        .optimize = optimize,
+        // The binding's translate-c of the SDL headers needs the SDK's libc headers
+        // (AvailabilityMacros.h & co) — same paths addAppleSdkPaths supplies to compiles.
+        .sdl_system_include_path = @as(std.Build.LazyPath, .{ .cwd_relative = b.pathJoin(&.{ b.sysroot.?, "usr/include" }) }),
+    }) else b.dependency("sdl3", .{
         .target = target,
         .optimize = optimize,
     });
@@ -525,7 +551,7 @@ pub fn build(b: *std.Build) void {
             .flags = &.{"-fno-objc-arc"},
         });
         ffi_mod.linkFramework("Cocoa", .{});
-        addMacosSdkPaths(b, ffi_mod);
+        addAppleSdkPaths(b, ffi_mod);
         // Metal/QuartzCore/Foundation arrive transitively via SDL + wgpu-native (wgpu renders
         // through Metal on macOS) — no explicit links needed now the native Metal backend is gone.
     }
@@ -540,6 +566,19 @@ pub fn build(b: *std.Build) void {
 
     const lib_step = b.step("shared-lib", "Build the shared library for C# FFI");
     lib_step.dependOn(&install_lib.step);
+
+    // Static archive of the same FFI module. iOS forbids loading unsigned dylibs from the app
+    // sandbox, so the engine is linked INTO the host binary there (C# side resolves DllImport
+    // via "__Internal" under the ZIGOTE_STATIC_NATIVE define). Usable on any platform, but iOS
+    // is the customer.
+    const static_lib = b.addLibrary(.{
+        .name = "zigote",
+        .root_module = ffi_mod,
+        .linkage = .static,
+    });
+    const install_static = b.addInstallArtifact(static_lib, .{});
+    const static_step = b.step("static-lib", "Build the static library (iOS embeds the engine in the app binary)");
+    static_step.dependOn(&install_static.step);
 
     // On Windows, ship wgpu_native.dll alongside zigote.dll (we link its import lib, not the static
     // MSVC archive — see linkWgpuNative). Installed into zig-out/lib so the C# build copies it too.
