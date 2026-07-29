@@ -556,7 +556,7 @@ pub fn build(b: *std.Build) void {
             .SDL_USE_IME = linux,
             .SDL_DISABLE_WINDOWS_IME = false,
             .SDL_GDK_TEXTINPUT = false,
-            .SDL_IPHONE_KEYBOARD = false,
+            .SDL_IPHONE_KEYBOARD = ios,
             .SDL_IPHONE_LAUNCHSCREEN = false,
             .SDL_VIDEO_VITA_PIB = false,
             .SDL_VIDEO_VITA_PVR = false,
