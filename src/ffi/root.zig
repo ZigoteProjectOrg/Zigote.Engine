@@ -90,6 +90,29 @@ const webp = @cImport({
 
 var log_callback: ?*const fn (i32, [*c]const u8) callconv(.c) void = null;
 
+/// Android throws away stdout/stderr, so anything the engine (or a Rust panic inside
+/// wgpu-native) writes there is invisible — including the message that explains a fatal error.
+/// Everything therefore also goes to logcat under the "zigote" tag.
+const android_log = if (@import("builtin").abi.isAndroid()) struct {
+    extern fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
+
+    fn write(level: std.log.Level, msg: [*:0]const u8) void {
+        // Android priorities: 3 DEBUG, 4 INFO, 5 WARN, 6 ERROR.
+        const prio: c_int = switch (level) {
+            .debug => 3,
+            .info => 4,
+            .warn => 5,
+            .err => 6,
+        };
+        _ = __android_log_write(prio, "zigote", msg);
+    }
+} else struct {
+    fn write(level: std.log.Level, msg: [*:0]const u8) void {
+        _ = level;
+        _ = msg;
+    }
+};
+
 pub fn myLogFn(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.EnumLiteral),
@@ -97,12 +120,27 @@ pub fn myLogFn(
     args: anytype,
 ) void {
     _ = scope;
-    if (log_callback) |cb| {
-        var buf: [4096]u8 = undefined;
-        if (std.fmt.bufPrintZ(&buf, format, args)) |msg| {
-            cb(@intFromEnum(level), msg.ptr);
-        } else |_| {}
-    }
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, format, args) catch return;
+    android_log.write(level, msg.ptr);
+    if (log_callback) |cb| cb(@intFromEnum(level), msg.ptr);
+}
+
+/// Forward wgpu-native's own diagnostics into the same sink. Without this the only trace of a
+/// surface/adapter failure on Android is an abort with no message.
+fn wgpuLogToEngine(level: wgpu.LogLevel, message: wgpu.StringView, userdata: ?*anyopaque) callconv(.c) void {
+    _ = userdata;
+    const text = message.toSlice() orelse return;
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, "wgpu: {s}", .{text}) catch return;
+    const lvl: std.log.Level = switch (level) {
+        .@"error" => .err,
+        .warn => .warn,
+        .info => .info,
+        else => .debug,
+    };
+    android_log.write(lvl, msg.ptr);
+    if (log_callback) |cb| cb(@intFromEnum(lvl), msg.ptr);
 }
 
 pub const std_options: std.Options = .{
@@ -803,16 +841,28 @@ fn zigote_init_impl(
     // e.g. on a Mac with the Vulkan SDK installed the default would dlopen MoltenVK and stand up
     // a whole second adapter chain. Same policy as the SDL gpu_driver=none hint above.
     var instance_extras = wgpu.InstanceExtras{
-        .backends = switch (@import("builtin").os.tag) {
+        .backends = if (@import("builtin").abi.isAndroid())
+            // Vulkan ONLY on Android. An ANativeWindow can be connected to exactly one graphics
+            // API at a time, so leaving GL in the mask makes wgpu's GL backend call
+            // eglCreateWindowSurface on the window Vulkan already owns — the connect fails
+            // ("already connected to another API") and surface configuration then aborts.
+            wgpu.InstanceBackends.vulkan
+        else switch (@import("builtin").os.tag) {
             // iOS is Metal-only — falling into the generic arm would ask for Vulkan/GL and
             // find neither.
             .macos, .ios => wgpu.InstanceBackends.metal,
             .windows => wgpu.InstanceBackends.dx12 | wgpu.InstanceBackends.vulkan,
-            // Linux and Android (and anything else): Vulkan with the GL(ES) fallback wgpu
-            // would resolve anyway.
+            // Desktop Linux (and anything else): Vulkan with the GL fallback wgpu would
+            // resolve anyway.
             else => wgpu.InstanceBackends.vulkan | wgpu.InstanceBackends.gl,
         },
     };
+    // Route wgpu's diagnostics into the engine log before anything can fail: on Android a fatal
+    // surface/adapter error otherwise aborts with no message at all.
+    wgpu.setLogCallback(wgpuLogToEngine, null);
+    wgpu.setLogLevel(if (@import("builtin").abi.isAndroid()) .debug else if (@import("builtin").mode == .Debug) .info else .warn);
+
+    std.log.info("wgpu backends mask = 0x{x} (android={})", .{ instance_extras.backends, @import("builtin").abi.isAndroid() });
     const instance_desc = (wgpu.InstanceDescriptor{}).withNativeExtras(&instance_extras);
     const instance = wgpu.Instance.create(&instance_desc) orelse return error.WgpuInstanceUnavailable;
     errdefer instance.release();
@@ -823,6 +873,12 @@ fn zigote_init_impl(
     var adapter_opts = wgpu.RequestAdapterOptions{
         .power_preference = .high_performance,
         .compatible_surface = surface,
+        // Android: demand the Vulkan adapter. wgpu-native creates every compiled-in backend
+        // regardless of InstanceExtras.backends, and its GL/EGL adapter otherwise wins the
+        // request — then surface configuration calls eglCreateWindowSurface on an ANativeWindow
+        // that is already connected to another API and aborts the process. Only the adapter's
+        // backend_type actually pins the choice.
+        .backend_type = if (@import("builtin").abi.isAndroid()) .vulkan else .undefined,
     };
     const adapter_resp = instance.requestAdapterSync(&adapter_opts, 1_000_000);
     const adapter = adapter_resp.adapter orelse return error.WgpuAdapterUnavailable;
