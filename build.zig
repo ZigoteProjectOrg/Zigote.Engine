@@ -309,9 +309,16 @@ pub fn build(b: *std.Build) void {
     build_opts.addOption(bool, "enable_physics3d", enable_physics3d);
     build_opts.addOption(bool, "enable_ecs", enable_ecs);
 
+    // `c_sdl_sanitize_c = .off`: the sdl3 binding defaults to `.trap`, which compiles SDL's own C with
+    // UBSan traps — and upstream SDL is not UBSan-clean. On Wayland that is fatal, not theoretical:
+    // SDL_waylandevents.c's `pointer_handle_leave` evaluates SDL_BUTTON_MASK(0) → `1u << -1` (shift
+    // out of bounds), so the first pointer-leave with a button held hits a `ud1` and the process dies
+    // with SIGILL. Every distro ships SDL without UBSan; so do we. Our own C deps already pass
+    // -fno-sanitize=undefined (buildWebp/buildMiniaudio/buildFlecs) — this makes SDL consistent.
     const sdl3_dep = b.dependency("sdl3", .{
         .target = target,
         .optimize = optimize,
+        .c_sdl_sanitize_c = std.zig.SanitizeC.off,
     });
     const zigimg_dep = b.dependency("zigimg", .{
         .target = target,
@@ -502,12 +509,47 @@ pub fn build(b: *std.Build) void {
         // through Metal on macOS) — no explicit links needed now the native Metal backend is gone.
     }
 
+    // Windows/MinGW: undo the _FORTIFY_SOURCE=2 that std.Build defines for every non-Debug build.
+    // zig 0.16 moved translate-c out of the compiler, and the standalone one mistranslates MinGW's
+    // fortified string wrappers — for wcscat/wcscpy it emits the extern in a local struct and then
+    // calls the bare name, leaving the local unused, which is a hard error. Those wrappers exist
+    // ONLY when _FORTIFY_SOURCE > 0, so defining it back to 0 removes them and the miscompile with
+    // them. Nothing is lost: they are bounds checks on C string calls this engine never makes.
+    // ponytail: delete this block once translate-c handles extern-in-local-scope (ziglang/zig #23275,
+    // PR #23384). It is a toolchain bug, not something the engine can fix properly.
+    if (target.result.os.tag == .windows) {
+        for ([_]*std.Build.Module{
+            core_mod, ui_mod,   engine_mod, zigote_mod,   ffi_mod,
+            wgpu_mod, zaudio_mod, zmath_mod, zpool_mod,   zmesh_opt_mod,
+        }) |m| m.addCMacro("_FORTIFY_SOURCE", "0");
+
+        // The sdl3 package builds its `c` module with its own TranslateC step and exposes no option
+        // to touch its macros, so reach the step through the generated file it owns. The id check
+        // keeps the @fieldParentPtr honest if that package ever generates `c` some other way.
+        if (sdl3_dep.module("sdl3").import_table.get("c")) |c_mod| {
+            if (c_mod.root_source_file) |lp| switch (lp) {
+                .generated => |g| if (g.file.step.id == .translate_c) {
+                    const tc: *std.Build.Step.TranslateC = @fieldParentPtr("step", g.file.step);
+                    tc.defineCMacro("_FORTIFY_SOURCE", "0");
+                },
+                else => {},
+            };
+        }
+    }
+
     const shared_lib = b.addLibrary(.{
         .name = "zigote",
         .root_module = ffi_mod,
         .linkage = .dynamic,
         .version = .{ .major = 0, .minor = 1, .patch = 0 },
     });
+    // Zig 0.16's self-hosted x86_64 backend (the Debug default) segfaults linking this library on
+    // Linux — `zig build shared-lib` in Debug dies with "process terminated with signal SEGV", so the
+    // whole C# Debug workflow is unbuildable there. LLVM handles it. Release modes already use LLVM,
+    // so this only costs Debug build time.
+    // ponytail: unconditional — re-test with a newer Zig and drop this line when the self-hosted
+    // backend stops crashing.
+    shared_lib.use_llvm = true;
     const install_lib = b.addInstallArtifact(shared_lib, .{});
 
     const lib_step = b.step("shared-lib", "Build the shared library for C# FFI");
@@ -535,9 +577,17 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{ .root_module = zigote_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    // The FFI layer's own tests (audio filter math, dialog filter parsing, …). These were previously
+    // unreachable — src/ffi is not part of any other module's import graph, so `zig build test` was
+    // silently skipping every `test` block under it.
+    const ffi_tests = b.addTest(.{ .root_module = ffi_mod });
+    ffi_tests.use_llvm = true; // same self-hosted-backend crash the shared library works around
+    const run_ffi_tests = b.addRunArtifact(ffi_tests);
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_core_tests.step);
     test_step.dependOn(&run_ui_tests.step);
     test_step.dependOn(&run_engine_tests.step);
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_ffi_tests.step);
 }
