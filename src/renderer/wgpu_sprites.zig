@@ -24,8 +24,12 @@ const shaders3d = @import("wgpu_3d_shaders.zig");
 const log = std.log.scoped(.sprites2d);
 
 pub const SpriteSystem = struct {
-    // Instance layout: 14 f32 per sprite — pos.xyz, rot, size.xy, uv0.xy, uv1.xy, rgba.
-    pub const INSTANCE_FLOATS: u32 = 14;
+    // Instance layout: 16 f32 per sprite — pos.xyz, rot, size.xy, uv0.xy, uv1.xy, rgba,
+    // corner_radius, border_width. The last two are in the sprite's own local units (same space as
+    // `size`): a radius rounds the quad's corners, and a non-zero border width draws only that
+    // thick a ring inside the edge instead of a filled quad. Together they let the 2D canvas express
+    // rounded rects, outlines and circles (radius = half the smaller side) without a custom shader.
+    pub const INSTANCE_FLOATS: u32 = 16;
     const STRIDE_BYTES: u64 = INSTANCE_FLOATS * 4;
     const PARAMS_SLOT: u32 = 256; // wgpu min uniform-buffer dynamic-offset alignment
     const PARAMS_FLOATS: u32 = 16;
@@ -326,7 +330,10 @@ pub const SpriteSystem = struct {
         // One 256-byte slot per batch; 16 params floats zero-padded.
         const params_off: u32 = @intCast(self.params_cpu.items.len);
         var slot = [_]u8{0} ** PARAMS_SLOT;
-        const n = @min(params.len, PARAMS_FLOATS);
+        // `n` must be explicitly usize: @min narrows its result type to the smallest int that can
+        // hold the comptime-known bound (16 → u5, max 31), so an inferred `n * 4` overflowed for
+        // any params.len >= 8 — which is every Renderer2D draw, since Material2D always sends 16.
+        const n: usize = @min(params.len, PARAMS_FLOATS);
         @memcpy(slot[0 .. n * 4], std.mem.sliceAsBytes(params[0..n]));
         self.params_cpu.appendSlice(a, &slot) catch return;
 
@@ -661,6 +668,7 @@ pub const SpriteSystem = struct {
             .{ .format = .float32x2, .offset = 24, .shader_location = 3 }, // uv0
             .{ .format = .float32x2, .offset = 32, .shader_location = 4 }, // uv1
             .{ .format = .float32x4, .offset = 40, .shader_location = 5 }, // color
+            .{ .format = .float32x2, .offset = 56, .shader_location = 6 }, // corner_radius, border_width
         };
         const vb_layout = wgpu.VertexBufferLayout{
             .array_stride = STRIDE_BYTES,

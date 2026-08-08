@@ -35,12 +35,19 @@ struct VsIn {
     @location(3) uv0: vec2<f32>,
     @location(4) uv1: vec2<f32>,
     @location(5) color: vec4<f32>,
+    // shape.x = corner radius, shape.y = border width — both in the sprite's local units (the same
+    // space as `size`). radius 0 + border 0 is a plain quad, which is the common case.
+    @location(6) shape: vec2<f32>,
 };
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    // Position within the quad in local units, for the fragment-side shape SDF.
+    @location(2) local: vec2<f32>,
+    @location(3) half_size: vec2<f32>,
+    @location(4) shape: vec2<f32>,
 };
 
 @vertex
@@ -63,11 +70,42 @@ fn vs_main(@builtin(vertex_index) vid: u32, in: VsIn) -> VsOut {
     let t = corner + vec2<f32>(0.5, 0.5);
     out.uv = vec2<f32>(mix(in.uv0.x, in.uv1.x, t.x), mix(in.uv0.y, in.uv1.y, 1.0 - t.y));
     out.color = in.color;
+    out.local = local;
+    out.half_size = abs(in.size) * 0.5;
+    out.shape = in.shape;
     return out;
+}
+
+/// Signed distance to a rounded box centred at the origin; negative inside.
+fn sd_round_box(p: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 {
+    let q = abs(p) - half_size + vec2<f32>(radius, radius);
+    return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - radius;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let col = textureSample(tex, samp, in.uv) * in.color;
+    var col = textureSample(tex, samp, in.uv) * in.color;
+
+    let radius = in.shape.x;
+    let border = in.shape.y;
+    if (radius > 0.0 || border > 0.0) {
+        // A radius past half the shorter side would invert the SDF; clamping degrades it to a
+        // capsule/circle instead, which is how a circle is expressed (radius >= half the side).
+        let r = clamp(radius, 0.0, min(in.half_size.x, in.half_size.y));
+        let d = sd_round_box(in.local, in.half_size, r);
+
+        // Antialias across one pixel, using the screen-space derivative of the distance so the
+        // edge stays one pixel wide at any zoom.
+        let aa = max(fwidth(d), 1e-6);
+        var mask = 1.0 - smoothstep(-aa, aa, d);
+
+        // A border keeps only the ring: inside the outer edge AND outside the inner edge.
+        if (border > 0.0) {
+            mask = mask * smoothstep(-aa, aa, d + border);
+        }
+
+        col = vec4<f32>(col.rgb, col.a * mask);
+    }
+
     return vec4<f32>(col.rgb * col.a, col.a);
 }
