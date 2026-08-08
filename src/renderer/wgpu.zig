@@ -56,6 +56,11 @@ pub const CachedImage = struct {
     texture: *wgpu.Texture,
     texture_view: *wgpu.TextureView,
     bind_group: *wgpu.BindGroup,
+    /// Owned by an app-supplied handle (zigote_load_texture*, render textures): the app decides
+    /// when it dies, so the cap below never evicts it and its CPU pixels can be dropped after
+    /// upload. Unpinned entries are keyed by a hash of inline pixels that arrive again with every
+    /// paint command, so re-uploading one is always possible.
+    pinned: bool = false,
 };
 
 pub const GpuUi = struct {
@@ -78,8 +83,14 @@ pub const GpuUi = struct {
     text: ft_text.FreeTypeTextRenderer,
     allocator: std.mem.Allocator,
     image_cache: std.AutoHashMap(u64, CachedImage),
+    /// Keys whose GPU texture was created this frame from an app-owned handle. The FFI layer
+    /// drains this at end-of-frame and frees the CPU-side pixel copy: once the texture exists,
+    /// holding a second full RGBA buffer per image doubles the memory an image costs for nothing.
+    uploaded_keys: std.ArrayListUnmanaged(u64) = .empty,
     scratch: std.heap.ArenaAllocator,
+    /// Cap on *unpinned* (inline-pixel) images only — pinned entries are the app's to release.
     max_cached_images: usize = 192,
+    unpinned_cached: usize = 0,
     shape_vertex_buffer: ?*wgpu.Buffer = null,
     shape_vertex_buffer_size: usize = 0,
     liquid_glass_vertex_buffer: ?*wgpu.Buffer = null,
@@ -90,6 +101,10 @@ pub const GpuUi = struct {
     image_vertex_buffer_size: usize = 0,
     // Backdrop capture for liquid glass refraction
     surface_format: wgpu.TextureFormat,
+    // Transparent-window mode (CSD rounded corners): the frame clears to alpha 0 so pixels the
+    // app leaves uncovered show the desktop through the premultiplied surface. Set once after
+    // init by the FFI layer when the window really got an alpha channel.
+    transparent_clear: bool = false,
     backdrop_bgl: *wgpu.BindGroupLayout,
     backdrop_sampler: *wgpu.Sampler,
     scene_texture: ?*wgpu.Texture = null,
@@ -503,6 +518,17 @@ pub const GpuUi = struct {
         };
     }
 
+    /// Drop a cached image's GPU resources. Only valid between frames — mid-frame the texture may
+    /// still be recorded in an open command encoder. Returns true if an entry was removed.
+    pub fn releaseCachedImage(self: *GpuUi, key: u64) bool {
+        const kv = self.image_cache.fetchRemove(key) orelse return false;
+        if (!kv.value.pinned and self.unpinned_cached > 0) self.unpinned_cached -= 1;
+        kv.value.bind_group.release();
+        kv.value.texture_view.release();
+        kv.value.texture.release();
+        return true;
+    }
+
     pub fn registerShader(self: *GpuUi, device: *wgpu.Device, id: u32, wgsl: []const u8) !void {
         const pipeline = try createCustomShaderPipeline(device, self.backdrop_bgl, self.surface_format, wgsl);
         const old = try self.custom_shader_pipelines.fetchPut(id, pipeline);
@@ -540,6 +566,7 @@ pub const GpuUi = struct {
             cached.texture.release();
         }
         self.image_cache.deinit();
+        self.uploaded_keys.deinit(self.allocator);
         self.scratch.deinit();
         self.text.deinit();
         self.image_pipeline.release();
@@ -763,13 +790,17 @@ pub fn renderFrame(
     }) orelse return error.WgpuCommandEncoderUnavailable;
     defer encoder.release();
 
-    const t = @as(f64, @floatFromInt(frame_index % 180)) / 180.0;
-    const clear = wgpu.Color{
-        .r = 0.08 + 0.12 * t,
-        .g = 0.10,
-        .b = 0.16 + 0.18 * (1.0 - t),
-        .a = 1.0,
-    };
+    // Static dark clear. This is only ever visible when the opaque-full-screen-root contract is
+    // violated (or transiently while a live resize outruns relayout) — it used to be animated as a
+    // debug tell, but the color cycling read as a rainbow shimmer around every window during
+    // resizes. A fixed dark fill still exposes contract violations without flashing.
+    _ = frame_index;
+    // Transparent windows clear to alpha 0 — the rounded-corner cutouts the app's clip leaves
+    // uncovered composite as see-through instead of the debug fill.
+    const clear = if (gpu_ui.transparent_clear)
+        wgpu.Color{ .r = 0, .g = 0, .b = 0, .a = 0 }
+    else
+        wgpu.Color{ .r = 0.08, .g = 0.10, .b = 0.16, .a = 1.0 };
 
     // Partial repaint: when C# supplied damage rects and this frame has no backdrop-sampling op (glass /
     // custom shader needs the whole scene as a refraction source), preserve the persistent scene texture
@@ -819,7 +850,8 @@ pub fn renderFrame(
             .view = view,
             .load_op = .clear,
             .store_op = .store,
-            .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 1.0 },
+            // Alpha 0 under transparent windows so the corner cutouts survive the blit pass.
+            .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = if (gpu_ui.transparent_clear) 0.0 else 1.0 },
         };
         const pass_descriptor = wgpu.RenderPassDescriptor{
             .color_attachment_count = 1,
@@ -2412,15 +2444,27 @@ fn createImageBatch(
     ) orelse return error.WgpuImageBindGroupUnavailable;
     errdefer bind_group.release();
 
-    // Cache the texture while under the (generous) cap. Over-cap images fall through to owns_resources=true
-    // and are released after the frame is submitted (the caller's deinit) — safe, unlike evicting a cached
-    // texture mid-frame, which would free a resource still recorded in the open command encoder.
-    if (gpu_ui.image_cache.count() < gpu_ui.max_cached_images) {
+    // An app-owned handle (image_registry entry, render texture) is pinned: cached unconditionally
+    // and kept until zigote_release_texture frees it. Anything else is keyed by a hash of the
+    // inline pixels and cached only while under the (generous) cap — over-cap images fall through
+    // to owns_resources=true and are released after the frame is submitted (the caller's deinit),
+    // safe unlike evicting a cached texture mid-frame, which would free a resource still recorded
+    // in the open command encoder.
+    const pinned = image.cache_key != null;
+    if (pinned or gpu_ui.unpinned_cached < gpu_ui.max_cached_images) {
         try gpu_ui.image_cache.put(key, .{
             .texture = texture,
             .texture_view = texture_view,
             .bind_group = bind_group,
+            .pinned = pinned,
         });
+        if (pinned) {
+            // Best-effort: a failed append only means the CPU copy is freed later (at release or
+            // shutdown), never that the texture is wrong.
+            gpu_ui.uploaded_keys.append(gpu_ui.allocator, key) catch {};
+        } else {
+            gpu_ui.unpinned_cached += 1;
+        }
         return .{
             .vertex_offset = 0,
             .vertex_count = 0,

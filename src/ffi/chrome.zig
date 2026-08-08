@@ -168,6 +168,20 @@ export fn zigote_window_chrome_minimize(window_id: u32) void {
     _ = sdl3.c.SDL_MinimizeWindow(win);
 }
 
+/// Maximized or fullscreen — CSD hosts draw square corners in these states.
+export fn zigote_window_is_maximized(window_id: u32) bool {
+    const win = sdlWindow(window_id) orelse return false;
+    const flags = sdl3.c.SDL_GetWindowFlags(win);
+    return flags & (sdl3.c.SDL_WINDOW_MAXIMIZED | sdl3.c.SDL_WINDOW_FULLSCREEN) != 0;
+}
+
+/// Whether the window really has an alpha channel the compositor composites (the pre-init
+/// transparent request can be refused by the platform).
+export fn zigote_window_is_transparent(window_id: u32) bool {
+    const win = sdlWindow(window_id) orelse return false;
+    return sdl3.c.SDL_GetWindowFlags(win) & sdl3.c.SDL_WINDOW_TRANSPARENT != 0;
+}
+
 /// Maximize, or restore when already maximized (CSD button action).
 export fn zigote_window_chrome_toggle_maximize(window_id: u32) void {
     const win = sdlWindow(window_id) orelse return;

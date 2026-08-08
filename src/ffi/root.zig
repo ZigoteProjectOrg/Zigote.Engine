@@ -66,6 +66,7 @@ const text_mod = zg.text_style;
 const zigimg = @import("zigimg");
 const GpuUi = wgpu_renderer.wgpu.GpuUi;
 const backend_mod = wgpu_renderer.backend;
+const gpu_select = wgpu_renderer.gpu_select;
 const WgpuBackend = wgpu_renderer.wgpu_backend.WgpuBackend;
 
 const render_mod = zg.render;
@@ -78,6 +79,94 @@ const webp = @cImport({
     @cInclude("webp/decode.h");
     @cInclude("webp/types.h");
 });
+const builtin = @import("builtin");
+
+// ── Native crash diagnostics ──────────────────────────────────────────────────
+//
+// On a fatal signal, print the signal name + native backtrace to stderr, then hand
+// the signal back to whoever owned it before us. Chaining is not optional: the .NET
+// host runtime owns SIGSEGV/SIGABRT for its own machinery (null-reference translation,
+// stack-overflow probes) and replacing its handler outright would turn every managed
+// NullReferenceException into a process kill. Desktop glibc/macOS only — that's where
+// engine crashes get debugged and where execinfo.h exists (bionic pre-33 and musl lack it).
+const crash_diagnostics = builtin.os.tag == .macos or
+    (builtin.os.tag == .linux and builtin.abi.isGnu());
+
+const execinfo = if (crash_diagnostics) @cImport({
+    @cInclude("execinfo.h");
+}) else struct {};
+
+const fatal_sigs = [_]std.posix.SIG{ .ILL, .TRAP, .ABRT, .BUS, .FPE, .SEGV };
+var prev_sigactions: [fatal_sigs.len]std.posix.Sigaction = undefined;
+var crash_handler_installed = false;
+
+fn nativeCrashSignalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t, uctx: ?*anyopaque) callconv(.c) void {
+    const stderr_fd = std.posix.STDERR_FILENO;
+
+    const sig_name: []const u8 = switch (sig) {
+        .ILL => "SIGILL (illegal instruction, exit code 132)",
+        .TRAP => "SIGTRAP (trace/breakpoint trap, exit code 133)",
+        .ABRT => "SIGABRT (abort, exit code 134)",
+        .BUS => "SIGBUS (bus error, exit code 135)",
+        .FPE => "SIGFPE (arithmetic exception, exit code 136)",
+        .SEGV => "SIGSEGV (segmentation fault, exit code 139)",
+        else => "unknown crash signal",
+    };
+    const addr: usize = switch (builtin.os.tag) {
+        .linux => @intFromPtr(info.fields.sigfault.addr),
+        .macos => @intFromPtr(info.addr),
+        else => 0,
+    };
+
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "\n[Zigote::FATAL] native crash: signal {d} {s}, fault address 0x{x}\n--- native callstack ---\n",
+        .{ @intFromEnum(sig), sig_name, addr },
+    ) catch "\n[Zigote::FATAL] native crash\n";
+    _ = std.c.write(stderr_fd, msg.ptr, msg.len);
+
+    var frames: [64]?*anyopaque = undefined;
+    const count = execinfo.backtrace(@ptrCast(&frames), frames.len);
+    if (count > 0) execinfo.backtrace_symbols_fd(@ptrCast(&frames), count, stderr_fd);
+
+    // Hand the signal back: permanently restore the previous action, then either invoke
+    // it with the original fault context (the .NET runtime needs siginfo/ucontext intact
+    // to resume or translate) or re-raise so the default action sets the real exit code.
+    // ponytail: one-shot — after the first chained signal our reporter stays detached;
+    // re-arming safely needs Breakpad-style managed-fault filtering.
+    const idx = std.mem.indexOfScalar(std.posix.SIG, &fatal_sigs, sig) orelse return;
+    const prev = prev_sigactions[idx];
+    std.posix.sigaction(sig, &prev, null);
+    if (prev.flags & std.posix.SA.SIGINFO != 0) {
+        if (prev.handler.sigaction) |h| h(sig, info, uctx);
+    } else if (prev.handler.handler) |h| {
+        if (h != std.posix.SIG.IGN.?) h(sig);
+    } else {
+        // SIG_DFL: the signal is blocked while we run, so this delivers on return.
+        std.posix.raise(sig) catch {};
+    }
+}
+
+fn installCrashHandler() void {
+    if (!crash_diagnostics) return;
+    if (crash_handler_installed) return;
+    crash_handler_installed = true;
+
+    // Warm up the unwinder outside signal context: backtrace() lazily loads libgcc
+    // (malloc, dlopen) on first call, which is not signal-safe.
+    var warmup: [1]?*anyopaque = undefined;
+    _ = execinfo.backtrace(@ptrCast(&warmup), 1);
+
+    const sa = std.posix.Sigaction{
+        .handler = .{ .sigaction = nativeCrashSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.SIGINFO,
+    };
+    for (fatal_sigs, 0..) |sig, i| {
+        std.posix.sigaction(sig, &sa, &prev_sigactions[i]);
+    }
+}
 
 var log_callback: ?*const fn (i32, [*c]const u8) callconv(.c) void = null;
 
@@ -230,6 +319,11 @@ pub const EVT_DROP_FILE: u8 = 14;
 pub const EVT_DROP_TEXT: u8 = 15;
 pub const EVT_DROP_POSITION: u8 = 16;
 pub const EVT_DROP_COMPLETE: u8 = 17;
+// 18..26 are the touch + app-lifecycle kinds on the host side (see EventKind in ZgStructs.cs).
+/// The window moved to another display, or its display's scale/mode changed. The host re-queries
+/// zigote_get_refresh_hz + zigote_get_scale and re-paces its frame loop (a 60 Hz and a 144 Hz panel
+/// want different caps). window_id says which window; carries no other payload.
+pub const EVT_DISPLAY_CHANGED: u8 = 27;
 
 /// Modifier bits in ZgEvent.modifiers.
 pub const MOD_SHIFT: u8 = 1;
@@ -338,9 +432,40 @@ const BlurRequest = struct {
 
 // ── Engine state ──────────────────────────────────────────────────────────────
 
+/// Guards the image registry against a worker thread decoding while the render thread paints.
+/// A spin lock rather than a mutex: `std.Thread.Mutex` is gone in this zig version and
+/// `std.Io.Mutex` wants an `Io` handle the FFI layer has no reason to hold, while every critical
+/// section here is one hashmap lookup or insert. Decoding always happens outside the lock.
+const SpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *SpinLock) void {
+        var spins: u32 = 0;
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            // Image sections are a hashmap op and never get past the spins. The audio lock is also
+            // held across a container-header parse on a loader thread, which is long enough that a
+            // pure spin would burn a core of the frame loop waiting for it — so hand the CPU back
+            // once it is clear this is not a short wait.
+            spins += 1;
+            if (spins < 64) {
+                std.atomic.spinLoopHint();
+            } else {
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+        }
+    }
+
+    fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
 pub const LoadedImage = struct {
     width: u32,
     height: u32,
+    /// The decoded RGBA copy, freed once the GPU texture exists (see drainImageUploads) — an
+    /// empty slice therefore means "resident on the GPU", not "broken". Width/height stay valid
+    /// either way, which is all the paint path needs after the first upload.
     pixels: []const u8,
 };
 
@@ -399,6 +524,14 @@ const EngineState = struct {
     font_name_len: usize,
     image_registry: std.AutoHashMap(u64, LoadedImage),
     next_image_handle: u64,
+    /// Guards image_registry + next_image_handle so zigote_load_texture* can be called from a
+    /// worker thread while the render thread paints. Decoding a page-sized JPEG takes tens of
+    /// milliseconds — far too long to sit on the frame loop.
+    image_lock: SpinLock = .{},
+    /// Handles released by the app, freed at end-of-frame. Deferred because a release can arrive
+    /// mid-frame (a widget disposed during layout) while the texture is still recorded in the
+    /// open command encoder.
+    pending_image_releases: std.ArrayListUnmanaged(u64) = .empty,
     // Out-of-band UTF-8 payload for text_input / text_editing events, appended during a poll and
     // referenced by (text_off, text_len) on each such event. Cleared (retaining capacity) at the
     // start of every poll; read by C# via zigote_poll_text_ptr before the next poll.
@@ -463,7 +596,7 @@ const EngineState = struct {
     gaussian_blur: ?wgpu_blur.GaussianBlur,
 
     // First opened game controller, or null. Scanned once on first query (connect it before launch).
-    gamepad: ?sdl3.gamepad.Gamepad = null,
+    gamepads: [max_gamepads]?sdl3.gamepad.Gamepad = @splat(null),
     gamepad_scanned: bool = false,
 
     // Host scroll orientation, learned from the last mouse-wheel event's SDL direction flag
@@ -476,6 +609,14 @@ const EngineState = struct {
     // machine with no audio device leaves this null and the engine runs silently.
     audio: ?*audio_ffi.AudioState = null,
     audio_scanned: bool = false,
+    // Guards `audio` and everything reachable from it. The host opens files off the UI thread (a
+    // container header parse is plainly visible as a hitch at every track change), so the handle
+    // table is written from a worker while the frame loop reads it — and `zigote_audio_reopen`
+    // frees the whole AudioState out from under both. miniaudio's own graph is thread-safe; our
+    // bookkeeping around it was not.
+    // ponytail: one coarse lock per audio call, so a slow file open blocks the frame's audio calls
+    // for its duration. Split into a table lock + an unlocked create if that ever shows up.
+    audio_lock: SpinLock = .{},
 
     // ── Secondary OS windows (UI-only; see SecondaryWindow) ───────────────────
     windows: std.AutoHashMap(u64, *SecondaryWindow),
@@ -483,6 +624,9 @@ const EngineState = struct {
     // Fonts registered so far, replayed onto every new window's GpuUi (entry 0 = the boot font).
     loaded_fonts: std.ArrayListUnmanaged(LoadedFont) = .empty,
     emoji_family: ?[:0]u8 = null,
+    /// Script-fallback families, in priority order, so a window created after they were registered
+    /// still gets them — same reason emoji_family is kept.
+    fallback_families: std.ArrayList([:0]u8) = .empty,
 
     // ── Live-resize render callback ────────────────────────────────────────────
     // Invoked from the SDL event-watch (see resizeEventWatch) during a modal window-resize drag —
@@ -493,6 +637,17 @@ const EngineState = struct {
     resize_render_cb: ?*const fn (window_id: u32, width: u32, height: u32) callconv(.c) void = null,
     // Reentrancy guard: a render triggered from the watch must never re-enter the watch.
     in_resize_cb: bool = false,
+    // Earliest time (SDL ns-since-init) the watch may render the next live-resize frame — see
+    // resizeEventWatch. 0 = render immediately.
+    next_live_resize_ns: u64 = 0,
+
+    // ── GPU selection (see gpu_select.zig) ────────────────────────────────────
+    // The adapters enumerated at init and which one the device was created on. Snapshotted rather
+    // than re-enumerated on demand: the adapters we didn't pick are released right after selection,
+    // and the host only needs this to show "which GPUs exist / which is in use" in settings.
+    gpus: [gpu_select.max_gpus]gpu_select.GpuInfo = undefined,
+    gpu_count: u32 = 0,
+    active_gpu: i32 = -1,
 
     fn fontName(self: *const EngineState) []const u8 {
         return self.font_name_buf[0..self.font_name_len];
@@ -517,10 +672,20 @@ const EngineState = struct {
     }
 };
 
+/// The single live engine, for validating opaque handles at the FFI boundary. Cleared FIRST in
+/// zigote_shutdown so calls still in flight on .NET worker threads (async image decodes, texture
+/// releases from disposers) are rejected instead of racing the teardown — an app quit while covers
+/// were still decoding used to panic inside image_registry.put on a deinited map.
+var live_engine: std.atomic.Value(u64) = .init(0);
+
+// ZIGOTE_RESIZE_TORTURE state — see zigote_poll_events. null = env not read yet.
+var resize_torture: ?bool = null;
+var resize_torture_tick: u32 = 0;
+
 /// Cast an opaque C# handle back to an EngineState pointer.
-/// Returns null if the handle is 0 (invalid / uninitialized).
+/// Returns null if the handle is 0, stale, or the engine is shutting down.
 inline fn stateFromHandle(handle: u64) ?*EngineState {
-    if (handle == 0) return null;
+    if (handle == 0 or live_engine.load(.acquire) != handle) return null;
     return @ptrFromInt(handle);
 }
 
@@ -602,8 +767,51 @@ export fn zigote_set_log_callback(cb: *const fn (i32, [*c]const u8) callconv(.c)
 ///   title          — window title (UTF-8, null-terminated)
 ///   font_path      — path to a .ttf/.ttc font file (null → macOS default)
 ///   font_name      — font family name matching font_path (null → "Inter")
+///   gpu_power      — which GPU to prefer on a multi-GPU machine (gpu_select.Power): 0 auto,
+///                    1 performance (3D apps → discrete), 2 efficiency (2D/UI apps → integrated)
+///   gpu_index      — pin a specific GPU by its index in zigote_enumerate_gpus; -1 = use gpu_power.
+///                    Overridden by ZIGOTE_GPU / ZIGOTE_GPU_POWER when those are set.
 ///
 /// Returns .ok on success, .err on failure (check stderr for details).
+/// Pre-init switch for a transparent (alpha-composited) main window. Main-thread, call before
+/// `zigote_init`; a window cannot change transparency after creation.
+export fn zigote_set_window_transparent(enabled: bool) void {
+    pending_transparent_window = enabled;
+}
+
+// glibc malloc tunables (malloc.h). Negative by design — they share a namespace with the
+// M_* mallopt parameters.
+const M_TRIM_THRESHOLD: c_int = -1;
+const M_MMAP_THRESHOLD: c_int = -3;
+const M_ARENA_MAX: c_int = -8;
+
+extern "c" fn mallopt(param: c_int, value: c_int) c_int;
+
+/// Teach glibc that this process frees large buffers on purpose.
+///
+/// Image decoding allocates multi-megabyte buffers, uses them briefly and frees them. glibc's
+/// default mmap threshold is 128 KB, but it *raises* that threshold dynamically — up to 32 MB —
+/// whenever it sees a large mmapped block freed, on the theory that the program will want another
+/// one soon and a heap block is cheaper than a syscall. For a decode path that assumption is
+/// exactly backwards: the buffers come back at wildly different sizes, so they land in the sbrk
+/// heap, fragment it, and the freed space cannot be returned to the OS. Scrolling a music library
+/// measured a heap that grew to 67 MB and stayed there while only 20 MB was ever in use.
+///
+/// Pinning the threshold disables the dynamic adjustment, so anything this size or larger is
+/// mmapped and handed straight back on free. 1 MB rather than the 128 KB default so ordinary
+/// per-frame allocations keep using the fast heap path and do not start paying for syscalls.
+fn tuneAllocatorForLargeTransients() void {
+    if (builtin.os.tag != .linux or !builtin.abi.isGnu()) return;
+    _ = mallopt(M_MMAP_THRESHOLD, 1024 * 1024);
+    // Also return the top of the heap more eagerly than the 128 KB default.
+    _ = mallopt(M_TRIM_THRESHOLD, 4 * 1024 * 1024);
+    // And cap the arena count. glibc gives each thread that contends for the heap its own arena,
+    // up to eight per core — so a host that decodes images on a thread pool ends up with dozens,
+    // each keeping its own high-water mark of fragmented, unreturnable space. A handful is ample
+    // for a UI process, whose allocation is nothing like a server's.
+    _ = mallopt(M_ARENA_MAX, 4);
+}
+
 export fn zigote_init(
     out_handle: *u64,
     width: u32,
@@ -612,12 +820,16 @@ export fn zigote_init(
     font_path: [*c]const u8,
     font_name: [*c]const u8,
     backend: u32,
+    gpu_power: u32,
+    gpu_index: i32,
 ) ZgResult {
-    const state = zigote_init_impl(width, height, title, font_path, font_name, backend) catch |err| {
+    installCrashHandler();
+    const state = zigote_init_impl(width, height, title, font_path, font_name, backend, gpu_power, gpu_index) catch |err| {
         std.log.err("zigote_init failed: {}", .{err});
         out_handle.* = 0;
         return .err;
     };
+    live_engine.store(@intFromPtr(state), .release);
     out_handle.* = @intFromPtr(state);
     return .ok;
 }
@@ -664,6 +876,8 @@ fn zigote_init_impl(
     font_path_c: [*c]const u8,
     font_name_c: [*c]const u8,
     backend_raw: u32,
+    gpu_power: u32,
+    gpu_index: i32,
 ) !*EngineState {
     // Resolve the requested backend. Only wgpu is implemented today; native backends
     // (Vulkan/D3D12) fall back to wgpu — log when a request is downgraded so the host can surface it.
@@ -675,6 +889,7 @@ fn zigote_init_impl(
         });
     }
     const allocator = std.heap.c_allocator;
+    tuneAllocatorForLargeTransients();
 
     // wgpu is the sole GPU stack: SDL is windowing/events only. Pin SDL's own GPU API off so no
     // code path (present or future) can quietly stand up a second GPU device through SDL —
@@ -682,22 +897,36 @@ fn zigote_init_impl(
     // Inert today (nothing calls SDL_GPU), so failure to set it is harmless.
     sdl3.hints.set(.gpu_driver, "none") catch {};
 
+    const title_slice: [:0]const u8 = if (title_c != null)
+        std.mem.span(title_c)
+    else
+        "Zigote";
+
+    // App identity, before SDL_Init (SDL only reads it during subsystem startup). This is what
+    // labels the process in audio mixers (pipewire/pavucontrol shows the stream as "Zigote Editor"
+    // instead of the bare process name) and in the macOS About box.
+    // ponytail: no app identifier — that is the Wayland `app_id`, and it only buys an icon and
+    // taskbar grouping if it matches an installed `.desktop` file. Pass one here when we ship one;
+    // until then SDL's process-name fallback is no worse and at least matches the real binary.
+    sdl3.setAppMetadata(title_slice, "0.1.0", null) catch {};
+
     // Only the subsystems window creation needs. The gamepad subsystem is initialized lazily on
     // first query (see ensureGamepad) — NOT here — because a connected controller can make SDL's
     // gamepad init fail (macOS GameController/HID path), and a hard `try` at the top of init would
     // take the whole window down with it. Controllers are opt-in; a missing one must never block boot.
     try sdl3.init(.{ .video = true, .events = true });
 
-    const title_slice: [:0]const u8 = if (title_c != null)
-        std.mem.span(title_c)
-    else
-        "Zigote";
-
     var window = try sdl3.video.Window.init(
         title_slice,
         width,
         height,
-        .{ .resizable = true, .high_pixel_density = true },
+        .{
+            .resizable = true,
+            .high_pixel_density = true,
+            // Alpha-composited window for CSD rounded corners (see zigote_set_window_transparent).
+            // Without it SDL declares the whole surface opaque and the compositor ignores alpha.
+            .transparent = pending_transparent_window,
+        },
     );
     errdefer window.deinit();
 
@@ -748,12 +977,17 @@ fn zigote_init_impl(
     var surface = try createNativeSurface(instance, window, metal_layer);
     errdefer surface.release();
 
-    var adapter_opts = wgpu.RequestAdapterOptions{
-        .power_preference = .high_performance,
-        .compatible_surface = surface,
-    };
-    const adapter_resp = instance.requestAdapterSync(&adapter_opts, 1_000_000);
-    const adapter = adapter_resp.adapter orelse return error.WgpuAdapterUnavailable;
+    // Pick a GPU. On a multi-GPU machine this is where a 3D app gets the discrete card and a 2D/UI
+    // app gets the integrated one (see gpu_select.zig) — and because an adapter carries its own
+    // backend, choosing the GPU also chooses the graphics API. Falls back to wgpu's own pick.
+    const selection = try gpu_select.select(
+        instance,
+        surface,
+        instance_extras.backends,
+        gpu_select.Power.fromU32(gpu_power),
+        gpu_index,
+    );
+    const adapter = selection.adapter;
     errdefer adapter.release();
 
     // wgpu-native 29.0.1 renamed the native push-constants feature to IMMEDIATES (same value
@@ -772,11 +1006,21 @@ fn zigote_init_impl(
     } else {
         std.log.warn("zigote: adapter lacks the immediates feature; UI pipeline may fail", .{});
     }
-    const msaa2_supported = adapter.hasFeature(.texture_adapter_specific_format_features);
-    if (msaa2_supported) {
+    const has_format_features = adapter.hasFeature(.texture_adapter_specific_format_features);
+    if (has_format_features) {
         wanted_features[feature_count] = .texture_adapter_specific_format_features;
         feature_count += 1;
     }
+
+    // Whether 2× rgba16float MSAA is actually legal here — a stricter question than whether the
+    // feature above was granted; see gpu_select.allowsMsaa2 for why.
+    var adapter_info: wgpu.AdapterInfo = undefined;
+    const adapter_backend: wgpu.BackendType =
+        if (adapter.getInfo(&adapter_info) == .success) blk: {
+            defer adapter_info.freeMembers();
+            break :blk adapter_info.backend_type;
+        } else .undefined;
+    const msaa2_supported = gpu_select.allowsMsaa2(adapter_backend, has_format_features);
     var device_desc = wgpu.DeviceDescriptor{
         .label = wgpu.StringView.fromSlice("zigote-ffi device"),
         .required_limits = null,
@@ -789,8 +1033,8 @@ fn zigote_init_impl(
     const device = device_resp.device orelse return error.WgpuDeviceUnavailable;
     errdefer device.release();
 
-    // The device was created with the feature granted → 2× rgba16float MSAA is legal. Lower the
-    // 3D renderer's sample count before any Gpu3d is created (its pipelines + targets read this).
+    // 2× rgba16float MSAA is legal here (see msaa2_supported) — lower the 3D renderer's sample
+    // count before any Gpu3d is created, since its pipelines and targets both read this.
     if (msaa2_supported) wgpu_renderer.wgpu_3d.MSAA_SAMPLES = 2;
 
     const queue = device.getQueue() orelse return error.WgpuQueueUnavailable;
@@ -812,7 +1056,7 @@ fn zigote_init_impl(
         .width = @intCast(pixel_size[0]),
         .height = @intCast(pixel_size[1]),
         .present_mode = .fifo,
-        .alpha_mode = if (capabilities.alpha_mode_count > 0) capabilities.alpha_modes[0] else .auto,
+        .alpha_mode = pickAlphaMode(&capabilities, pending_transparent_window),
     };
     surface.configure(&wgpu_config);
 
@@ -827,6 +1071,13 @@ fn zigote_init_impl(
         resolved_font_name,
     );
     errdefer gpu_ui.deinit();
+
+    // Transparent frames clear to alpha 0 so uncovered pixels (rounded-corner cutouts) show the
+    // desktop through. Effective only when SDL actually granted the transparent flag AND the
+    // surface composites premultiplied alpha.
+    gpu_ui.transparent_clear = pending_transparent_window and
+        wgpu_config.alpha_mode == .premultiplied and
+        sdl3.c.SDL_GetWindowFlags(window.value) & sdl3.c.SDL_WINDOW_TRANSPARENT != 0;
 
     var state = try allocator.create(EngineState);
     state.* = .{
@@ -870,6 +1121,9 @@ fn zigote_init_impl(
         .gaussian_blur = null,
         .windows = std.AutoHashMap(u64, *SecondaryWindow).init(allocator),
         .main_window_id = window.getId() catch 0,
+        .gpus = selection.gpus,
+        .gpu_count = selection.count,
+        .active_gpu = selection.active,
     };
 
     // Record the boot font so new secondary windows replay it into their own GpuUi (whose face
@@ -893,8 +1147,14 @@ fn zigote_init_impl(
     // Install the live-resize event watch: SDL calls it from inside the modal window-resize loop, so
     // the UI keeps laying out + rendering while the user drags a window edge instead of freezing until
     // release (see resizeEventWatch). Failure is non-fatal — resize just catches up on release.
-    if (sdl3.events.addWatch(EngineState, resizeEventWatch, state)) |_| {} else |err| {
-        std.log.warn("zigote: resize event watch unavailable: {}", .{err});
+    // Windows/macOS only: those are the platforms whose OS runs a nested modal loop that blocks the
+    // app's frame loop during the drag. On Linux (X11/Wayland) the normal poll loop keeps running and
+    // already renders each size step — the watch would render a SECOND full frame per step, each
+    // ending in a vsync-blocking present, halving the resize frame rate.
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .macos) {
+        if (sdl3.events.addWatch(EngineState, resizeEventWatch, state)) |_| {} else |err| {
+            std.log.warn("zigote: resize event watch unavailable: {}", .{err});
+        }
     }
 
     return state;
@@ -902,16 +1162,29 @@ fn zigote_init_impl(
 
 /// Reconfigure the wgpu surface for whichever window changed size. The main window owns the engine's
 /// wgpu_config; a secondary window owns its own. Shared by the poll path and the live-resize watch.
+/// Reconfiguring is a full swapchain rebuild, and SDL delivers each size change TWICE — once to the
+/// live-resize watch, then again through the poll queue (watches don't consume events). Skipping an
+/// unchanged size halves the rebuilds during a drag.
 fn reconfigureSurfaceForWindow(state: *EngineState, win_id: u32, new_w: u32, new_h: u32) void {
     if (win_id == state.main_window_id) {
+        if (state.wgpu_config.width == new_w and state.wgpu_config.height == new_h) return;
         state.wgpu_config.width = new_w;
         state.wgpu_config.height = new_h;
         state.surface.configure(&state.wgpu_config);
     } else if (windowFromSdlId(state, win_id)) |win| {
+        if (win.config.width == new_w and win.config.height == new_h) return;
         win.config.width = new_w;
         win.config.height = new_h;
         win.surface.configure(&win.config);
     }
+}
+
+/// Refresh interval of the display the given window is on, in nanoseconds. Falls back to 60 Hz when
+/// SDL reports no rate (headless, or a driver that doesn't publish one).
+fn refreshIntervalNs(state: *EngineState, win_id: u32) u64 {
+    const hz = refreshHzForWindow(state, win_id);
+    if (hz <= 0) return std.time.ns_per_s / 60;
+    return @intFromFloat(@as(f64, std.time.ns_per_s) / hz);
 }
 
 /// SDL event-watch installed at init. SDL invokes this synchronously as events are pumped — crucially
@@ -925,6 +1198,15 @@ fn resizeEventWatch(userdata: ?*EngineState, event: *sdl3.events.Event) bool {
         .window_pixel_size_changed => |resized| {
             if (state.in_resize_cb) return true; // rendering must not re-enter the watch
             const cb = state.resize_render_cb orelse return true;
+            // Throttle live frames to the window's display refresh. Each one ends in a .fifo
+            // present, which blocks until vblank, and the OS emits size steps faster than that —
+            // so rendering every step makes the window trail the cursor (worst when a 60 Hz and a
+            // 144 Hz monitor are mixed and the swapchain is synced to the slower one). Skipped
+            // steps cost nothing: the poll path reconfigures and repaints at the final size as
+            // soon as the modal drag loop exits.
+            const now = sdl3.timer.getNanosecondsSinceInit();
+            if (now < state.next_live_resize_ns) return true;
+            state.next_live_resize_ns = now + refreshIntervalNs(state, resized.id);
             const new_w: u32 = @max(1, @as(u32, @intCast(resized.width)));
             const new_h: u32 = @max(1, @as(u32, @intCast(resized.height)));
             reconfigureSurfaceForWindow(state, resized.id, new_w, new_h);
@@ -985,6 +1267,51 @@ export fn zigote_wait_events(timeout_ms: u32) void {
     _ = sdl3.events.waitTimeout(@intCast(timeout_ms));
 }
 
+var app_main_cb: ?*const fn () callconv(.c) void = null;
+
+fn appMainTrampoline(argc: c_int, argv: [*c][*c]u8) callconv(.c) c_int {
+    _ = argc;
+    _ = argv;
+    const cb = app_main_cb orelse return 1;
+    cb();
+    return 0;
+}
+
+/// Register the app body for Android bring-up: SDLActivity dlsyms zigote_android_main
+/// out of libzigote.so and calls it on its own thread once the activity is up.
+export fn zigote_set_android_main(f: *const fn () callconv(.c) void) void {
+    app_main_cb = f;
+}
+
+/// Entry point called by SDLActivity on Android (SDL_main_func signature).
+export fn zigote_android_main(argc: c_int, argv: [*c][*c]u8) c_int {
+    return appMainTrampoline(argc, argv);
+}
+
+/// Run the app body under SDL's platform entry protocol: UIApplicationMain on iOS,
+/// a plain call on desktop. Returns when the app exits.
+export fn zigote_run_app(app_main: *const fn () callconv(.c) void) void {
+    app_main_cb = app_main;
+    _ = sdl3.c.SDL_RunApp(0, null, appMainTrampoline, null);
+}
+
+/// Query main-window safe-area insets (left, top, right, bottom) in logical pixels.
+/// Zeros when the whole window is safe (desktop) or the query fails.
+export fn zigote_get_safe_area(handle: u64, insets: [*c]f32) void {
+    if (insets == null) return;
+    insets[0] = 0;
+    insets[1] = 0;
+    insets[2] = 0;
+    insets[3] = 0;
+    const state = stateFromHandle(handle) orelse return;
+    const safe = state.window.getSafeArea() catch return;
+    const w, const h = state.window.getSize() catch return;
+    insets[0] = @floatFromInt(@max(0, safe.x));
+    insets[1] = @floatFromInt(@max(0, safe.y));
+    insets[2] = @floatFromInt(@max(0, @as(i64, @intCast(w)) - safe.x - safe.w));
+    insets[3] = @floatFromInt(@max(0, @as(i64, @intCast(h)) - safe.y - safe.h));
+}
+
 /// Base pointer of the out-of-band UTF-8 text buffer filled by the most recent zigote_poll_events.
 /// text_input / text_editing events carry (text_off, text_len) into this buffer. Valid only until the
 /// next poll; the caller must read all text payloads from the just-polled batch before polling again.
@@ -998,6 +1325,21 @@ export fn zigote_poll_text_ptr(handle: u64) [*c]const u8 {
 export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
     const state = stateFromHandle(handle) orelse return 0;
     var count: u32 = 0;
+
+    // ZIGOTE_RESIZE_TORTURE=1: drive a continuous sawtooth of window resizes from inside the poll,
+    // so a real app exercises its full resize path (relayout, reactive rebuilds, swapchain churn)
+    // unattended. Debug/repro hook only — costs one getenv on the first poll when unset.
+    if (resize_torture == null)
+        resize_torture = std.c.getenv("ZIGOTE_RESIZE_TORTURE") != null;
+    if (resize_torture == true) {
+        resize_torture_tick +%= 1;
+        if (resize_torture_tick % 2 == 0) {
+            // 520..919 wide: sweeps across BOTH adaptive breakpoints (600 and 840 logical px), so
+            // every pass exercises the size-class swap path, not just intra-class relayout.
+            const step: i32 = @intCast((resize_torture_tick / 2) % 400);
+            _ = sdl3.c.SDL_SetWindowSize(state.window.value, 520 + step, 500 + @mod(step * 3, 300));
+        }
+    }
 
     // Reset the out-of-band text buffer for this poll batch (retains capacity across polls).
     state.poll_text.clearRetainingCapacity();
@@ -1156,6 +1498,21 @@ export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
                 buf[count] = zge;
                 count += 1;
             },
+            // Dragged onto another monitor, or that monitor's mode/scale changed. Both mean the
+            // refresh rate and content scale the host is pacing + laying out against may now be
+            // stale, so surface one event kind for either.
+            .window_display_changed => |w| {
+                zge.kind = EVT_DISPLAY_CHANGED;
+                zge.window_id = w.id;
+                buf[count] = zge;
+                count += 1;
+            },
+            .window_display_scale_changed => |w| {
+                zge.kind = EVT_DISPLAY_CHANGED;
+                zge.window_id = w.id;
+                buf[count] = zge;
+                count += 1;
+            },
             .system_theme_changed => {
                 zge.kind = EVT_SYSTEM_THEME;
                 zge.button = systemThemeValue();
@@ -1273,11 +1630,15 @@ fn ensure3d(state: *EngineState) ?*wgpu_renderer.wgpu_3d.Gpu3d {
     return g;
 }
 
-// ── Game controller (SDL gamepad) ─────────────────────────────────────────────
+// ── Game controllers (SDL gamepad, up to 8 player slots) ──────────────────────
 
-fn ensureGamepad(state: *EngineState) ?sdl3.gamepad.Gamepad {
-    if (state.gamepad) |g| return g;
-    if (state.gamepad_scanned) return null;
+const max_gamepads = 8;
+
+// ponytail: one scan at first use, in slot-discovery order — controllers plugged in
+// after that aren't seen until restart; rescan on SDL gamepad-added/removed events
+// if hot-plug ever matters.
+fn ensureGamepads(state: *EngineState) void {
+    if (state.gamepad_scanned) return;
     // Latch the attempt BEFORE touching SDL so a failure (or a one-time stall) never repeats every
     // frame: gamepad support is best-effort, and the engine must keep running without it.
     state.gamepad_scanned = true;
@@ -1298,49 +1659,67 @@ fn ensureGamepad(state: *EngineState) ?sdl3.gamepad.Gamepad {
     std.log.info("zigote: initializing gamepad subsystem…", .{});
     sdl3.init(.{ .gamepad = true }) catch {
         std.log.warn("zigote: gamepad subsystem init failed; controller input disabled", .{});
-        return null;
+        return;
     };
     const pads = sdl3.gamepad.getGamepads() catch {
         std.log.warn("zigote: gamepad enumeration failed; controller input disabled", .{});
-        return null;
+        return;
     };
     if (pads.len == 0) {
         std.log.info("zigote: gamepad subsystem ready; no controllers detected", .{});
-        return null;
+        return;
     }
-    state.gamepad = sdl3.gamepad.Gamepad.init(pads[0]) catch {
-        std.log.warn("zigote: failed to open controller 0; controller input disabled", .{});
-        return null;
-    };
-    std.log.info("zigote: game controller connected", .{});
-    return state.gamepad;
+    var opened: u32 = 0;
+    for (pads[0..@min(pads.len, max_gamepads)], 0..) |id, i| {
+        state.gamepads[i] = sdl3.gamepad.Gamepad.init(id) catch {
+            std.log.warn("zigote: failed to open controller {d}", .{i});
+            continue;
+        };
+        opened += 1;
+    }
+    std.log.info("zigote: {d} game controller(s) connected", .{opened});
 }
 
-/// 1 if a game controller is connected (and opened), else 0.
-export fn zigote_input_gamepad_connected(handle: u64) u32 {
+fn gamepadAt(state: *EngineState, pad: u8) ?sdl3.gamepad.Gamepad {
+    if (pad >= max_gamepads) return null;
+    ensureGamepads(state);
+    return state.gamepads[pad];
+}
+
+/// Number of connected (and opened) game controllers, up to 8 slots.
+export fn zigote_input_gamepad_count(handle: u64) u32 {
     const state = stateFromHandle(handle) orelse return 0;
-    return if (ensureGamepad(state) != null) 1 else 0;
+    ensureGamepads(state);
+    var n: u32 = 0;
+    for (state.gamepads) |g| n += @intFromBool(g != null);
+    return n;
 }
 
-/// Read a controller axis, normalised to [-1, 1] (triggers report [0, 1]). SDL axis order:
+/// 1 if the game controller in slot pad is connected (and opened), else 0.
+export fn zigote_input_gamepad_connected(handle: u64, pad: u8) u32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    return @intFromBool(gamepadAt(state, pad) != null);
+}
+
+/// Read a controller axis for slot pad, normalised to [-1, 1] (triggers report [0, 1]). SDL axis order:
 /// 0 left-X, 1 left-Y, 2 right-X, 3 right-Y, 4 left-trigger, 5 right-trigger.
-export fn zigote_input_gamepad_axis(handle: u64, axis: u8) f32 {
+export fn zigote_input_gamepad_axis(handle: u64, pad: u8, axis: u8) f32 {
     if (axis >= 6) return 0;
     const state = stateFromHandle(handle) orelse return 0;
-    const g = ensureGamepad(state) orelse return 0;
+    const g = gamepadAt(state, pad) orelse return 0;
     const ax = sdl3.gamepad.Axis.fromSdl(@intCast(axis)) orelse return 0;
     const v = @as(f32, @floatFromInt(g.getAxis(ax))) / 32767.0;
     return std.math.clamp(v, -1.0, 1.0);
 }
 
-/// 1 while a controller button is held. SDL button order: 0 south(A), 1 east(B), 2 west(X),
+/// 1 while a controller button is held for slot pad. SDL button order: 0 south(A), 1 east(B), 2 west(X),
 /// 3 north(Y), 4 back, 5 guide, 6 start, 7 L-stick, 8 R-stick, 9 LB, 10 RB, 11-14 d-pad.
-export fn zigote_input_gamepad_button(handle: u64, button: u8) u32 {
+export fn zigote_input_gamepad_button(handle: u64, pad: u8, button: u8) u32 {
     if (button >= 21) return 0;
     const state = stateFromHandle(handle) orelse return 0;
-    const g = ensureGamepad(state) orelse return 0;
+    const g = gamepadAt(state, pad) orelse return 0;
     const btn = sdl3.gamepad.Button.fromSdl(@intCast(button)) orelse return 0;
-    return if (g.getButton(btn)) 1 else 0;
+    return @intFromBool(g.getButton(btn));
 }
 
 // ── Audio (miniaudio software synth) ───────────────────────────────────────────
@@ -1358,6 +1737,8 @@ fn ensureAudio(state: *EngineState) ?*audio_ffi.AudioState {
 /// Fire a one-shot tone (UI click / blip / beep). waveform: 0 sine, 1 square, 2 triangle, 3 saw, 4 noise.
 export fn zigote_audio_beep(handle: u64, freq: f32, duration: f32, volume: f32, waveform: u8) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     const a = ensureAudio(state) orelse return;
     audio_ffi.beep(a, freq, duration, volume, audio_ffi.Waveform.fromU8(waveform));
 }
@@ -1365,6 +1746,8 @@ export fn zigote_audio_beep(handle: u64, freq: f32, duration: f32, volume: f32, 
 /// Set a sustained tone on a channel (held until changed). volume<=0 or freq<=0 silences the channel.
 export fn zigote_audio_voice(handle: u64, channel: u32, freq: f32, volume: f32, waveform: u8) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     const a = ensureAudio(state) orelse return;
     audio_ffi.setVoice(a, @intCast(channel), freq, volume, audio_ffi.Waveform.fromU8(waveform));
 }
@@ -1372,18 +1755,24 @@ export fn zigote_audio_voice(handle: u64, channel: u32, freq: f32, volume: f32, 
 /// Silence every voice (one-shots, sustained channels, and all handle sources).
 export fn zigote_audio_stop_all(handle: u64) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.stopAll(a);
 }
 
 /// Age + reap fire-and-forget one-shots. Call once per frame from the host loop.
 export fn zigote_audio_update(handle: u64, dt: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.update(a, dt);
 }
 
 /// Set the spatial listener pose (position + forward + world-up). All sounds spatialise against it.
 export fn zigote_audio_set_listener(handle: u64, px: f32, py: f32, pz: f32, fx: f32, fy: f32, fz: f32, ux: f32, uy: f32, uz: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     const a = ensureAudio(state) orelse return;
     audio_ffi.setListener(a, px, py, pz, fx, fy, fz, ux, uy, uz);
 }
@@ -1391,6 +1780,8 @@ export fn zigote_audio_set_listener(handle: u64, px: f32, py: f32, pz: f32, fx: 
 /// Master output volume [0,4]; 1 = unity.
 export fn zigote_audio_set_master_volume(handle: u64, volume: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     const a = ensureAudio(state) orelse return;
     audio_ffi.setMasterVolume(a, volume);
 }
@@ -1398,6 +1789,8 @@ export fn zigote_audio_set_master_volume(handle: u64, volume: f32) void {
 /// Positioned procedural one-shot (spatialised + attenuated). waveform: 0 sine,1 square,2 tri,3 saw,4 noise.
 export fn zigote_audio_beep_3d(handle: u64, px: f32, py: f32, pz: f32, freq: f32, duration: f32, volume: f32, waveform: u8, min_dist: f32, max_dist: f32, rolloff: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     const a = ensureAudio(state) orelse return;
     audio_ffi.beep3d(a, px, py, pz, freq, duration, volume, audio_ffi.Waveform.fromU8(waveform), min_dist, max_dist, rolloff);
 }
@@ -1405,6 +1798,8 @@ export fn zigote_audio_beep_3d(handle: u64, px: f32, py: f32, pz: f32, freq: f32
 /// Create a sustained procedural-tone source (not started). Returns a handle id (0 = failure).
 export fn zigote_audio_sound_create_tone(handle: u64, freq: f32, waveform: u8) u32 {
     const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     const a = ensureAudio(state) orelse return 0;
     return audio_ffi.createTone(a, freq, audio_ffi.Waveform.fromU8(waveform)) orelse 0;
 }
@@ -1412,65 +1807,136 @@ export fn zigote_audio_sound_create_tone(handle: u64, freq: f32, waveform: u8) u
 /// Create a source from a decoded/streamed audio file (not started). Returns a handle id (0 = failure).
 export fn zigote_audio_sound_create_file(handle: u64, path_c: [*c]const u8, streaming: u32) u32 {
     const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (path_c == null) return 0;
     const a = ensureAudio(state) orelse return 0;
     const path = std.mem.span(@as([*:0]const u8, @ptrCast(path_c)));
     return audio_ffi.createFile(a, path, streaming != 0) orelse 0;
 }
 
+/// Create a sound fed by `zigote_audio_stream_push` instead of by a file — network radio, or any
+/// source the host holds bytes for (not started). Returns a handle id (0 = failure).
+export fn zigote_audio_stream_create(handle: u64) u32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    const a = ensureAudio(state) orelse return 0;
+    return audio_ffi.createStream(a) orelse 0;
+}
+
+/// Hand encoded bytes to a stream source. Returns how many were accepted; a short count means its
+/// queue is full and the caller should stop reading until it drains.
+export fn zigote_audio_stream_push(handle: u64, id: u32, data: [*c]const u8, len: u32) u32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (data == null or len == 0) return 0;
+    const a = state.audio orelse return 0;
+    return @intCast(audio_ffi.streamPush(a, id, data[0..len]));
+}
+
+/// No more bytes are coming. What is queued still plays out, then the sound reports end-of-stream.
+export fn zigote_audio_stream_finish(handle: u64, id: u32) void {
+    const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a| audio_ffi.streamFinish(a, id);
+}
+
+/// 0 connecting, 1 playing, 2 undecodable, 3 ended.
+export fn zigote_audio_stream_state(handle: u64, id: u32) u32 {
+    const state = stateFromHandle(handle) orelse return 2;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    const a = state.audio orelse return 2;
+    return audio_ffi.streamState(a, id);
+}
+
+/// Decoded audio held ahead of the mixer, in seconds — what a "Buffering…" indicator shows.
+export fn zigote_audio_stream_buffered(handle: u64, id: u32) f32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    const a = state.audio orelse return 0;
+    return audio_ffi.streamBuffered(a, id);
+}
+
 export fn zigote_audio_sound_play(handle: u64, id: u32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.play(a, id);
 }
 
 export fn zigote_audio_sound_stop(handle: u64, id: u32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.stop(a, id);
 }
 
 export fn zigote_audio_sound_destroy(handle: u64, id: u32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.destroyHandle(a, id);
 }
 
 export fn zigote_audio_sound_set_volume(handle: u64, id: u32, volume: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.setVolume(a, id, volume);
 }
 
 export fn zigote_audio_sound_set_pitch(handle: u64, id: u32, pitch: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.setPitch(a, id, pitch);
 }
 
 export fn zigote_audio_sound_set_looping(handle: u64, id: u32, looping: u32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.setLooping(a, id, looping != 0);
 }
 
 export fn zigote_audio_sound_set_spatial(handle: u64, id: u32, enabled: u32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.setSpatial(a, id, enabled != 0);
 }
 
 export fn zigote_audio_sound_set_position(handle: u64, id: u32, x: f32, y: f32, z: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.setPosition(a, id, x, y, z);
 }
 
 export fn zigote_audio_sound_set_velocity(handle: u64, id: u32, x: f32, y: f32, z: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.setVelocity(a, id, x, y, z);
 }
 
 export fn zigote_audio_sound_set_attenuation(handle: u64, id: u32, min_dist: f32, max_dist: f32, rolloff: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.setAttenuation(a, id, min_dist, max_dist, rolloff);
 }
 
 /// Returns 1 while the source is playing, else 0.
 export fn zigote_audio_sound_is_playing(handle: u64, id: u32) u32 {
     const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| return if (audio_ffi.isPlaying(a, id)) 1 else 0;
     return 0;
 }
@@ -1479,24 +1945,200 @@ export fn zigote_audio_sound_is_playing(handle: u64, id: u32) u32 {
 /// engine's audio state is torn down — there is deliberately no per-bus destroy (see audio.zig).
 export fn zigote_audio_group_create(handle: u64) u32 {
     const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     const a = ensureAudio(state) orelse return 0;
     return audio_ffi.groupCreate(a) orelse 0;
 }
 
 export fn zigote_audio_group_set_volume(handle: u64, group_id: u32, volume: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.groupSetVolume(a, group_id, volume);
 }
 
 export fn zigote_audio_group_set_pitch(handle: u64, group_id: u32, pitch: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.groupSetPitch(a, group_id, pitch);
 }
 
 /// Route a sound through a bus (group_id 0 = back to the master output).
 export fn zigote_audio_sound_set_group(handle: u64, id: u32, group_id: u32) void {
     const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.soundSetGroup(a, id, group_id);
+}
+
+// ── Device rate (high-resolution playback) ─────────────────────────────────────
+
+/// The output device's current sample rate in Hz (0 = no audio device).
+export fn zigote_audio_output_rate(handle: u64) u32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    const a = ensureAudio(state) orelse return 0;
+    return audio_ffi.outputRate(a);
+}
+
+/// Reopen the audio device at `sample_rate` Hz (0 = the device's preferred rate) and return the rate
+/// actually achieved (0 = failure, sound now disabled). A host that refuses the requested rate keeps
+/// the rate it already had, so the return value can differ from `sample_rate` without being an error —
+/// compare it against what you asked for if the distinction matters to the caller.
+///
+/// The rate is fixed when a device is created, so this tears the engine down and builds a new one:
+/// **every sound handle, mixer bus and equalizer chain is destroyed and their ids are invalid
+/// afterwards.** The caller must recreate them — which is not as harsh as it sounds, since the
+/// reason to call this is that a track with a different rate is about to be loaded anyway.
+export fn zigote_audio_reopen(handle: u64, sample_rate: u32) u32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    var previous_rate: u32 = 0;
+    if (state.audio) |a| {
+        previous_rate = audio_ffi.outputRate(a);
+        audio_ffi.deinit(a);
+        state.audio = null;
+    }
+
+    // Clear the "already tried and failed" latch: a different rate may well succeed where the last
+    // attempt did not.
+    state.audio_scanned = true;
+    state.audio = audio_ffi.initWithRate(state.allocator, sample_rate);
+
+    // The device is destroyed before the new rate is attempted, because the rate is fixed at creation
+    // and a device cannot be reconfigured in place. So a refused rate used to leave NO device at all,
+    // permanently and silently: nothing here retried, and the caller only learns that the rate was not
+    // achieved. Any host that grants exactly one rate — WASAPI shared mode against a fixed mixer
+    // format, some PipeWire and ALSA dmix configurations, Wine — went mute on the first track whose
+    // rate differed, for the rest of the session. Reclaiming the rate that was already working keeps
+    // playback alive; the caller sees a rate it did not ask for and resamples, which is the same
+    // outcome as never having asked.
+    if (state.audio == null and previous_rate != 0 and previous_rate != sample_rate)
+        state.audio = audio_ffi.initWithRate(state.allocator, previous_rate);
+
+    const a = state.audio orelse return 0;
+    return audio_ffi.outputRate(a);
+}
+
+// ── Transport (media playback: seek + position) ────────────────────────────────
+
+/// Seek a sound to an absolute position in seconds.
+export fn zigote_audio_sound_seek(handle: u64, id: u32, seconds: f32) void {
+    const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a| audio_ffi.seekSeconds(a, id, seconds);
+}
+
+/// Playback cursor in seconds; -1 when the source cannot report one.
+export fn zigote_audio_sound_cursor(handle: u64, id: u32) f32 {
+    const state = stateFromHandle(handle) orelse return -1;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a| return audio_ffi.cursorSeconds(a, id);
+    return -1;
+}
+
+/// Total length in seconds; -1 when unknown.
+export fn zigote_audio_sound_duration(handle: u64, id: u32) f32 {
+    const state = stateFromHandle(handle) orelse return -1;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a| return audio_ffi.durationSeconds(a, id);
+    return -1;
+}
+
+/// The source decoded past its last frame (playlist auto-advance signal). Unlike `is_playing` this
+/// stays false for a sound that was merely paused.
+export fn zigote_audio_sound_at_end(handle: u64, id: u32) u32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a| return if (audio_ffi.atEnd(a, id)) 1 else 0;
+    return 0;
+}
+
+/// Start a sound at an exact point on the audio clock, `seconds_from_now` ahead of now — the
+/// primitive gapless playback is built on.
+export fn zigote_audio_sound_schedule_start(handle: u64, id: u32, seconds_from_now: f32) void {
+    const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a| audio_ffi.scheduleStart(a, id, seconds_from_now);
+}
+
+// ── Equalizer chains ───────────────────────────────────────────────────────────
+
+/// Create a chain of `band_count` filters (max 16), flat until configured. 0 on failure.
+export fn zigote_audio_eq_create(handle: u64, band_count: u32) u32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    const a = ensureAudio(state) orelse return 0;
+    return audio_ffi.eqCreate(a, band_count) orelse 0;
+}
+
+/// Configure one band. kind: 0 peak, 1 low shelf, 2 high shelf. Shelves take Q (converted to the
+/// RBJ slope internally), matching how AutoEq and every parametric EQ UI specify them.
+export fn zigote_audio_eq_set_band(handle: u64, eq_id: u32, index: u32, kind: u8, freq_hz: f32, gain_db: f32, q: f32) void {
+    const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a|
+        audio_ffi.eqSetBand(a, eq_id, index, audio_ffi.BandKind.fromU8(kind), freq_hz, gain_db, q);
+}
+
+/// Bypass (0) or engage (1) the chain without losing its band settings.
+export fn zigote_audio_eq_set_enabled(handle: u64, eq_id: u32, enabled: u32) void {
+    const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a| audio_ffi.eqSetEnabled(a, eq_id, enabled != 0);
+}
+
+export fn zigote_audio_eq_destroy(handle: u64, eq_id: u32) void {
+    const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a| audio_ffi.eqDestroy(a, eq_id);
+}
+
+/// Route a sound through an equalizer chain (eq_id 0 = dry).
+export fn zigote_audio_sound_set_eq(handle: u64, id: u32, eq_id: u32) void {
+    const state = stateFromHandle(handle) orelse return;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a| audio_ffi.soundSetEq(a, id, eq_id);
+}
+
+// ── Offline decoding ───────────────────────────────────────────────────────────
+
+/// Decode a whole file to interleaved f32 at its native rate/channels — for callers that need the
+/// samples rather than playback (waveform overviews, loudness analysis, sampler/IR loading).
+/// Returns the buffer pointer as an integer (0 = failure); free it with `zigote_audio_decode_free`.
+/// Needs no audio device, so it works on machines with sound disabled. Loader threads only.
+export fn zigote_audio_decode_file(handle: u64, path_c: [*c]const u8, out_channels: *u32, out_sample_rate: *u32, out_frame_count: *u64) usize {
+    _ = handle;
+    out_channels.* = 0;
+    out_sample_rate.* = 0;
+    out_frame_count.* = 0;
+    const path = std.mem.span(path_c);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= buf.len) return 0;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const decoded = audio_ffi.decodeFile(buf[0..path.len :0], out_channels, out_sample_rate, out_frame_count) orelse return 0;
+    return @intFromPtr(decoded);
+}
+
+export fn zigote_audio_decode_free(handle: u64, frames: usize) void {
+    _ = handle;
+    if (frames == 0) return;
+    audio_ffi.decodeFree(@ptrFromInt(frames));
 }
 
 /// Translate raw ZgPaintCommand array into a native PaintList.
@@ -1619,7 +2261,17 @@ fn fillPaintList(
                 if (cmd.pixels_ptr != null and cmd.pixels_len > 0) {
                     pixels = cmd.pixels_ptr[0..cmd.pixels_len];
                 } else if (cache_key) |key| {
-                    if (state.image_registry.get(key)) |cached_img| {
+                    // Locked: a worker thread may be inserting a freshly decoded image right now,
+                    // and a rehash under a reader would hand back a dangling slice. The pixels a
+                    // hit yields stay valid for the frame — releases are deferred to end-of-frame,
+                    // which runs on this thread.
+                    state.image_lock.lock();
+                    const found = state.image_registry.get(key);
+                    state.image_lock.unlock();
+
+                    if (found) |cached_img| {
+                        // An empty slice means the texture is already on the GPU and the CPU copy
+                        // was dropped: pass through, the renderer resolves it by cache_key.
                         pixels = cached_img.pixels;
                         w = cached_img.width;
                         h = cached_img.height;
@@ -1871,6 +2523,47 @@ export fn zigote_measure_text(
 export fn zigote_get_scale(handle: u64) f32 {
     const state = stateFromHandle(handle) orelse return 1.0;
     return state.window.getDisplayScale() catch 1.0;
+}
+
+/// Refresh rate (Hz) of the display the given window currently sits on. 0 when unknown — the caller
+/// picks its own fallback. Re-query on EVT_DISPLAY_CHANGED: dragging a window from a 60 Hz panel to
+/// a 144 Hz one changes the answer.
+fn refreshHzForWindow(state: *EngineState, win_id: u32) f32 {
+    const window = if (win_id == 0 or win_id == state.main_window_id)
+        state.window
+    else if (windowFromSdlId(state, win_id)) |win| win.window else return 0;
+    const display = window.getDisplayForWindow() catch return 0;
+    const mode = display.getCurrentMode() catch return 0;
+    return mode.refresh_rate orelse 0;
+}
+
+/// Refresh rate (Hz) of the display showing `window_id` (0 = main window); 0 if unknown.
+export fn zigote_get_refresh_hz(handle: u64, window_id: u32) f32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    return refreshHzForWindow(state, window_id);
+}
+
+/// One enumerated GPU as handed to the host. Alias so the FFI surface names it the way the rest of
+/// the C ABI does (and so the C# binding generator maps it to the `ZgGpuInfo` struct).
+pub const ZgGpuInfo = gpu_select.GpuInfo;
+
+/// Copy up to `max` enumerated GPUs into `out`, returning how many were written. This is the list
+/// the engine chose from at init (see gpu_select.zig) — it does not re-scan, so it is cheap and
+/// stable for the lifetime of the handle. Pass a null `out_gpus` to just query the count.
+/// (Named `out_gpus`, not `out`: the C# binding generator uses the parameter name verbatim and
+/// `out` is a keyword there.)
+export fn zigote_enumerate_gpus(handle: u64, out_gpus: [*c]ZgGpuInfo, max: u32) u32 {
+    const state = stateFromHandle(handle) orelse return 0;
+    const n = @min(state.gpu_count, max);
+    if (out_gpus != null) @memcpy(out_gpus[0..n], state.gpus[0..n]);
+    return n;
+}
+
+/// Index (into zigote_enumerate_gpus) of the GPU the device was created on, or -1 when the adapter
+/// came from wgpu's own fallback pick and is not one of the enumerated entries.
+export fn zigote_get_active_gpu(handle: u64) i32 {
+    const state = stateFromHandle(handle) orelse return -1;
+    return state.active_gpu;
 }
 
 // ── 3D Scene FFI ──────────────────────────────────────────────────────────────
@@ -3317,7 +4010,14 @@ fn createSecondaryWindowImpl(
         title_slice,
         width,
         height,
-        .{ .resizable = true, .high_pixel_density = true },
+        // Same alpha channel the main window asked for, or a secondary window (devtools, Settings)
+        // would sit next to it with square corners: the per-frame CSD rounding clips only on a
+        // window the compositor actually composites (zigote_window_is_transparent).
+        .{
+            .resizable = true,
+            .high_pixel_density = true,
+            .transparent = pending_transparent_window,
+        },
     );
     errdefer window.deinit();
 
@@ -3350,7 +4050,12 @@ fn createSecondaryWindowImpl(
         .width = @intCast(pixel_size[0]),
         .height = @intCast(pixel_size[1]),
         .present_mode = .fifo,
-        .alpha_mode = if (capabilities.alpha_mode_count > 0) capabilities.alpha_modes[0] else .auto,
+        .alpha_mode = if (pending_transparent_window)
+            pickAlphaMode(&capabilities, true)
+        else if (capabilities.alpha_mode_count > 0)
+                capabilities.alpha_modes[0]
+            else
+                .auto,
     };
     surface.configure(&config);
 
@@ -3371,6 +4076,13 @@ fn createSecondaryWindowImpl(
         }
     }
     if (state.emoji_family) |fam| gpu_ui.text.addEmojiFontFamily(fam);
+    for (state.fallback_families.items) |fam| gpu_ui.text.addFallbackFontFamily(fam);
+
+    // Clear to alpha 0 so the rounded-corner cutouts show the desktop (see the same line in
+    // zigote_init) — only where SDL granted transparency and the surface premultiplies.
+    gpu_ui.transparent_clear = pending_transparent_window and
+        config.alpha_mode == .premultiplied and
+        sdl3.c.SDL_GetWindowFlags(window.value) & sdl3.c.SDL_WINDOW_TRANSPARENT != 0;
 
     const win = try state.allocator.create(SecondaryWindow);
     errdefer state.allocator.destroy(win);
@@ -3472,6 +4184,22 @@ export fn zigote_window_set_position(handle: u64, window_handle: u64, x: i32, y:
     const state = stateFromHandle(handle) orelse return;
     const win = windowFromHandle(state, window_handle) orelse return;
     win.window.setPosition(.{ .absolute = x }, .{ .absolute = y }) catch {};
+}
+
+/// Hide or show the MAIN window without destroying it.
+///
+/// What a media player needs to keep playing after its window is closed: destroying the window
+/// would take the render surface and the event loop's reason to exist with it, while hiding leaves
+/// everything running with nothing on screen. Showing raises as well, because the only reason to
+/// show a hidden window is that the user asked for it back.
+export fn zigote_main_window_set_visible(handle: u64, visible: u32) void {
+    const state = stateFromHandle(handle) orelse return;
+    if (visible == 0) {
+        state.window.hide() catch {};
+        return;
+    }
+    state.window.show() catch {};
+    state.window.raise() catch {};
 }
 
 /// Screen position (top-left, logical desktop coordinates) of the MAIN engine window.
@@ -3627,6 +4355,11 @@ export fn zigote_set_clipboard(text_ptr: [*c]const u8) void {
 export fn zigote_shutdown(handle: u64) void {
     const state = stateFromHandle(handle) orelse return;
 
+    // Close the FFI gate FIRST: async image decodes on .NET worker threads can still be in flight
+    // (an app quit while covers were decoding), and every entry point re-validates the handle via
+    // stateFromHandle. Anyone already past the gate is drained by taking image_lock below.
+    live_engine.store(0, .release);
+
     // Secondary windows first — they borrow the shared device/queue released below.
     {
         var win_it = state.windows.valueIterator();
@@ -3642,12 +4375,20 @@ export fn zigote_shutdown(handle: u64) void {
     }
     state.loaded_fonts.deinit(state.allocator);
     if (state.emoji_family) |fam| state.allocator.free(fam);
+    for (state.fallback_families.items) |fam| state.allocator.free(fam);
+    state.fallback_families.deinit(state.allocator);
 
+    // Under image_lock: waits out any worker already inside registerImage/release_texture; workers
+    // arriving after this are rejected by the gate (or the re-check those paths do under the lock).
+    state.image_lock.lock();
     var it = state.image_registry.iterator();
     while (it.next()) |entry| {
-        state.allocator.free(entry.value_ptr.*.pixels);
+        // Empty = the CPU copy was already dropped after upload (drainImageUploads).
+        if (entry.value_ptr.*.pixels.len > 0) state.allocator.free(entry.value_ptr.*.pixels);
     }
     state.image_registry.deinit();
+    state.pending_image_releases.deinit(state.allocator);
+    state.image_lock.unlock();
     state.node_handles.deinit();
     state.poll_text.deinit(state.allocator);
 
@@ -3668,9 +4409,15 @@ export fn zigote_shutdown(handle: u64) void {
         state.physics = null;
     }
 
-    if (state.audio) |a| {
-        audio_ffi.deinit(a);
-        state.audio = null;
+    // Under the lock: a loader thread may still be inside an audio call when the host shuts down.
+    {
+        state.audio_lock.lock();
+        defer state.audio_lock.unlock();
+        if (state.audio) |a| {
+            audio_ffi.deinit(a);
+            state.audio = null;
+        }
+        state.audio_scanned = true; // nothing may lazily reopen a device on a shutting-down engine
     }
 
     // Clean up render textures (remove their image_cache entries first to avoid double-release)
@@ -3707,7 +4454,124 @@ export fn zigote_shutdown(handle: u64) void {
     sdl3.quit(.{ .video = true, .events = true });
     sdl3.shutdown();
 
-    state.allocator.destroy(state);
+    // Deliberately NOT destroyed: a worker that passed the gate before it closed may still spin on
+    // image_lock (it then re-checks the gate and bails). Freeing the state under it would turn that
+    // benign late call into use-after-free. One EngineState leaks per init/shutdown cycle — a few KB,
+    // once, at process exit in practice.
+    // ponytail: intentional leak; refcount the handle if init/shutdown ever cycles in-process.
+}
+
+/// Take ownership of a decoded RGBA buffer and hand back the handle the paint stream refers to.
+/// Frees `bytes` and returns 0 if the registry cannot grow, so callers never leak on failure.
+fn registerImage(state: *EngineState, w: u32, h: u32, bytes: []u8) u64 {
+    state.image_lock.lock();
+    defer state.image_lock.unlock();
+
+    // Re-check under the lock: the engine may have shut down while this worker was decoding
+    // (zigote_shutdown deinits the registry holding this same lock).
+    if (live_engine.load(.acquire) != @intFromPtr(state)) {
+        state.allocator.free(bytes);
+        return 0;
+    }
+
+    const img_handle = state.next_image_handle;
+    state.next_image_handle += 1;
+    state.image_registry.put(img_handle, .{
+        .width = w,
+        .height = h,
+        .pixels = bytes,
+    }) catch {
+        state.allocator.free(bytes);
+        return 0;
+    };
+    return img_handle;
+}
+
+/// Release a texture handle returned by any zigote_load_texture* call: the CPU pixel copy and the
+/// GPU texture both go. Deferred to the end of the current frame (see drainImageReleases), so it
+/// is safe to call at any point, including from a widget being disposed mid-layout. Releasing an
+/// unknown or already-released handle is a no-op.
+export fn zigote_release_texture(handle: u64, image_handle: u64) void {
+    const state = stateFromHandle(handle) orelse return;
+    if (image_handle == 0) return;
+    state.image_lock.lock();
+    defer state.image_lock.unlock();
+    // Re-check under the lock — see registerImage.
+    if (live_engine.load(.acquire) != handle) return;
+    state.pending_image_releases.append(state.allocator, image_handle) catch {};
+}
+
+/// Live texture accounting: how many handles exist, how much decoded RGBA is still held on the CPU
+/// (only images not yet painted), and how much is resident on the GPU. An image-heavy app drives its
+/// own cache budget off this — and it is what makes a leak visible instead of merely fatal.
+export fn zigote_image_stats(handle: u64, out_count: *u32, out_cpu_bytes: *u64, out_gpu_bytes: *u64) void {
+    out_count.* = 0;
+    out_cpu_bytes.* = 0;
+    out_gpu_bytes.* = 0;
+    const state = stateFromHandle(handle) orelse return;
+
+    state.image_lock.lock();
+    defer state.image_lock.unlock();
+
+    var cpu: u64 = 0;
+    var gpu: u64 = 0;
+    var it = state.image_registry.iterator();
+    while (it.next()) |entry| {
+        cpu += entry.value_ptr.pixels.len;
+        if (state.gpu_ui.image_cache.contains(entry.key_ptr.*))
+            gpu += @as(u64, entry.value_ptr.width) * entry.value_ptr.height * 4;
+    }
+
+    out_count.* = state.image_registry.count();
+    out_cpu_bytes.* = cpu;
+    out_gpu_bytes.* = gpu;
+}
+
+/// End-of-frame: drop the CPU copy of every image that now has a GPU texture. Holding both costs
+/// a second full RGBA buffer per image — 24 MB for a single 2000×3000 page.
+fn drainImageUploads(state: *EngineState) void {
+    if (state.gpu_ui.uploaded_keys.items.len == 0) return;
+
+    for (state.gpu_ui.uploaded_keys.items) |key| {
+        // Detach the buffer under the lock, free it outside: freeing a 24 MB page can walk the
+        // allocator for a while and a decoding worker should not spin on that.
+        state.image_lock.lock();
+        const pixels = blk: {
+            const entry = state.image_registry.getPtr(key) orelse break :blk &.{};
+            const p = entry.pixels;
+            entry.pixels = &.{};
+            break :blk p;
+        };
+        state.image_lock.unlock();
+        if (pixels.len > 0) state.allocator.free(pixels);
+    }
+    state.gpu_ui.uploaded_keys.clearRetainingCapacity();
+}
+
+/// End-of-frame: free everything the app released during the frame.
+fn drainImageReleases(state: *EngineState) void {
+    // Detach the pending list under the lock before iterating: zigote_release_texture appends from
+    // worker threads (widget disposers), and an append mid-iteration reallocates under our feet.
+    state.image_lock.lock();
+    const keys = state.pending_image_releases.toOwnedSlice(state.allocator) catch {
+        state.image_lock.unlock();
+        return; // OOM: keep the list intact, retry next frame
+    };
+    state.image_lock.unlock();
+    defer state.allocator.free(keys);
+
+    for (keys) |key| {
+        state.image_lock.lock();
+        const removed = state.image_registry.fetchRemove(key);
+        state.image_lock.unlock();
+
+        if (removed) |kv| {
+            if (kv.value.pixels.len > 0) state.allocator.free(kv.value.pixels);
+            // gpu_ui is render-thread-only, so this needs no image lock — and must not hold one:
+            // releasing wgpu resources is not a short operation.
+            _ = state.gpu_ui.releaseCachedImage(key);
+        }
+    }
 }
 
 export fn zigote_load_texture(handle: u64, path_c: [*c]const u8, out_w: *u32, out_h: *u32) u64 {
@@ -3726,16 +4590,8 @@ export fn zigote_load_texture(handle: u64, path_c: [*c]const u8, out_w: *u32, ou
     var h: u32 = 0;
     const bytes = loadTextureBytes(state.allocator, file_data, &w, &h) orelse return 0;
 
-    const img_handle = state.next_image_handle;
-    state.next_image_handle += 1;
-    state.image_registry.put(img_handle, .{
-        .width = w,
-        .height = h,
-        .pixels = bytes,
-    }) catch {
-        state.allocator.free(bytes);
-        return 0;
-    };
+    const img_handle = registerImage(state, w, h, bytes);
+    if (img_handle == 0) return 0;
 
     out_w.* = w;
     out_h.* = h;
@@ -3771,16 +4627,8 @@ export fn zigote_load_texture_mask(handle: u64, path_c: [*c]const u8, out_w: *u3
         bytes[i + 3] = val;
     }
 
-    const img_handle = state.next_image_handle;
-    state.next_image_handle += 1;
-    state.image_registry.put(img_handle, .{
-        .width = w,
-        .height = h,
-        .pixels = bytes,
-    }) catch {
-        state.allocator.free(bytes);
-        return 0;
-    };
+    const img_handle = registerImage(state, w, h, bytes);
+    if (img_handle == 0) return 0;
 
     out_w.* = w;
     out_h.* = h;
@@ -3796,16 +4644,8 @@ export fn zigote_load_texture_from_memory(handle: u64, data_ptr: [*c]const u8, d
     var h: u32 = 0;
     const bytes = loadTextureBytes(state.allocator, data, &w, &h) orelse return 0;
 
-    const img_handle = state.next_image_handle;
-    state.next_image_handle += 1;
-    state.image_registry.put(img_handle, .{
-        .width = w,
-        .height = h,
-        .pixels = bytes,
-    }) catch {
-        state.allocator.free(bytes);
-        return 0;
-    };
+    const img_handle = registerImage(state, w, h, bytes);
+    if (img_handle == 0) return 0;
 
     out_w.* = w;
     out_h.* = h;
@@ -3873,6 +4713,90 @@ fn downsampleRgba(allocator: std.mem.Allocator, src: []const u8, w: u32, h: u32,
     return ScaledImage{ .pixels = dst, .width = dw, .height = dh };
 }
 
+/// One source pixel as RGBA8, straight out of whatever the decoder produced. Covers the formats
+/// photographic content actually arrives in; anything exotic returns null and the caller falls back
+/// to converting the whole image first.
+inline fn samplePixel(pixels: *const zigimg.color.PixelStorage, i: usize) ?[4]u32 {
+    return switch (pixels.*) {
+        .rgba32 => |p| .{ p[i].r, p[i].g, p[i].b, p[i].a },
+        .rgb24 => |p| .{ p[i].r, p[i].g, p[i].b, 255 },
+        .bgra32 => |p| .{ p[i].r, p[i].g, p[i].b, p[i].a },
+        .bgr24 => |p| .{ p[i].r, p[i].g, p[i].b, 255 },
+        .grayscale8 => |p| .{ p[i].value, p[i].value, p[i].value, 255 },
+        .grayscale8Alpha => |p| .{ p[i].value, p[i].value, p[i].value, p[i].alpha },
+        else => null,
+    };
+}
+
+/// Box-downsample straight from decoded pixels into the destination, converting per sample.
+///
+/// This exists so a thumbnail never costs a full-size RGBA buffer. Going through an intermediate
+/// meant a 1800×1800 JPEG allocated ~10 MB of rgb24, then ~13 MB of rgba32, then a ~13 MB copy of
+/// that, to produce 147 KB — and with a general-purpose allocator those peaks are what the process
+/// keeps. Here the only allocation is the destination.
+///
+/// Returns null when no scaling is needed, or when the pixel format is one samplePixel does not
+/// know; the caller handles both.
+fn downsampleFromPixels(allocator: std.mem.Allocator, pixels: *const zigimg.color.PixelStorage, w: u32, h: u32, max_dim: u32) ?ScaledImage {
+    // A malformed file can decode with a zero axis, and the format probe below indexes pixel 0.
+    if (w == 0 or h == 0) return null;
+    const fw: f32 = @floatFromInt(w);
+    const fh: f32 = @floatFromInt(h);
+    const fmax: f32 = @floatFromInt(max_dim);
+    const scale = @min(fmax / fw, fmax / fh);
+    if (scale >= 1.0) return null;
+    if (samplePixel(pixels, 0) == null) return null; // format we cannot read directly
+
+    const dw: u32 = @max(1, @as(u32, @intFromFloat(fw * scale)));
+    const dh: u32 = @max(1, @as(u32, @intFromFloat(fh * scale)));
+    const dst = allocator.alloc(u8, @as(usize, dw) * @as(usize, dh) * 4) catch return null;
+
+    const bx = fw / @as(f32, @floatFromInt(dw));
+    const by = fh / @as(f32, @floatFromInt(dh));
+
+    var dy: u32 = 0;
+    while (dy < dh) : (dy += 1) {
+        const sy0: u32 = @intFromFloat(@as(f32, @floatFromInt(dy)) * by);
+        var sy1: u32 = @intFromFloat(@as(f32, @floatFromInt(dy + 1)) * by);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > h) sy1 = h;
+        var dx: u32 = 0;
+        while (dx < dw) : (dx += 1) {
+            const sx0: u32 = @intFromFloat(@as(f32, @floatFromInt(dx)) * bx);
+            var sx1: u32 = @intFromFloat(@as(f32, @floatFromInt(dx + 1)) * bx);
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx1 > w) sx1 = w;
+
+            var r: u32 = 0;
+            var g: u32 = 0;
+            var b: u32 = 0;
+            var a: u32 = 0;
+            var n: u32 = 0;
+            var yy: u32 = sy0;
+            while (yy < sy1) : (yy += 1) {
+                const row = @as(usize, yy) * @as(usize, w);
+                var xx: u32 = sx0;
+                while (xx < sx1) : (xx += 1) {
+                    const px = samplePixel(pixels, row + @as(usize, xx)) orelse continue;
+                    r += px[0];
+                    g += px[1];
+                    b += px[2];
+                    a += px[3];
+                    n += 1;
+                }
+            }
+            if (n == 0) n = 1;
+            const di = (@as(usize, dy) * @as(usize, dw) + @as(usize, dx)) * 4;
+            dst[di] = @intCast(r / n);
+            dst[di + 1] = @intCast(g / n);
+            dst[di + 2] = @intCast(b / n);
+            dst[di + 3] = @intCast(a / n);
+        }
+    }
+
+    return ScaledImage{ .pixels = dst, .width = dw, .height = dh };
+}
+
 /// Decode an image from memory, downsampling to fit within max_dim (0 = no scaling). Bounds the CPU +
 /// GPU memory of image-heavy UIs whose source images are far larger than they are displayed.
 export fn zigote_load_texture_from_memory_scaled(handle: u64, data_ptr: [*c]const u8, data_len: usize, max_dim: u32, out_w: *u32, out_h: *u32) u64 {
@@ -3882,6 +4806,36 @@ export fn zigote_load_texture_from_memory_scaled(handle: u64, data_ptr: [*c]cons
 
     var w: u32 = 0;
     var h: u32 = 0;
+
+    // Everything zigimg handles decodes exactly once here, and the result is either scaled straight
+    // out of the decoder's buffer or moved out of it whole. WebP has its own decoder and falls
+    // through to the general path below.
+    if (!isWebP(data)) {
+        var img = zigimg.Image.fromMemory(state.allocator, data) catch |err| {
+            std.log.err("zigote: image decode failed: {}", .{err});
+            return 0;
+        };
+        defer img.deinit(state.allocator);
+
+        const iw: u32 = @intCast(img.width);
+        const ih: u32 = @intCast(img.height);
+
+        // Scaling reads the decoded pixels directly, so a thumbnail never costs a full-size RGBA
+        // buffer. Returns null when there is nothing to scale or the format is one it cannot read,
+        // and then the whole image is moved out instead.
+        const result: ScaledImage = if (max_dim > 0)
+            downsampleFromPixels(state.allocator, &img.pixels, iw, ih, max_dim) orelse
+                ScaledImage{ .pixels = toRgbaOwned(state.allocator, &img) orelse return 0, .width = iw, .height = ih }
+        else
+            ScaledImage{ .pixels = toRgbaOwned(state.allocator, &img) orelse return 0, .width = iw, .height = ih };
+
+        const decoded_handle = registerImage(state, result.width, result.height, result.pixels);
+        if (decoded_handle == 0) return 0;
+        out_w.* = result.width;
+        out_h.* = result.height;
+        return decoded_handle;
+    }
+
     var bytes = loadTextureBytes(state.allocator, data, &w, &h) orelse return 0;
 
     if (max_dim > 0 and (w > max_dim or h > max_dim)) {
@@ -3893,16 +4847,8 @@ export fn zigote_load_texture_from_memory_scaled(handle: u64, data_ptr: [*c]cons
         }
     }
 
-    const img_handle = state.next_image_handle;
-    state.next_image_handle += 1;
-    state.image_registry.put(img_handle, .{
-        .width = w,
-        .height = h,
-        .pixels = bytes,
-    }) catch {
-        state.allocator.free(bytes);
-        return 0;
-    };
+    const img_handle = registerImage(state, w, h, bytes);
+    if (img_handle == 0) return 0;
 
     out_w.* = w;
     out_h.* = h;
@@ -3997,6 +4943,27 @@ export fn zigote_text_layout_move_caret(eng: u64, layout_handle: u64, text_offse
     return state.gpu_ui.text.moveCaretTextLayout(layout_handle, text_offset, direction);
 }
 
+/// Register already-decoded RGBA8 pixels as a texture handle. For callers that produced their
+/// pixels rather than loading a file — a procedural page, a video frame, an extension handing back
+/// raw bytes — which otherwise have to encode to PNG purely to get past the decoder.
+/// Release it with zigote_release_texture like any other handle. Returns 0 on error.
+export fn zigote_load_texture_from_rgba(
+    handle: u64,
+    pixels_ptr: [*c]const u8,
+    pixels_len: usize,
+    width: u32,
+    height: u32,
+) u64 {
+    const state = stateFromHandle(handle) orelse return 0;
+    if (pixels_ptr == null or width == 0 or height == 0) return 0;
+
+    const expected_len = @as(usize, width) * @as(usize, height) * 4;
+    if (pixels_len < expected_len) return 0;
+
+    const copy = state.allocator.dupe(u8, pixels_ptr[0..expected_len]) catch return 0;
+    return registerImage(state, width, height, copy);
+}
+
 /// Upload a custom glyph atlas (R8 grayscale) and return a texture handle.
 /// The handle can be used in CMD_GLYPH_RUN commands via AddGlyphRun().
 /// Returns 0 on error.
@@ -4024,18 +4991,7 @@ export fn zigote_upload_glyph_atlas(
     }
 
     // Assign a handle and store pixels in image_registry for lifecycle tracking
-    const img_handle = state.next_image_handle;
-    state.next_image_handle += 1;
-    state.image_registry.put(img_handle, .{
-        .width = width,
-        .height = height,
-        .pixels = rgba,
-    }) catch {
-        state.allocator.free(rgba);
-        return 0;
-    };
-
-    return img_handle;
+    return registerImage(state, width, height, rgba);
 }
 
 /// Load a font face from a file path and register it under `name`.
@@ -4079,7 +5035,43 @@ export fn zigote_add_emoji_font(handle: u64, name_ptr: [*c]const u8) ZgResult {
     return .ok;
 }
 
+/// Register `name` as a script-fallback family: text the requested face cannot render falls
+/// through these, in registration order, before giving up and drawing .notdef. The font must have
+/// been loaded first via zigote_load_font or the initial font list.
+///
+/// This is what lets an app whose bundled face covers only Latin still display Japanese, Korean,
+/// Chinese, Arabic or Thai — the host registers whatever the platform ships.
+/// Returns .ok on success, .err on failure.
+export fn zigote_add_fallback_font(handle: u64, name_ptr: [*c]const u8) ZgResult {
+    const state = stateFromHandle(handle) orelse return .err;
+    if (name_ptr == null) return .err;
+    const name = std.mem.span(name_ptr);
+
+    state.gpu_ui.text.addFallbackFontFamily(name);
+    var it = state.windows.valueIterator();
+    while (it.next()) |win| win.*.gpu_ui.text.addFallbackFontFamily(name);
+
+    const owned = state.allocator.dupeZ(u8, name) catch return .ok;
+    state.fallback_families.append(state.allocator, owned) catch state.allocator.free(owned);
+    return .ok;
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Set by `zigote_set_window_transparent` BEFORE `zigote_init`: create the main window with an
+/// alpha channel the compositor composites (SDL_WINDOW_TRANSPARENT + a premultiplied wgpu
+/// surface). CSD hosts use it to draw rounded window corners — the frame clears to alpha 0 and
+/// the app clips its paint to a rounded rect. Ignored where the compositor/surface can't do
+/// alpha (the query export below reports what actually took).
+var pending_transparent_window: bool = false;
+
+fn pickAlphaMode(caps: *const wgpu.SurfaceCapabilities, want_transparent: bool) wgpu.CompositeAlphaMode {
+    if (want_transparent) {
+        for (caps.alpha_modes[0..caps.alpha_mode_count]) |m|
+        if (m == .premultiplied) return m;
+    }
+    return if (caps.alpha_mode_count > 0) caps.alpha_modes[0] else .auto;
+}
 
 fn pickSurfaceFormat(formats: []const wgpu.TextureFormat) wgpu.TextureFormat {
     for (formats) |f| {
@@ -4865,6 +5857,11 @@ fn renderFrameV2Impl(state: *EngineState) !void {
 /// End the frame — clear transient per-frame data.
 export fn zigote_end_frame(handle: u64) void {
     const state = stateFromHandle(handle) orelse return;
+    // Image lifecycle, both halves, at the one point in the frame where the command encoder is
+    // closed and submitted: drop CPU copies of everything now on the GPU, then free what the app
+    // released during the frame.
+    drainImageUploads(state);
+    drainImageReleases(state);
     state.pending_scene_w = 0;
     state.pending_scene_h = 0;
     state.paint_list.clearRetainingCapacity(state.allocator);
@@ -5486,7 +6483,48 @@ export fn zigote_debug_get_engine_stats(handle: u64, out_stats: *ZgEngineStats) 
     out.gpu_texture_memory += um.coverage_atlas + um.emoji_atlas + um.scene + um.backdrop;
     out.gpu_buffer_memory += um.vertex_buffers;
 
+    // Cached images count too. Leaving them out made this number a poor guide in exactly the app
+    // that needs it most: in anything art-heavy — a music library, a photo grid — the image cache
+    // dwarfs every atlas here, so a stats panel reporting only atlases showed a flat few megabytes
+    // while the process grew by hundreds. Walked rather than tracked incrementally because the
+    // registry is the authority on what is actually resident.
+    {
+        state.image_lock.lock();
+        defer state.image_lock.unlock();
+        var it = state.image_registry.iterator();
+        while (it.next()) |entry| {
+            if (state.gpu_ui.image_cache.contains(entry.key_ptr.*))
+                out.gpu_texture_memory += @as(u64, entry.value_ptr.width) * entry.value_ptr.height * 4;
+        }
+    }
+
     out_stats.* = out;
+}
+
+/// Turn an already-decoded image into an owned RGBA8 buffer, *moving* rather than copying.
+///
+/// Both branches used to end in `allocator.dupe`, which meant a full-size second copy of an image
+/// that had just been allocated and was about to be thrown away — the single largest transient in
+/// the whole load path. The storage the decoder (or the converter) produced is already exactly the
+/// buffer we want, so it is handed over and the source union is set to `.invalid`, whose `deinit`
+/// is a no-op. Ownership of the returned slice passes to the caller.
+fn toRgbaOwned(allocator: std.mem.Allocator, img: *zigimg.Image) ?[]u8 {
+    // RGBA8 PNGs already decode straight to rgba32. Converting rgba32 -> rgba32 trips an error in
+    // zigimg's PixelFormatConverter, which previously dropped every truecolour+alpha texture (it
+    // rendered as flat white), so this case must be taken before the converter.
+    if (img.pixels == .rgba32) {
+        const bytes = std.mem.sliceAsBytes(img.pixels.rgba32);
+        img.pixels = .{ .invalid = {} };
+        return bytes;
+    }
+
+    var rgba = zigimg.PixelFormatConverter.convert(allocator, &img.pixels, .rgba32) catch |err| {
+        std.log.err("zigote: pixel-format convert to rgba32 failed: {}", .{err});
+        return null;
+    };
+    const bytes = std.mem.sliceAsBytes(rgba.rgba32);
+    rgba = .{ .invalid = {} };
+    return bytes;
 }
 
 fn loadTextureBytes(allocator: std.mem.Allocator, file_data: []const u8, out_w: *u32, out_h: *u32) ?[]u8 {
@@ -5502,20 +6540,94 @@ fn loadTextureBytes(allocator: std.mem.Allocator, file_data: []const u8, out_w: 
 
         out_w.* = @intCast(img.width);
         out_h.* = @intCast(img.height);
-
-        // RGBA8 PNGs already decode straight to rgba32. Converting rgba32 -> rgba32 trips an
-        // error in zigimg's PixelFormatConverter, which previously dropped every truecolour+
-        // alpha texture (it rendered as flat white). Copy directly in that case.
-        if (img.pixels == .rgba32) {
-            return allocator.dupe(u8, std.mem.sliceAsBytes(img.pixels.rgba32)) catch return null;
-        }
-
-        var rgba = zigimg.PixelFormatConverter.convert(allocator, &img.pixels, .rgba32) catch |err| {
-            std.log.err("zigote: pixel-format convert to rgba32 failed: {}", .{err});
-            return null;
-        };
-        defer rgba.deinit(allocator);
-
-        return allocator.dupe(u8, std.mem.sliceAsBytes(rgba.rgba32)) catch return null;
+        return toRgbaOwned(allocator, &img);
     }
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+// The audio handle table is written from a loader thread (a host opens a track off the UI thread
+// so the container-header parse does not hitch the frame) and read by the frame loop, and
+// zigote_audio_reopen frees the whole AudioState out from under both. Every entry point must take
+// audio_lock, and the failure mode of forgetting one is not a test failure somewhere else — it is
+// a rare use-after-free in a release build hours into playback. So the check is on the source: a
+// new zigote_audio_* export that does not lock fails here, at the moment it is written.
+test "every audio FFI export takes audio_lock" {
+    const src = @embedFile("root.zig");
+    // Stateless and slow (a whole-file decode): deliberately outside the lock, see the exports.
+    const exempt = [_][]const u8{ "zigote_audio_decode_file", "zigote_audio_decode_free" };
+
+    const decl = "export fn zigote_audio_";
+    var checked: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, decl)) |found| {
+        at = found + decl.len;
+        // Only a real declaration, which starts a line. Skips this test's own mention of the string.
+        if (found != 0 and src[found - 1] != '\n') continue;
+
+        const name_start = found + "export fn ".len;
+        const name = src[name_start..std.mem.indexOfScalarPos(u8, src, name_start, '(').?];
+
+        const exempted = for (exempt) |e| {
+            if (std.mem.eql(u8, name, e)) break true;
+        } else false;
+        if (exempted) continue;
+
+        // The lock must come before anything else touches the state, so look only at the head of
+        // the body — far enough for the stateFromHandle line, short enough that a lock buried after
+        // a state access does not pass.
+        const head = src[found..@min(src.len, found + 320)];
+        if (std.mem.indexOf(u8, head, "state.audio_lock.lock();") == null) {
+            std.debug.print("unguarded audio export: {s}\n", .{name});
+            return error.AudioExportNotLocked;
+        }
+        checked += 1;
+    }
+
+    // A rename that silently matches nothing would otherwise make this test vacuously pass.
+    try std.testing.expect(checked >= 40);
+}
+
+// downsampleFromPixels reads the decoder's own buffer rather than a converted RGBA copy, so the
+// two things that can silently go wrong are channel order (every image tinted) and source
+// indexing (every image mirrored or sheared). Both are invisible in a thumbnail unless checked:
+// a 4×1 strip of red|red|blue|blue must halve to exactly red|blue.
+test "downsampleFromPixels preserves channel order and position" {
+    const allocator = std.testing.allocator;
+
+    const red = zigimg.color.Rgb24{ .r = 200, .g = 20, .b = 10 };
+    const blue = zigimg.color.Rgb24{ .r = 10, .g = 20, .b = 200 };
+    var strip = [_]zigimg.color.Rgb24{ red, red, blue, blue };
+    const storage = zigimg.color.PixelStorage{ .rgb24 = strip[0..] };
+
+    const scaled = downsampleFromPixels(allocator, &storage, 4, 1, 2) orelse
+        return error.ExpectedScaling;
+    defer allocator.free(scaled.pixels);
+
+    try std.testing.expectEqual(@as(u32, 2), scaled.width);
+    try std.testing.expectEqual(@as(u32, 1), scaled.height);
+    // Left destination pixel is the average of two reds, i.e. red — not blue, and not (200,20,200).
+    try std.testing.expectEqualSlices(u8, &.{ 200, 20, 10, 255 }, scaled.pixels[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 200, 255 }, scaled.pixels[4..8]);
+}
+
+// rgba32 sources must keep their alpha, and an image already within max_dim must report "nothing
+// to do" so the caller moves the decoded buffer out whole instead of copying it.
+test "downsampleFromPixels handles alpha and declines when no scaling is needed" {
+    const allocator = std.testing.allocator;
+
+    var pixels = [_]zigimg.color.Rgba32{
+        .{ .r = 10, .g = 20, .b = 30, .a = 40 },
+        .{ .r = 10, .g = 20, .b = 30, .a = 40 },
+    };
+    const storage = zigimg.color.PixelStorage{ .rgba32 = pixels[0..] };
+
+    const scaled = downsampleFromPixels(allocator, &storage, 2, 1, 1) orelse
+        return error.ExpectedScaling;
+    defer allocator.free(scaled.pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30, 40 }, scaled.pixels[0..4]);
+
+    // Already small enough, and a zero axis, both decline rather than allocating or indexing.
+    try std.testing.expect(downsampleFromPixels(allocator, &storage, 2, 1, 64) == null);
+    try std.testing.expect(downsampleFromPixels(allocator, &storage, 2, 0, 1) == null);
 }

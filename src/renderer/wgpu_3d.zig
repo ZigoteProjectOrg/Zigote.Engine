@@ -28,10 +28,12 @@ const Vec4 = math.Vec4;
 
 /// MSAA sample count for the 3D scene pass (sky + meshes). The shadow pass stays 1x.
 // Geometry-pass MSAA sample count. Defaults to 4 — the only count the WebGPU spec guarantees for
-// EVERY renderable format (rgba16float in particular). `root.zig` lowers it to 2 at device init IF
-// the adapter grants TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES (2× rgba16float MSAA is adapter-specific,
-// not spec-baseline — Apple Silicon supports it). 2× halves every multisampled target (HDR color,
-// depth, and the 3 MSAA G-buffers); TAA runs on top and reclaims most of the edge antialiasing.
+// EVERY renderable format (rgba16float in particular). `root.zig` lowers it to 2 at device init on
+// Metal adapters that grant TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES (2× rgba16float MSAA is
+// adapter-specific, not spec-baseline — Apple Silicon supports it; Mesa's llvmpipe grants the same
+// feature but supports [1, 4, 8], and asking it for 2 aborts the process in pipeline validation).
+// 2× halves every multisampled target (HDR color, depth, and the 3 MSAA G-buffers); TAA runs on top
+// and reclaims most of the edge antialiasing.
 // Written exactly once, before the first Gpu3d is created; read-only thereafter (pipelines + targets
 // both read this same value, so they always agree on the sample count).
 pub var MSAA_SAMPLES: u32 = 4;
