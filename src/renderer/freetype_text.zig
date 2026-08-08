@@ -205,6 +205,17 @@ pub const FreeTypeTextRenderer = struct {
     // invalidate on loadFontFromCPath / addEmojiFontFamily.
     emoji_glyph_cache: std.AutoHashMap(u21, bool),
 
+    // ── Script fallback ───────────────────────────────────────────────────────
+    // Families to try, in order, for a codepoint the requested face has no glyph for. A UI font
+    // covers the scripts its designer drew and nothing else — Inter is Latin, Greek and Cyrillic —
+    // so without this, any app displaying text it did not author (a music player showing tags, a
+    // file manager showing filenames) renders Japanese, Korean, Chinese, Arabic and Thai as tofu.
+    // The host registers whatever the platform ships; see addFallbackFontFamily.
+    fallback_families: std.ArrayList([]const u8),
+    // Memoizes routeFor. Keyed on (primary family, codepoint) because coverage is per face, and
+    // invalidated whenever a face or fallback is registered.
+    route_cache: std.AutoHashMap(u64, i8),
+
     /// CPU-only construction for native backends (Metal/…): reuses all FreeType/HarfBuzz shaping
     /// and the coverage atlas; the caller uploads `atlasPixels()` to its own GPU texture.
     pub fn initCpu(
@@ -264,6 +275,8 @@ pub const FreeTypeTextRenderer = struct {
         self.emoji_families = .empty;
         self.pending_color_quads = .empty;
         self.emoji_glyph_cache = std.AutoHashMap(u21, bool).init(allocator);
+        self.fallback_families = .empty;
+        self.route_cache = std.AutoHashMap(u64, i8).init(allocator);
 
         if (ft.FT_Init_FreeType(&self.library) != 0) {
             return error.FreeTypeInitFailed;
@@ -420,8 +433,11 @@ pub const FreeTypeTextRenderer = struct {
         if (self.color_atlas_pixels) |p| self.allocator.free(p);
         for (self.emoji_families.items) |name| self.allocator.free(name);
         self.emoji_families.deinit(self.allocator);
+        for (self.fallback_families.items) |name| self.allocator.free(name);
+        self.fallback_families.deinit(self.allocator);
         self.pending_color_quads.deinit(self.allocator);
         self.emoji_glyph_cache.deinit();
+        self.route_cache.deinit();
 
         self.glyphs.deinit();
         self.allocator.free(self.atlas_pixels);
@@ -490,6 +506,7 @@ pub const FreeTypeTextRenderer = struct {
         self.resetAtlas();
         self.color_glyphs.clearRetainingCapacity();
         self.emoji_glyph_cache.clearRetainingCapacity();
+        self.route_cache.clearRetainingCapacity();
         if (self.color_atlas_pixels) |p| {
             @memset(p, 0);
             self.color_atlas_dirty = true;
@@ -540,6 +557,125 @@ pub const FreeTypeTextRenderer = struct {
             return;
         };
         self.emoji_glyph_cache.clearRetainingCapacity(); // new family may now cover codepoints cached as false
+        self.route_cache.clearRetainingCapacity();
+    }
+
+    /// A stretch of text that one face can shape on its own.
+    const FaceRun = struct { text: []const u8, family: []const u8, emoji: bool };
+
+    /// Splits text into runs by which face renders them.
+    ///
+    /// Every shaping entry point — paint, measure and cached layout — goes through this, because a
+    /// run boundary the painter sees but the measurer does not means text laid out at one width and
+    /// drawn at another. (Emoji segmentation used to live only in the paint path, so emoji were
+    /// already measured against the wrong face.)
+    ///
+    /// Combining marks never start a run: they belong to the base character before them, and
+    /// splitting a mark onto a different face than its base would shape both wrongly.
+    const RunSplitter = struct {
+        renderer: *FreeTypeTextRenderer,
+        text: []const u8,
+        primary: []const u8,
+        pos: usize = 0,
+
+        fn next(self: *RunSplitter) ?FaceRun {
+            if (self.pos >= self.text.len) return null;
+
+            const start = self.pos;
+            var current: ?Route = null;
+
+            while (self.pos < self.text.len) {
+                const len = std.unicode.utf8ByteSequenceLength(self.text[self.pos]) catch 1;
+                const end = @min(self.pos + len, self.text.len);
+                const cp: u21 = std.unicode.utf8Decode(self.text[self.pos..end]) catch 0xFFFD;
+
+                if (current) |run| {
+                    if (!isCombining(cp)) {
+                        const route = self.renderer.routeFor(cp, self.primary);
+                        if (route.emoji != run.emoji or !std.mem.eql(u8, route.family, run.family))
+                            break;
+                    }
+                } else {
+                    current = self.renderer.routeFor(cp, self.primary);
+                }
+
+                self.pos = end;
+            }
+
+            const run = current orelse return null;
+            return .{ .text = self.text[start..self.pos], .family = run.family, .emoji = run.emoji };
+        }
+    };
+
+    fn splitRuns(self: *FreeTypeTextRenderer, text: []const u8, primary: []const u8) RunSplitter {
+        return .{ .renderer = self, .text = text, .primary = primary };
+    }
+
+    /// Register a family to fall back to for codepoints the requested face cannot render. Order is
+    /// priority order, so the host should register the closest-matching face first. The family must
+    /// already be loaded (see loadFontFromCPath).
+    pub fn addFallbackFontFamily(self: *FreeTypeTextRenderer, name: []const u8) void {
+        // Ignore an unknown or duplicate family rather than storing a name that resolves to nothing
+        // on every lookup for the life of the process.
+        if (!self.faces.contains(name)) return;
+        for (self.fallback_families.items) |existing| {
+            if (std.mem.eql(u8, existing, name)) return;
+        }
+
+        const duped = self.allocator.dupe(u8, name) catch return;
+        self.fallback_families.append(self.allocator, duped) catch {
+            self.allocator.free(duped);
+            return;
+        };
+        self.route_cache.clearRetainingCapacity(); // codepoints cached as tofu may now resolve
+    }
+
+    /// Where a codepoint should be drawn from. `emoji` takes the colour path; otherwise `family`
+    /// names the face to shape with.
+    const Route = struct { family: []const u8, emoji: bool };
+
+    /// Cached values of routeFor, packed into the i8 the cache stores.
+    const route_primary: i8 = -1;
+    const route_emoji: i8 = -2;
+
+    /// Resolve which face renders `cp`: the requested one if it has the glyph, else the first
+    /// fallback that does, else the requested one again (so it renders as that face's .notdef —
+    /// a visible box is the honest answer when nothing on the system can draw the character).
+    fn routeFor(self: *FreeTypeTextRenderer, cp: u21, primary: []const u8) Route {
+        // Latin-1 is in every text face we ship or fall back to, and is the overwhelming majority
+        // of what gets measured. Skipping the map here keeps the common path free.
+        if (cp < 0x0100) return .{ .family = primary, .emoji = false };
+
+        var hasher = std.hash.Wyhash.init(cp);
+        hasher.update(primary);
+        const key = hasher.final();
+
+        const slot: i8 = if (self.route_cache.get(key)) |cached| cached else blk: {
+            const resolved = self.resolveRoute(cp, primary);
+            self.route_cache.put(key, resolved) catch {};
+            break :blk resolved;
+        };
+
+        if (slot == route_emoji) return .{ .family = self.emoji_families.items[0], .emoji = true };
+        if (slot == route_primary or slot >= self.fallback_families.items.len)
+            return .{ .family = primary, .emoji = false };
+        return .{ .family = self.fallback_families.items[@intCast(slot)], .emoji = false };
+    }
+
+    fn resolveRoute(self: *FreeTypeTextRenderer, cp: u21, primary: []const u8) i8 {
+        if (self.emoji_families.items.len > 0 and isEmojiCodepoint(cp) and self.emojiHasGlyph(cp))
+            return route_emoji;
+
+        if (self.faces.get(primary)) |face| {
+            if (ft.FT_Get_Char_Index(face, @as(ft.FT_ULong, cp)) != 0) return route_primary;
+        }
+
+        for (self.fallback_families.items, 0..) |name, index| {
+            const face = self.faces.get(name) orelse continue;
+            if (ft.FT_Get_Char_Index(face, @as(ft.FT_ULong, cp)) != 0) return @intCast(index);
+        }
+
+        return route_primary;
     }
 
     /// True only if an emoji font actually contains a glyph for this codepoint. Many symbols
@@ -615,62 +751,27 @@ pub const FreeTypeTextRenderer = struct {
 
         self.pending_color_quads.clearRetainingCapacity();
 
-        const has_emoji = self.emoji_families.items.len > 0;
+        // Only control characters are split here — they move the pen rather than drawing. Which
+        // face renders what is decided inside flushTextSegment, so paint, measure and cached
+        // layout all get the same answer from the same code.
         var segment_start: usize = 0;
-        var segment_is_emoji: bool = false;
-        var i: usize = 0;
+        for (text.text, 0..) |byte, i| {
+            if (byte != '\n' and byte != '\r' and byte != '\t') continue;
 
-        while (i < text.text.len) {
-            const byte = text.text[i];
-
-            // Control chars are single-byte; flush and handle layout
-            if (byte == '\n') {
-                try self.flushTextSegment(allocator, vertices, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..i], segment_is_emoji, text.letter_spacing, text.word_spacing);
-                pen_x = text.baseline_x;
-                baseline_y += line_height;
-                i += 1;
-                segment_start = i;
-                segment_is_emoji = false;
-                continue;
-            }
-            if (byte == '\r') {
-                try self.flushTextSegment(allocator, vertices, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..i], segment_is_emoji, text.letter_spacing, text.word_spacing);
-                i += 1;
-                segment_start = i;
-                segment_is_emoji = false;
-                continue;
-            }
-            if (byte == '\t') {
-                try self.flushTextSegment(allocator, vertices, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..i], segment_is_emoji, text.letter_spacing, text.word_spacing);
-                pen_x += text.size * 2.0;
-                i += 1;
-                segment_start = i;
-                segment_is_emoji = false;
-                continue;
+            try self.flushTextSegment(allocator, vertices, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..i], false, text.letter_spacing, text.word_spacing);
+            switch (byte) {
+                '\n' => {
+                    pen_x = text.baseline_x;
+                    baseline_y += line_height;
+                },
+                '\t' => pen_x += text.size * 2.0,
+                else => {},
             }
 
-            // Advance by full codepoint; check for emoji run boundary
-            const cp_len: usize = std.unicode.utf8ByteSequenceLength(byte) catch 1;
-            const cp_end = @min(i + cp_len, text.text.len);
-
-            if (has_emoji) {
-                const cp: u21 = std.unicode.utf8Decode(text.text[i..cp_end]) catch 0xFFFD;
-                // Route to the emoji font only when it can actually render the glyph; otherwise
-                // keep it on the main text font (which covers ✕ ⌘ ↗ ▸ … as monochrome glyphs).
-                const cp_is_emoji = isEmojiCodepoint(cp) and self.emojiHasGlyph(cp);
-                if (cp_is_emoji != segment_is_emoji and i > segment_start) {
-                    try self.flushTextSegment(allocator, vertices, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..i], segment_is_emoji, text.letter_spacing, text.word_spacing);
-                    segment_start = i;
-                    segment_is_emoji = cp_is_emoji;
-                } else if (cp_is_emoji != segment_is_emoji) {
-                    segment_is_emoji = cp_is_emoji;
-                }
-            }
-
-            i = cp_end;
+            segment_start = i + 1;
         }
 
-        try self.flushTextSegment(allocator, vertices, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..], segment_is_emoji, text.letter_spacing, text.word_spacing);
+        try self.flushTextSegment(allocator, vertices, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..], false, text.letter_spacing, text.word_spacing);
     }
 
     fn flushTextSegment(
@@ -692,10 +793,15 @@ pub const FreeTypeTextRenderer = struct {
         word_spacing: f32,
     ) !void {
         if (segment.len == 0) return;
-        if (is_emoji and self.emoji_families.items.len > 0) {
-            try self.appendEmojiShapedSegment(segment, self.emoji_families.items[0], pixel_size, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y);
-        } else {
-            try self.appendShapedSegment(allocator, vertices, segment, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y, letter_spacing, word_spacing);
+        _ = is_emoji; // the splitter decides this per run now
+
+        var runs = self.splitRuns(segment, font_family);
+        while (runs.next()) |run| {
+            if (run.emoji) {
+                try self.appendEmojiShapedSegment(run.text, run.family, pixel_size, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y);
+            } else {
+                try self.appendShapedSegment(allocator, vertices, run.text, run.family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y, letter_spacing, word_spacing);
+            }
         }
     }
 
@@ -737,25 +843,17 @@ pub const FreeTypeTextRenderer = struct {
         var shaped_list: std.ArrayList(ShapedGlyph) = .empty;
         defer shaped_list.deinit(self.allocator);
 
-        // UAX#9-lite: a string containing strong RTL content is split into direction runs, each
-        // shaped with an explicit direction, and the runs are appended in VISUAL order (paragraph
-        // RTL → reversed run sequence) so the sequential left-to-right emitters draw them correctly.
-        // Strings without RTL content take the single-buffer path exactly as before.
+        // UAX #9: text with anything to reorder is split into embedding-level runs, each shaped with
+        // an explicit direction. `analyze` hands them back already in VISUAL order (rule L2), so
+        // appending them in order is what the sequential left-to-right emitters want. Text with
+        // nothing to reorder takes the single-buffer path exactly as before.
         var dir_runs: std.ArrayList(bidi.Run) = .empty;
         defer dir_runs.deinit(self.allocator);
-        if (try bidi.analyze(self.allocator, text, &dir_runs)) |paragraph| {
-            switch (paragraph) {
-                .ltr => for (dir_runs.items) |r|
-                    try self.shapeRunInto(hb_font, text[r.start..r.end], r.start, r.dir, &shaped_list),
-                .rtl => {
-                    var idx = dir_runs.items.len;
-                    while (idx > 0) {
-                        idx -= 1;
-                        const r = dir_runs.items[idx];
-                        try self.shapeRunInto(hb_font, text[r.start..r.end], r.start, r.dir, &shaped_list);
-                    }
-                },
-            }
+        // null base: let P2/P3 derive the paragraph direction from the text itself. Nothing at this
+        // level knows the widget's locale, which is the only thing that would justify forcing it.
+        if (try bidi.analyze(self.allocator, text, null, &dir_runs)) |_| {
+            for (dir_runs.items) |r|
+                try self.shapeRunInto(hb_font, text[r.start..r.end], r.start, r.dir(), &shaped_list);
         } else {
             try self.shapeRunInto(hb_font, text, 0, null, &shaped_list);
         }
@@ -1237,6 +1335,9 @@ pub const FreeTypeTextRenderer = struct {
         out_h.* = baseline_y + line_height;
     }
 
+    /// Advance the pen across a segment without drawing, splitting it by face exactly as the
+    /// painter does — otherwise a string containing anything outside the primary face measures
+    /// against a face that will not draw it, and the layout is wrong before anything is painted.
     fn advanceShapedSegment(
         self: *FreeTypeTextRenderer,
         text: []const u8,
@@ -1248,18 +1349,23 @@ pub const FreeTypeTextRenderer = struct {
         baseline_y: *f32,
     ) !void {
         if (text.len == 0) return;
-        const run = try self.getShapedRun(text, font_family, pixel_size);
-        if (letter_spacing == 0 and word_spacing == 0) {
-            pen_x.* += run.advance_x;
-            baseline_y.* += run.advance_y;
-            return;
-        }
-        for (run.glyphs) |shaped| {
-            var spacing = letter_spacing;
-            if (clusterIsSpace(text, shaped.cluster)) spacing += word_spacing;
-            if (shaped.x_advance < 0) spacing = -spacing;
-            pen_x.* += shaped.x_advance + spacing;
-            baseline_y.* -= shaped.y_advance;
+
+        var runs = self.splitRuns(text, font_family);
+        while (runs.next()) |face_run| {
+            const run = try self.getShapedRun(face_run.text, face_run.family, pixel_size);
+            if (letter_spacing == 0 and word_spacing == 0) {
+                pen_x.* += run.advance_x;
+                baseline_y.* += run.advance_y;
+                continue;
+            }
+
+            for (run.glyphs) |shaped| {
+                var spacing = letter_spacing;
+                if (clusterIsSpace(face_run.text, shaped.cluster)) spacing += word_spacing;
+                if (shaped.x_advance < 0) spacing = -spacing;
+                pen_x.* += shaped.x_advance + spacing;
+                baseline_y.* -= shaped.y_advance;
+            }
         }
     }
 
@@ -1371,10 +1477,44 @@ pub const FreeTypeTextRenderer = struct {
         baseline_y: *f32,
     ) !void {
         if (text.len == 0) return;
+        const inv_raster_scale = 1.0 / @max(raster_scale, 0.01);
+
+        // Split by face like the painter and the measurer. A cached layout that shaped everything
+        // against the primary face would bake the wrong glyphs and the wrong advances into the
+        // handle, and every later draw would replay them.
+        var runs = self.splitRuns(text, font_family);
+        while (runs.next()) |face_run| try self.appendLayoutRun(
+            allocator,
+            glyphs_out,
+            face_run,
+            shape_pixel_size,
+            raster_pixel_size,
+            inv_raster_scale,
+            letter_spacing,
+            word_spacing,
+            pen_x,
+            baseline_y,
+        );
+    }
+
+    fn appendLayoutRun(
+        self: *FreeTypeTextRenderer,
+        allocator: std.mem.Allocator,
+        glyphs_out: *std.ArrayList(TextLayoutGlyph),
+        face_run: FaceRun,
+        shape_pixel_size: u16,
+        raster_pixel_size: u16,
+        inv_raster_scale: f32,
+        letter_spacing: f32,
+        word_spacing: f32,
+        pen_x: *f32,
+        baseline_y: *f32,
+    ) !void {
+        const text = face_run.text;
+        const font_family = face_run.family;
 
         const face = self.resolveFace(font_family) orelse return error.FreeTypeFontNotFound;
         const run = try self.getShapedRun(text, font_family, shape_pixel_size);
-        const inv_raster_scale = 1.0 / @max(raster_scale, 0.01);
 
         for (run.glyphs) |shaped| {
             const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, raster_pixel_size);
@@ -2021,6 +2161,23 @@ fn clusterIsSpace(text: []const u8, cluster: u32) bool {
     };
 }
 
+/// Marks and joiners that attach to the character before them: combining diacriticals (and their
+/// supplement/extended blocks), the symbol marks, the half-marks, variation selectors and the
+/// zero-width joiner. These must stay in their base character's run — a mark shaped against a
+/// different face than its base lands in the wrong place, if it lands at all.
+fn isCombining(cp: u21) bool {
+    return switch (cp) {
+        0x0300...0x036F => true, // combining diacritical marks
+        0x1AB0...0x1AFF => true, // …extended
+        0x1DC0...0x1DFF => true, // …supplement
+        0x20D0...0x20FF => true, // combining marks for symbols
+        0xFE00...0xFE0F => true, // variation selectors
+        0xFE20...0xFE2F => true, // combining half marks
+        0x200D => true, // zero-width joiner (emoji sequences)
+        else => false,
+    };
+}
+
 fn effectiveFontFamily(self: *const FreeTypeTextRenderer, text: zg.paint.Text) []const u8 {
     if (text.font_family) |family| return family;
     if (text.font_family_fallback.len > 0) return text.font_family_fallback[0];
@@ -2377,4 +2534,113 @@ test "nextClusterAbove returns the smallest cluster strictly greater" {
     try std.testing.expectEqual(@as(?u32, 12), nextClusterAbove(&sorted, 7));
     try std.testing.expectEqual(@as(?u32, null), nextClusterAbove(&sorted, 12));
     try std.testing.expectEqual(@as(?u32, null), nextClusterAbove(&[_]u32{}, 5));
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+// The first of these paths that exists, or null. Finding a CJK face this way avoids hardcoding one
+// distribution's packaging — the same Noto ships under several names.
+fn testExistingPath(candidates: []const []const u8) ?[]const u8 {
+    var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    for (candidates) |candidate| {
+        std.Io.Dir.accessAbsolute(io, candidate, .{}) catch continue;
+        return candidate;
+    }
+    return null;
+}
+
+// Fallback routing is invisible until someone reads a language the bundled font does not cover, so
+// it is checked against real faces: Latin must stay on the primary face (a fallback that also
+// carries Latin would otherwise silently replace the UI font), and a codepoint the primary cannot
+// draw must reach the fallback rather than render as .notdef.
+test "routeFor keeps Latin on the primary face and sends CJK to a fallback" {
+    const allocator = std.testing.allocator;
+
+    const cjk = testExistingPath(&.{
+        "/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+    }) orelse return error.SkipZigTest; // no CJK font here; nothing to assert against
+
+    var renderer = try FreeTypeTextRenderer.initCpu(allocator, &.{}, "primary");
+    defer renderer.deinit();
+
+    const cjk_z = try allocator.dupeZ(u8, cjk);
+    defer allocator.free(cjk_z);
+
+    // Relative to the build's working directory, which is this package's root.
+    renderer.loadFontFromCPath("primary", "../Zigote.UI/Fonts/Inter/static/Inter_18pt-Regular.ttf") catch
+        return error.SkipZigTest;
+    try renderer.loadFontFromCPath("cjk", cjk_z.ptr);
+    renderer.addFallbackFontFamily("cjk");
+
+    // Latin, Latin-1, Cyrillic and Greek are all Inter's, and must not migrate to a fallback that
+    // happens to carry them too.
+    try std.testing.expectEqualStrings("primary", renderer.routeFor('A', "primary").family);
+    try std.testing.expectEqualStrings("primary", renderer.routeFor(0x00E9, "primary").family);
+    try std.testing.expectEqualStrings("primary", renderer.routeFor(0x0416, "primary").family);
+    try std.testing.expectEqualStrings("primary", renderer.routeFor(0x03A9, "primary").family);
+
+    // Hiragana, katakana and Han are not.
+    try std.testing.expectEqualStrings("cjk", renderer.routeFor(0x3042, "primary").family);
+    try std.testing.expectEqualStrings("cjk", renderer.routeFor(0x30A2, "primary").family);
+    try std.testing.expectEqualStrings("cjk", renderer.routeFor(0x4E00, "primary").family);
+
+    // Asking twice must agree — the second answer comes from the memo, and a key that collided
+    // would hand back whatever was cached for a different codepoint.
+    try std.testing.expectEqualStrings("primary", renderer.routeFor('A', "primary").family);
+    try std.testing.expectEqualStrings("cjk", renderer.routeFor(0x3042, "primary").family);
+
+    // Mixed text splits at the script boundary and loses nothing across the seam.
+    const mixed = "Kid A \u{3042}\u{3042} live";
+    var runs = renderer.splitRuns(mixed, "primary");
+    var covered: usize = 0;
+    var saw_fallback = false;
+    while (runs.next()) |run| {
+        covered += run.text.len;
+        if (std.mem.eql(u8, run.family, "cjk")) saw_fallback = true;
+    }
+    try std.testing.expectEqual(mixed.len, covered);
+    try std.testing.expect(saw_fallback);
+}
+
+// The splitter is what keeps paint and measure agreeing, so its boundaries have to be exact.
+test "RunSplitter covers its input and keeps marks with their base" {
+    const allocator = std.testing.allocator;
+
+    var renderer = try FreeTypeTextRenderer.initCpu(allocator, &.{}, "primary");
+    defer renderer.deinit();
+
+    // Nothing registered: everything routes to the primary, so mixed text is a single run and no
+    // byte is dropped or repeated.
+    const mixed = "abc\u{6F22}\u{5B57}def";
+    var runs = renderer.splitRuns(mixed, "primary");
+    var total: usize = 0;
+    var count: usize = 0;
+    while (runs.next()) |run| {
+        total += run.text.len;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(mixed.len, total);
+
+    // A combining acute must never start a run of its own.
+    var marks = renderer.splitRuns("e\u{0301}", "primary");
+    const first = marks.next().?;
+    try std.testing.expectEqual("e\u{0301}".len, first.text.len);
+    try std.testing.expect(marks.next() == null);
+
+    // Empty input yields nothing rather than an empty run.
+    var empty = renderer.splitRuns("", "primary");
+    try std.testing.expect(empty.next() == null);
+
+    // A fallback naming a face that was never loaded is ignored, rather than kept and probed on
+    // every lookup for the life of the process.
+    renderer.addFallbackFontFamily("nonexistent");
+    try std.testing.expectEqual(@as(usize, 0), renderer.fallback_families.items.len);
 }
