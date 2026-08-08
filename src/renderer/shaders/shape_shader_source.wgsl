@@ -49,6 +49,15 @@ fn vs_main(
   return out;
 }
 
+// UI colors arrive sRGB-encoded (theme values). The swapchain is an *_srgb format that encodes
+// on write, so emit linear here or every flat fill gets encoded twice and washes out toward
+// white (#222226 -> #676769, accent #3584e4 -> pastel). Same 2.2 approximation as the
+// tonemapper's srgb_decode; blending then happens in linear space, which pairs correctly with
+// the sRGB target.
+fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
+  return pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2));
+}
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   let half_size = in.rect_size / 2.0;
@@ -82,5 +91,5 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     discard;
   }
 
-  return vec4<f32>(in.color.rgb, in.color.a * alpha);
+  return vec4<f32>(srgb_decode(in.color.rgb), in.color.a * alpha);
 }

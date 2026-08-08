@@ -20,12 +20,18 @@ fn vs_main(
   return out;
 }
 
+// Text colors arrive sRGB-encoded; the sRGB swapchain encodes on write, so emit linear or
+// glyphs get double-encoded and wash out (see shape shader).
+fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
+  return pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2));
+}
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   // Atlas texels are grayscale coverage rasterized at the output's physical pixel size.
-  // Coverage gamma (~1/1.2): the swapchain is sRGB and alpha is blended in non-linear space, which
-  // makes edge pixels perceptually too dark — light text reads thin, dark text heavy. Lifting the
-  // coverage counters that stem-thinning (the standard cheap fix when stuck with sRGB-space AA).
+  // Coverage gamma (~1/1.2): with linear-space blending on the sRGB target, edge pixels of dark
+  // text on light ground read perceptually thin. Lifting the coverage counters that stem-thinning
+  // (the standard cheap fix for linear-space AA of UI text).
   let coverage = pow(textureSample(text_tex, text_sampler, in.uv).r, 1.0 / 1.2);
-  return vec4<f32>(in.color.rgb, in.color.a * coverage);
+  return vec4<f32>(srgb_decode(in.color.rgb), in.color.a * coverage);
 }

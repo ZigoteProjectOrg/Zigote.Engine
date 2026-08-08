@@ -111,7 +111,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   // ── Tint. `clear_tint` (0 = clear glass, 1 = strongest) is independent of edge coverage: dark
   //    tints multiply (deepen), light tints screen (brighten), matching the source material. ──────
   let luma_w = vec3<f32>(0.299, 0.587, 0.114);
-  let gc = clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+  // Tint arrives sRGB-encoded like every UI color; the backdrop sample is linear — decode so the
+  // multiply/screen happens in one space (see shape shader).
+  let gc = pow(clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
   let tint_amount = clamp(in.clear_tint, 0.0, 1.0);
   if (tint_amount > 0.0) {
     if (dot(gc, luma_w) < 0.5) {
