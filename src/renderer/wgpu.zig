@@ -518,6 +518,55 @@ pub const GpuUi = struct {
         };
     }
 
+    /// Overwrite a cached image's texels in place, keeping its texture, view and bind group.
+    ///
+    /// The upload path in `createImageBatch` is create-once: a cache hit returns the existing GPU
+    /// resources and never looks at the pixels again, which is exactly right for a photo and exactly
+    /// wrong for a video frame. Recreating the texture every frame would churn a 1080p allocation
+    /// and a bind group at 60 Hz; this re-uses both and pays only for the texel copy.
+    ///
+    /// Render thread only, and only between frames: `queue.writeTexture` is ordered before the
+    /// submits that follow it, so a caller draining at the top of a frame sees the new pixels in
+    /// that same frame. Returns false when the key has no texture yet — the caller should leave the
+    /// CPU copy in place and let the normal first-upload path take it.
+    pub fn updateCachedImage(
+        self: *GpuUi,
+        queue: *wgpu.Queue,
+        key: u64,
+        pixels: []const u8,
+        width: u32,
+        height: u32,
+    ) bool {
+        const cached = self.image_cache.get(key) orelse return false;
+        if (width == 0 or height == 0) return false;
+
+        const src_stride = @as(usize, width) * 4;
+        if (pixels.len < src_stride * @as(usize, height)) return false;
+
+        // wgpu wants rows aligned to 256 bytes; a frame whose width already satisfies that (every
+        // multiple of 64 px — 1280, 1920, 3840) uploads straight from the caller's buffer with no
+        // staging copy at all.
+        const bytes_per_row = std.mem.alignForward(usize, src_stride, 256);
+        if (bytes_per_row == src_stride) {
+            writeImageRows(queue, cached.texture, pixels, bytes_per_row, width, height);
+            return true;
+        }
+
+        const staging = self.allocator.alloc(u8, bytes_per_row * @as(usize, height)) catch return false;
+        defer self.allocator.free(staging);
+        @memset(staging, 0);
+        var row: usize = 0;
+        while (row < height) : (row += 1) {
+            const src_start = row * src_stride;
+            @memcpy(
+                staging[row * bytes_per_row ..][0..src_stride],
+                pixels[src_start..][0..src_stride],
+            );
+        }
+        writeImageRows(queue, cached.texture, staging, bytes_per_row, width, height);
+        return true;
+    }
+
     /// Drop a cached image's GPU resources. Only valid between frames — mid-frame the texture may
     /// still be recorded in an open command encoder. Returns true if an entry was removed.
     pub fn releaseCachedImage(self: *GpuUi, key: u64) bool {
@@ -2552,6 +2601,38 @@ fn createImageTexture(
     );
 
     return texture;
+}
+
+/// The `queue.writeTexture` call shared by the create and update paths. `rows` is already padded to
+/// `bytes_per_row`.
+fn writeImageRows(
+    queue: *wgpu.Queue,
+    texture: *wgpu.Texture,
+    rows: []const u8,
+    bytes_per_row: usize,
+    width: u32,
+    height: u32,
+) void {
+    queue.writeTexture(
+        &.{
+            .texture = texture,
+            .mip_level = 0,
+            .origin = .{ .x = 0, .y = 0, .z = 0 },
+            .aspect = .all,
+        },
+        rows.ptr,
+        rows.len,
+        &.{
+            .offset = 0,
+            .bytes_per_row = @intCast(bytes_per_row),
+            .rows_per_image = height,
+        },
+        &.{
+            .width = width,
+            .height = height,
+            .depth_or_array_layers = 1,
+        },
+    );
 }
 
 fn createImageBindGroup(

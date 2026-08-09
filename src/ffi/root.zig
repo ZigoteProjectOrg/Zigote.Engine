@@ -532,6 +532,9 @@ const EngineState = struct {
     /// mid-frame (a widget disposed during layout) while the texture is still recorded in the
     /// open command encoder.
     pending_image_releases: std.ArrayListUnmanaged(u64) = .empty,
+    /// Handles whose pixels were rewritten by zigote_update_texture_rgba since the last frame.
+    /// Drained at the top of the next render, where the GPU texture can be written safely.
+    pending_image_updates: std.ArrayListUnmanaged(u64) = .empty,
     // Out-of-band UTF-8 payload for text_input / text_editing events, appended during a poll and
     // referenced by (text_off, text_len) on each such event. Cleared (retaining capacity) at the
     // start of every poll; read by C# via zigote_poll_text_ptr before the next poll.
@@ -4424,6 +4427,7 @@ export fn zigote_shutdown(handle: u64) void {
     }
     state.image_registry.deinit();
     state.pending_image_releases.deinit(state.allocator);
+    state.pending_image_updates.deinit(state.allocator);
     state.image_lock.unlock();
     state.node_handles.deinit();
     state.poll_text.deinit(state.allocator);
@@ -4998,6 +5002,98 @@ export fn zigote_load_texture_from_rgba(
 
     const copy = state.allocator.dupe(u8, pixels_ptr[0..expected_len]) catch return 0;
     return registerImage(state, width, height, copy);
+}
+
+/// Rewrite an existing texture's RGBA8 pixels, keeping the handle. For a source of frames — a video,
+/// a camera, a procedural surface — where zigote_load_texture_from_rgba + zigote_release_texture
+/// would allocate and destroy a GPU texture and its bind group sixty times a second to show the same
+/// rectangle.
+///
+/// The dimensions must match the ones the handle was created with: this is an overwrite, not a
+/// resize. Returns false for an unknown handle, a size mismatch, or a short buffer — a caller that
+/// changed resolution should create a new handle.
+///
+/// Safe from any thread. The texel upload itself is deferred to the top of the next frame, on the
+/// render thread, where writing a texture is legal (see drainImageUpdates).
+export fn zigote_update_texture_rgba(
+    handle: u64,
+    image_handle: u64,
+    pixels_ptr: [*c]const u8,
+    pixels_len: usize,
+    width: u32,
+    height: u32,
+) bool {
+    const state = stateFromHandle(handle) orelse return false;
+    if (image_handle == 0 or pixels_ptr == null or width == 0 or height == 0) return false;
+
+    const expected_len = @as(usize, width) * @as(usize, height) * 4;
+    if (pixels_len < expected_len) return false;
+
+    state.image_lock.lock();
+    defer state.image_lock.unlock();
+    // Re-check under the lock — see registerImage.
+    if (live_engine.load(.acquire) != handle) return false;
+
+    const entry = state.image_registry.getPtr(image_handle) orelse return false;
+    if (entry.width != width or entry.height != height) return false;
+
+    // The CPU copy is dropped once an image reaches the GPU (drainImageUploads), so the steady
+    // state for a video is: allocate one buffer on the first update, then memcpy into it forever.
+    if (entry.pixels.len != expected_len) {
+        const fresh = state.allocator.alloc(u8, expected_len) catch return false;
+        if (entry.pixels.len > 0) state.allocator.free(entry.pixels);
+        entry.pixels = fresh;
+    }
+
+    @memcpy(@constCast(entry.pixels[0..expected_len]), pixels_ptr[0..expected_len]);
+
+    // One entry per handle per frame: a producer faster than the display would otherwise grow the
+    // list without bound, and only the last write is visible anyway.
+    for (state.pending_image_updates.items) |key| {
+        if (key == image_handle) return true;
+    }
+    state.pending_image_updates.append(state.allocator, image_handle) catch return false;
+    return true;
+}
+
+/// Push every pending zigote_update_texture_rgba into its GPU texture. Render thread, top of frame:
+/// `queue.writeTexture` is ordered ahead of the submits that follow, so an update handed over during
+/// the previous frame is visible in this one.
+fn drainImageUpdates(state: *EngineState) void {
+    state.image_lock.lock();
+    const keys = state.pending_image_updates.toOwnedSlice(state.allocator) catch {
+        state.image_lock.unlock();
+        return; // OOM: keep the list intact, retry next frame
+    };
+    state.image_lock.unlock();
+    defer state.allocator.free(keys);
+
+    for (keys) |key| {
+        state.image_lock.lock();
+        const entry = state.image_registry.getPtr(key);
+        const pixels = if (entry) |e| e.pixels else &.{};
+        const width = if (entry) |e| e.width else 0;
+        const height = if (entry) |e| e.height else 0;
+        state.image_lock.unlock();
+
+        if (pixels.len == 0) continue;
+
+        // A miss means the image has never been painted, so no texture exists yet; leaving the
+        // pixels attached lets the ordinary first-upload path pick them up.
+        if (state.gpu_ui.updateCachedImage(state.queue, key, pixels, width, height)) {
+            // Uploaded: drop the CPU copy exactly like drainImageUploads does, so a paused video
+            // does not hold a second full-resolution buffer. The next update reallocates it.
+            state.image_lock.lock();
+            const stale = blk: {
+                const e = state.image_registry.getPtr(key) orelse break :blk &.{};
+                const p = e.pixels;
+                e.pixels = &.{};
+                break :blk p;
+            };
+            state.image_lock.unlock();
+            if (stale.len > 0) state.allocator.free(stale);
+        }
+    }
 }
 
 /// Upload a custom glyph atlas (R8 grayscale) and return a texture handle.
@@ -5858,6 +5954,10 @@ fn buildRenderGraph(state: *EngineState) !void {
 fn renderFrameV2Impl(state: *EngineState) !void {
     state.frame_dropped = false;
     state.scene_rendered = false;
+
+    // Before any batch is built: a frame handed over by zigote_update_texture_rgba lands in its
+    // texture here, so this frame draws it rather than the one before it.
+    drainImageUpdates(state);
 
     var frame = render_mod.FrameContext{
         .frame_index = state.frame_index,
