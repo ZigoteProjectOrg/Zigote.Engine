@@ -1260,6 +1260,33 @@ export fn zigote_set_cursor(cursor_id: u32) void {
     if (cursor_cache[id]) |cur| sdl3.mouse.set(cur) catch {};
 }
 
+/// Capture the pointer for mouselook: hide the cursor, hold it inside the window, and report motion
+/// as deltas on `scroll_x`/`scroll_y` of the move event rather than as a position.
+///
+/// This is what a first-person camera needs and what no amount of application-side work can fake —
+/// without it the cursor reaches a window edge and the view stops turning. Enabling it flushes any
+/// pending motion, so the first event after the switch is not a jump.
+///
+/// Returns true on success. Fails only if the platform refuses the mode.
+export fn zigote_set_relative_mouse_mode(handle: u64, enabled: bool) bool {
+    const state = stateFromHandle(handle) orelse return false;
+    sdl3.mouse.setWindowRelativeMode(state.window, enabled) catch return false;
+    return true;
+}
+
+/// Whether the pointer is currently captured for this window.
+export fn zigote_get_relative_mouse_mode(handle: u64) bool {
+    const state = stateFromHandle(handle) orelse return false;
+    return sdl3.mouse.getWindowRelativeMode(state.window);
+}
+
+/// Move the cursor to a window-relative position. Used to park it somewhere sensible before
+/// releasing capture, so a menu opens with the pointer where the player expects it.
+export fn zigote_warp_mouse_in_window(handle: u64, x: f32, y: f32) void {
+    const state = stateFromHandle(handle) orelse return;
+    sdl3.mouse.warpInWindow(state.window, x, y);
+}
+
 /// Block the calling thread until an SDL event arrives or timeout_ms elapses.
 /// After returning, call zigote_poll_events to drain the queue.
 /// Used by the C# frame loop to sleep instead of spinning when the UI is idle.
@@ -1361,6 +1388,15 @@ export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
                 zge.kind = EVT_MOUSE_MOVE;
                 zge.x = m.x;
                 zge.y = m.y;
+                // A move event carries no scroll, so those two slots carry the frame's relative
+                // motion instead — the same trick the key events use for the auto-repeat flag, and it
+                // keeps ZgEvent's size (and therefore the ABI guard) unchanged.
+                //
+                // This is the only motion a captured pointer produces: with relative mode on, SDL
+                // stops the cursor moving and `x`/`y` stop being meaningful, so mouselook has to read
+                // the deltas rather than differencing positions.
+                zge.scroll_x = m.x_rel;
+                zge.scroll_y = m.y_rel;
                 zge.window_id = m.window_id orelse 0;
                 buf[count] = zge;
                 count += 1;
