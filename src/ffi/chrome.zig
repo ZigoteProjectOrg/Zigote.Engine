@@ -16,6 +16,7 @@ const is_macos = builtin.os.tag == .macos;
 
 extern fn zigote_macwin_set_unified(nswindow: ?*anyopaque, enabled: i32) void;
 extern fn zigote_macwin_get_unified(nswindow: ?*anyopaque) i32;
+extern fn zigote_macwin_set_csd(nswindow: ?*anyopaque, enabled: i32, radius: f32) void;
 
 /// Re-assert a window's chrome if the OS dropped it. macOS clears the FullSizeContentView
 /// styleMask bit on fullscreen/zoom round-trips, silently reverting a unified titlebar to
@@ -68,6 +69,9 @@ export fn zigote_window_chrome_set_hit_provider(
 const Entry = struct {
     window_id: u32 = 0, // 0 = free slot
     style: u32 = STYLE_SYSTEM,
+    /// CSD frame rounding, in logical px. macOS masks the content layer with it; other platforms
+    /// leave the corners to the app's own renderer-side clip.
+    corner_radius: f32 = 12,
     rect_count: u32 = 0,
     rects: [max_rects * 4]f32 = @splat(0),
 };
@@ -118,7 +122,10 @@ export fn zigote_window_chrome_set(window_id: u32, style: u32) bool {
 
     switch (style) {
         STYLE_SYSTEM => {
-            if (is_macos) zigote_macwin_set_unified(nsWindowOf(win), 0);
+            if (is_macos) {
+                zigote_macwin_set_unified(nsWindowOf(win), 0);
+                zigote_macwin_set_csd(nsWindowOf(win), 0, 0);
+            }
             _ = sdl3.c.SDL_SetWindowBordered(win, true);
             _ = sdl3.c.SDL_SetWindowHitTest(win, null, null);
             entry.* = .{}; // free the slot
@@ -126,7 +133,10 @@ export fn zigote_window_chrome_set(window_id: u32, style: u32) bool {
         },
         STYLE_MAC_UNIFIED => {
             // Comptime-pruned so the ObjC extern is never referenced off-macOS.
-            if (is_macos) zigote_macwin_set_unified(nsWindowOf(win), 1) else return false;
+            if (is_macos) {
+                zigote_macwin_set_csd(nsWindowOf(win), 0, 0);
+                zigote_macwin_set_unified(nsWindowOf(win), 1);
+            } else return false;
             // The styleMask change moves the content rect (it now spans the full frame incl.
             // the titlebar band); SDL doesn't notice on its own — re-assert the size so its
             // view/drawable re-layout against the new geometry.
@@ -137,6 +147,9 @@ export fn zigote_window_chrome_set(window_id: u32, style: u32) bool {
         },
         STYLE_BORDERLESS_CSD => {
             _ = sdl3.c.SDL_SetWindowBordered(win, false);
+            // macOS rounds the frame in CoreAnimation (see macos_window_chrome.m); every other
+            // platform lets the app clip its own corners in the renderer.
+            if (is_macos) zigote_macwin_set_csd(nsWindowOf(win), 1, entry.corner_radius);
         },
         else => return false,
     }
@@ -159,6 +172,19 @@ export fn zigote_window_chrome_drag_rects(
     entry.rect_count = n;
     if (n > 0 and rects != null) {
         for (0..n * 4) |i| entry.rects[i] = rects[i];
+    }
+}
+
+/// Set the CSD frame's corner radius (logical px). Where the platform rounds the window itself —
+/// macOS — this takes effect immediately on a window already in CSD; elsewhere it is remembered
+/// for nothing, since the app clips its own corners. Call it whenever the app's radius changes;
+/// applying a chrome style re-reads it.
+export fn zigote_window_chrome_set_corner_radius(window_id: u32, radius: f32) void {
+    const entry = entryFor(window_id, true) orelse return;
+    entry.corner_radius = radius;
+    if (is_macos and entry.style == STYLE_BORDERLESS_CSD) {
+        const win = sdlWindow(window_id) orelse return;
+        zigote_macwin_set_csd(nsWindowOf(win), 1, radius);
     }
 }
 
