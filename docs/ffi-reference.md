@@ -119,11 +119,23 @@ poll; single-threaded drain-decode).
 5 `KEY_UP` · 6 `QUIT` · 7 `RESIZE` · 8 `TEXT_INPUT` · 9 `TEXT_EDITING` (IME) ·
 10 `WINDOW_FOCUS` (button: 1 gained / 0 lost) · 11 `WINDOW_CLOSE` · 12 `SYSTEM_THEME` (button: 0
 unknown / 1 light / 2 dark) · 13 `DROP_BEGIN` · 14 `DROP_FILE` · 15 `DROP_TEXT` · 16 `DROP_POSITION` ·
-17 `DROP_COMPLETE`.
+17 `DROP_COMPLETE` · 18 `TOUCH_DOWN` · 19 `TOUCH_MOVE` · 20 `TOUCH_UP` · 21 `TOUCH_CANCEL` ·
+22 `APP_BACKGROUND` · 23 `APP_FOREGROUND` · 24 `LOW_MEMORY` · 25 `SCREEN_KEYBOARD_SHOWN` · 26 `SCREEN_KEYBOARD_HIDDEN` (mobile on-screen keyboard; occlusion is handled natively — the backend pans the view against the SetTextInputArea rect).
 
 A file/text drop arrives as `DROP_BEGIN` → N × `DROP_FILE`/`DROP_TEXT` → `DROP_COMPLETE`, with the
 payload out-of-band in `poll_text` exactly like text input. **New drop event kinds reused existing
 `ZgEvent` fields — no ABI bump** (still ABI 9).
+
+Touchscreen fingers (direct touch devices only — trackpads stay wheel/cursor; SDL's touch↔mouse
+synthesis is pinned off at init so nothing fires twice) arrive as `TOUCH_DOWN` → N × `TOUCH_MOVE` →
+`TOUCH_UP`/`TOUCH_CANCEL`, reusing existing fields: `x`/`y` = window-local position (de-normalized to
+the mouse coordinate space), `key_scancode` = compact finger slot (0–9, stable per contact),
+`scroll_x` = pressure 0..1. `TOUCH_CANCEL` means the OS took the gesture — abandon, don't commit.
+App lifecycle: `APP_BACKGROUND` (SDL `will_enter_background` — stop GPU work before the app
+suspends), `APP_FOREGROUND` (`did_enter_foreground`), `LOW_MEMORY`; `terminating` maps to `QUIT`.
+**All reuse existing `ZgEvent` fields — no ABI bump** (still ABI 9). The main-window safe-area
+insets (notch/home indicator; zero on desktop) are queryable via `zigote_get_safe_area(handle,
+insets*4f32)` as `[left, top, right, bottom]` in window coordinates.
 
 **`MOD_*`:** 1 `SHIFT` · 2 `CTRL` · 4 `ALT` · 8 `GUI` (⌘ on macOS, Super/Win elsewhere).
 **`BTN_*`:** 0 `LEFT` · 1 `RIGHT` · 2 `MIDDLE`.

@@ -45,6 +45,15 @@ comptime {
 comptime {
     _ = @import("chrome.zig");
 }
+// The native menu bar and OS drag-out are implemented in Objective-C for macOS
+// (src/platform/macos_{menu,drag}.m, compiled only there). Everywhere else this stub supplies
+// the same exports as no-ops, so the FFI surface — and therefore the generated, platform-
+// independent C# P/Invoke set — resolves on every target. That matters most on iOS, where the
+// engine is linked statically into the app binary and an undeclared symbol is a link error even
+// if unreachable.
+comptime {
+    if (@import("builtin").os.tag != .macos) _ = @import("desktop_shims_stub.zig");
+}
 const build_options = @import("build_options");
 /// Gates 3D-game-only native subsystems (Assimp model import). Lean 2D-only builds
 /// (`-Denable3d=false`) compile these out and don't link Assimp — see build.zig.
@@ -170,6 +179,29 @@ fn installCrashHandler() void {
 
 var log_callback: ?*const fn (i32, [*c]const u8) callconv(.c) void = null;
 
+/// Android throws away stdout/stderr, so anything the engine (or a Rust panic inside
+/// wgpu-native) writes there is invisible — including the message that explains a fatal error.
+/// Everything therefore also goes to logcat under the "zigote" tag.
+const android_log = if (@import("builtin").abi.isAndroid()) struct {
+    extern fn __android_log_write(prio: c_int, tag: [*:0]const u8, text: [*:0]const u8) c_int;
+
+    fn write(level: std.log.Level, msg: [*:0]const u8) void {
+        // Android priorities: 3 DEBUG, 4 INFO, 5 WARN, 6 ERROR.
+        const prio: c_int = switch (level) {
+            .debug => 3,
+            .info => 4,
+            .warn => 5,
+            .err => 6,
+        };
+        _ = __android_log_write(prio, "zigote", msg);
+    }
+} else struct {
+    fn write(level: std.log.Level, msg: [*:0]const u8) void {
+        _ = level;
+        _ = msg;
+    }
+};
+
 pub fn myLogFn(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.EnumLiteral),
@@ -177,12 +209,27 @@ pub fn myLogFn(
     args: anytype,
 ) void {
     _ = scope;
-    if (log_callback) |cb| {
-        var buf: [4096]u8 = undefined;
-        if (std.fmt.bufPrintZ(&buf, format, args)) |msg| {
-            cb(@intFromEnum(level), msg.ptr);
-        } else |_| {}
-    }
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, format, args) catch return;
+    android_log.write(level, msg.ptr);
+    if (log_callback) |cb| cb(@intFromEnum(level), msg.ptr);
+}
+
+/// Forward wgpu-native's own diagnostics into the same sink. Without this the only trace of a
+/// surface/adapter failure on Android is an abort with no message.
+fn wgpuLogToEngine(level: wgpu.LogLevel, message: wgpu.StringView, userdata: ?*anyopaque) callconv(.c) void {
+    _ = userdata;
+    const text = message.toSlice() orelse return;
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, "wgpu: {s}", .{text}) catch return;
+    const lvl: std.log.Level = switch (level) {
+        .@"error" => .err,
+        .warn => .warn,
+        .info => .info,
+        else => .debug,
+    };
+    android_log.write(lvl, msg.ptr);
+    if (log_callback) |cb| cb(@intFromEnum(lvl), msg.ptr);
 }
 
 pub const std_options: std.Options = .{
@@ -319,11 +366,43 @@ pub const EVT_DROP_FILE: u8 = 14;
 pub const EVT_DROP_TEXT: u8 = 15;
 pub const EVT_DROP_POSITION: u8 = 16;
 pub const EVT_DROP_COMPLETE: u8 = 17;
-// 18..26 are the touch + app-lifecycle kinds on the host side (see EventKind in ZgStructs.cs).
+// Touchscreen fingers. Only DIRECT touch devices (screens) arrive here — trackpads are
+// indirect and stay cursor/wheel input, and SDL's mouse/pen simulated-touch ids are filtered
+// (pen contact is treated as a direct touch: a stylus drives the UI like a finger). x/y carry
+// the window-local position in window coordinates (the same space as mouse events; SDL reports
+// fingers normalized 0..1, de-normalized here against the event's window). key_scancode
+// carries the finger slot — a compact id (0..MAX_TOUCH_FINGERS-1) stable while that finger
+// stays down, so C# can key per-pointer state on it. scroll_x carries pressure (0..1).
+// TOUCH_CANCEL ends a sequence with no logical "up": OS gesture takeover, palm rejection, or
+// the app being backgrounded — the UI must abandon (not commit) whatever the finger was doing.
+pub const EVT_TOUCH_DOWN: u8 = 18;
+pub const EVT_TOUCH_MOVE: u8 = 19;
+pub const EVT_TOUCH_UP: u8 = 20;
+pub const EVT_TOUCH_CANCEL: u8 = 21;
+// Mobile app lifecycle. BACKGROUND is SDL's will_enter_background — it arrives BEFORE the OS
+// suspends the app, and on iOS the app must stop presenting to the drawable before returning
+// to the pump (rendering while backgrounded is a watchdog kill). FOREGROUND is
+// did_enter_foreground: safe to render again. LOW_MEMORY asks the app to drop caches.
+// SDL's `terminating` already maps to EVT_QUIT. Note for the eventual iOS port: SDL delivers
+// these synchronously via event watches at the transition moment (the poll loop may never run
+// again before suspension), so the resize-style event watch must flush/stop GPU work directly;
+// the polled copies here remain correct for Android and desktop.
+pub const EVT_APP_BACKGROUND: u8 = 22;
+pub const EVT_APP_FOREGROUND: u8 = 23;
+pub const EVT_LOW_MEMORY: u8 = 24;
+// The mobile on-screen keyboard appeared/disappeared. Occlusion itself needs no app work —
+// the platform backends pan the view so the SDL_SetTextInputArea rect (already fed from the
+// text widgets) stays visible — but the app layer wants the state for layout/scroll polish.
+pub const EVT_SCREEN_KEYBOARD_SHOWN: u8 = 25;
+pub const EVT_SCREEN_KEYBOARD_HIDDEN: u8 = 26;
 /// The window moved to another display, or its display's scale/mode changed. The host re-queries
 /// zigote_get_refresh_hz + zigote_get_scale and re-paces its frame loop (a 60 Hz and a 144 Hz panel
 /// want different caps). window_id says which window; carries no other payload.
 pub const EVT_DISPLAY_CHANGED: u8 = 27;
+
+/// Simultaneous touch fingers tracked; fingers beyond this are ignored at down and never
+/// surface. 10 matches the practical ceiling of phone/tablet digitizers.
+pub const MAX_TOUCH_FINGERS = 10;
 
 /// Modifier bits in ZgEvent.modifiers.
 pub const MOD_SHIFT: u8 = 1;
@@ -598,15 +677,26 @@ const EngineState = struct {
     blur_requests: std.ArrayListUnmanaged(BlurRequest),
     gaussian_blur: ?wgpu_blur.GaussianBlur,
 
-    // First opened game controller, or null. Scanned once on first query (connect it before launch).
+    // Opened game controllers by player slot, packed from slot 0. First query brings the
+    // subsystem up and scans; SDL gamepad_added/removed events request a rescan (hotplug).
     gamepads: [max_gamepads]?sdl3.gamepad.Gamepad = @splat(null),
     gamepad_scanned: bool = false,
+    gamepad_sub_ready: bool = false,
+    gamepad_rescan: bool = false,
 
     // Host scroll orientation, learned from the last mouse-wheel event's SDL direction flag
     // (0 unknown until the first scroll, 1 normal, 2 flipped/natural). SDL exposes the OS
     // "natural scroll" setting only per wheel event, so there is no static query — we latch it
     // here and serve zigote_get_scroll_orientation from it.
     scroll_orientation: u8 = 0,
+
+    // Active touch fingers: slot index (reported to C# in key_scancode) → the SDL
+    // (touch device id, finger id) pair it stands for. SDL finger ids are u64s that may be
+    // pointers or indices depending on the platform; C# gets the compact slot instead so its
+    // per-pointer maps stay small and the 44-byte ZgEvent needs no u64 field. A slot lives
+    // from finger_down to finger_up/finger_canceled; fingers arriving with all slots taken
+    // are dropped entirely (their motion/up never surfaces either, since lookups miss).
+    touch_fingers: [MAX_TOUCH_FINGERS]?TouchFingerSlot = @splat(null),
 
     // miniaudio software synth for UI/game sound. Opened lazily on first use (see ensureAudio); a
     // machine with no audio device leaves this null and the engine runs silently.
@@ -846,7 +936,9 @@ fn createNativeSurface(instance: *wgpu.Instance, window: sdl3.video.Window, meta
     const props = sdl3.c.SDL_GetWindowProperties(window.value);
 
     switch (@import("builtin").os.tag) {
-        .macos => {
+        // iOS shares the macOS path: SDL's MetalView wraps a CAMetalLayer on both (the comment
+        // at the MetalView creation site notes it exists exactly for macOS/iOS).
+        .macos, .ios => {
             var src = wgpu.SurfaceSourceMetalLayer{ .layer = metal_layer orelse return error.MetalLayerUnavailable };
             return instance.createSurface(&.{ .next_in_chain = @ptrCast(&src.chain), .label = label }) orelse error.WgpuSurfaceUnavailable;
         },
@@ -857,6 +949,15 @@ fn createNativeSurface(instance: *wgpu.Instance, window: sdl3.video.Window, meta
             return instance.createSurface(&.{ .next_in_chain = @ptrCast(&src.chain), .label = label }) orelse error.WgpuSurfaceUnavailable;
         },
         .linux => {
+            // Android rides the linux OS tag (aarch64-linux-android): the surface wraps SDL's
+            // ANativeWindow. NOTE: on Android that window handle dies on every backgrounding —
+            // surface recreation on EVT_APP_FOREGROUND is part of the mobile bring-up.
+            if (comptime @import("builtin").abi.isAndroid()) {
+                const a_window = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, null) orelse return error.NoNativeWindowHandle;
+                var src = wgpu.SurfaceSourceAndroidNativeWindow{ .window = a_window };
+                return instance.createSurface(&.{ .next_in_chain = @ptrCast(&src.chain), .label = label }) orelse error.WgpuSurfaceUnavailable;
+            }
+
             // Wayland first, then X11 — SDL exposes whichever driver is active.
             if (sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, null)) |wl_display| {
                 const wl_surface = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, null) orelse return error.NoNativeWindowHandle;
@@ -900,6 +1001,18 @@ fn zigote_init_impl(
     // Inert today (nothing calls SDL_GPU), so failure to set it is harmless.
     sdl3.hints.set(.gpu_driver, "none") catch {};
 
+    // Touch is first-class input: fingers surface as EVT_TOUCH_* and the C# side routes them
+    // as pointers. Without pinning these off, SDL would ALSO synthesize mouse events from
+    // touches (its default), so every tap would fire twice — once as touch, once as a fake
+    // click. The reverse simulation (mouse → fake touch) stays off too: real mice must keep
+    // hover/right-click semantics instead of masquerading as fingers.
+    sdl3.hints.set(.touch_mouse_events, "0") catch {};
+    // Android's back gesture/button must reach the app as a key event (AC_BACK) instead of
+    // finishing the activity behind our back — the UI decides whether there is somewhere to go
+    // back TO, and only closes the app when there is not.
+    sdl3.hints.set(.android_trap_back_button, "1") catch {};
+    sdl3.hints.set(.mouse_touch_events, "0") catch {};
+
     const title_slice: [:0]const u8 = if (title_c != null)
         std.mem.span(title_c)
     else
@@ -933,10 +1046,10 @@ fn zigote_init_impl(
     );
     errdefer window.deinit();
 
-    // The SDL Metal view / CAMetalLayer exists only on macOS/iOS — it backs the macOS wgpu
-    // surface (wgpu renders through Metal under the hood). On Windows/Linux the wgpu surface comes
+    // The SDL Metal view / CAMetalLayer exists only on macOS/iOS — it backs the wgpu surface on
+    // both (wgpu renders through Metal under the hood). On Windows/Linux the wgpu surface comes
     // from the HWND/X11/Wayland handle instead (see createNativeSurface), so we don't create one there.
-    const metal_view: ?sdl3.MetalView = if (@import("builtin").os.tag == .macos)
+    const metal_view: ?sdl3.MetalView = if (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .ios)
         (sdl3.MetalView.init(window) orelse return error.MetalViewUnavailable)
     else
         null;
@@ -966,13 +1079,28 @@ fn zigote_init_impl(
     // e.g. on a Mac with the Vulkan SDK installed the default would dlopen MoltenVK and stand up
     // a whole second adapter chain. Same policy as the SDL gpu_driver=none hint above.
     var instance_extras = wgpu.InstanceExtras{
-        .backends = switch (@import("builtin").os.tag) {
-            .macos => wgpu.InstanceBackends.metal,
+        .backends = if (@import("builtin").abi.isAndroid())
+            // Vulkan ONLY on Android. An ANativeWindow can be connected to exactly one graphics
+            // API at a time, so leaving GL in the mask makes wgpu's GL backend call
+            // eglCreateWindowSurface on the window Vulkan already owns — the connect fails
+            // ("already connected to another API") and surface configuration then aborts.
+            wgpu.InstanceBackends.vulkan
+        else switch (@import("builtin").os.tag) {
+            // iOS is Metal-only — falling into the generic arm would ask for Vulkan/GL and
+            // find neither.
+            .macos, .ios => wgpu.InstanceBackends.metal,
             .windows => wgpu.InstanceBackends.dx12 | wgpu.InstanceBackends.vulkan,
-            // Linux (and anything else): Vulkan with the GL fallback wgpu would resolve anyway.
+            // Desktop Linux (and anything else): Vulkan with the GL fallback wgpu would
+            // resolve anyway.
             else => wgpu.InstanceBackends.vulkan | wgpu.InstanceBackends.gl,
         },
     };
+    // Route wgpu's diagnostics into the engine log before anything can fail: on Android a fatal
+    // surface/adapter error otherwise aborts with no message at all.
+    wgpu.setLogCallback(wgpuLogToEngine, null);
+    wgpu.setLogLevel(if (@import("builtin").abi.isAndroid()) .debug else if (@import("builtin").mode == .Debug) .info else .warn);
+
+    std.log.info("wgpu backends mask = 0x{x} (android={})", .{ instance_extras.backends, @import("builtin").abi.isAndroid() });
     const instance_desc = (wgpu.InstanceDescriptor{}).withNativeExtras(&instance_extras);
     const instance = wgpu.Instance.create(&instance_desc) orelse return error.WgpuInstanceUnavailable;
     errdefer instance.release();
@@ -983,6 +1111,9 @@ fn zigote_init_impl(
     // Pick a GPU. On a multi-GPU machine this is where a 3D app gets the discrete card and a 2D/UI
     // app gets the integrated one (see gpu_select.zig) — and because an adapter carries its own
     // backend, choosing the GPU also chooses the graphics API. Falls back to wgpu's own pick.
+    // On Android the enumeration mask (instance_extras.backends) is already Vulkan-only, and
+    // gpu_select's fallback pins backend_type to match — see the note there for why GL/EGL
+    // winning the adapter request aborts the process.
     const selection = try gpu_select.select(
         instance,
         surface,
@@ -1016,14 +1147,26 @@ fn zigote_init_impl(
     }
 
     // Whether 2× rgba16float MSAA is actually legal here — a stricter question than whether the
-    // feature above was granted; see gpu_select.allowsMsaa2 for why.
+    // feature above was granted; see gpu_select.allowsMsaa2 for why. One query serves two
+    // decisions: the backend picks MSAA, and `adapter_type` flags a software rasterizer for the
+    // environment-bake shrink further down.
     var adapter_info: wgpu.AdapterInfo = undefined;
-    const adapter_backend: wgpu.BackendType =
-        if (adapter.getInfo(&adapter_info) == .success) blk: {
-            defer adapter_info.freeMembers();
-            break :blk adapter_info.backend_type;
-        } else .undefined;
-    const msaa2_supported = gpu_select.allowsMsaa2(adapter_backend, has_format_features);
+    var adapter_backend: wgpu.BackendType = .undefined;
+    var adapter_is_cpu = false;
+    if (adapter.getInfo(&adapter_info) == .success) {
+        defer adapter_info.freeMembers();
+        adapter_backend = adapter_info.backend_type;
+        adapter_is_cpu = adapter_info.adapter_type == .cpu;
+    }
+    // The feature only unlocks ADAPTER-SPECIFIC sample counts — it does not promise 2×. Both the
+    // iOS simulator's paravirtual GPU and the Android emulator's Vulkan-over-host-Metal grant it
+    // yet support only [1,4] for rgba16float (pipeline creation then hard-fails), and there is no
+    // per-format count query in the C API — so mobile targets stay at the spec-guaranteed 4×.
+    // iOS needs the explicit exclusion: allowsMsaa2 admits every Metal backend, and iOS is Metal.
+    const mobile_target = @import("builtin").os.tag == .ios or
+        @import("builtin").abi.isAndroid();
+    const msaa2_supported = gpu_select.allowsMsaa2(adapter_backend, has_format_features) and
+        !mobile_target;
     var device_desc = wgpu.DeviceDescriptor{
         .label = wgpu.StringView.fromSlice("zigote-ffi device"),
         .required_limits = null,
@@ -1039,6 +1182,15 @@ fn zigote_init_impl(
     // 2× rgba16float MSAA is legal here (see msaa2_supported) — lower the 3D renderer's sample
     // count before any Gpu3d is created, since its pipelines and targets both read this.
     if (msaa2_supported) wgpu_renderer.wgpu_3d.MSAA_SAMPLES = 2;
+
+    // Software rasterizer (the Android emulator's Vulkan is SwiftShader on every host): the
+    // full-size environment-IBL bake runs long enough on a CPU that the emulator's fence
+    // watchdog kills the device ("Parent device is lost" on the next acquire). Shrink it to
+    // something a CPU finishes comfortably; real GPUs keep full quality.
+    if (adapter_is_cpu) {
+        wgpu_renderer.wgpu_3d.ENV_SIZE = 64;
+        std.log.warn("zigote: software GPU adapter detected — reducing environment bake to 64px", .{});
+    }
 
     const queue = device.getQueue() orelse return error.WgpuQueueUnavailable;
     errdefer queue.release();
@@ -1161,6 +1313,37 @@ fn zigote_init_impl(
     }
 
     return state;
+}
+
+/// Rebuild the main window's wgpu surface against the CURRENT ANativeWindow.
+///
+/// Android destroys the window's native surface when the app is backgrounded and hands back a
+/// NEW one on resume, so the surface wgpu holds is dead from that moment: presenting to it draws
+/// nothing (the symptom is a black screen with only freshly-damaged regions visible). No SDL
+/// event reports the loss on this path — RENDER_DEVICE_RESET is GL-only — so the
+/// background/foreground transition IS the protocol. SDL only resumes the app thread once the
+/// new surface is ready, so the window property already points at it by the time this runs.
+fn recreateAndroidSurface(state: *EngineState) void {
+    const new_surface = createNativeSurface(state.instance, state.window, null) catch |err| {
+        std.log.err("android: surface recreation failed: {}", .{err});
+        return;
+    };
+
+    state.surface.unconfigure();
+    state.surface.release();
+    state.surface = new_surface;
+
+    // Rotation while backgrounded changes the drawable size, so re-read it rather than reusing
+    // the stale extent; format/present/alpha stay as chosen at boot.
+    if (state.window.getSizeInPixels()) |size| {
+        state.wgpu_config.width = @max(1, @as(u32, @intCast(size[0])));
+        state.wgpu_config.height = @max(1, @as(u32, @intCast(size[1])));
+    } else |_| {}
+    state.surface.configure(&state.wgpu_config);
+
+    // The backend holds the surface BY VALUE; without this it keeps presenting to the dead one.
+    state.wgpu_backend.surface = state.surface;
+    std.log.info("android: surface recreated ({d}x{d})", .{ state.wgpu_config.width, state.wgpu_config.height });
 }
 
 /// Reconfigure the wgpu surface for whichever window changed size. The main window owns the engine's
@@ -1297,36 +1480,63 @@ export fn zigote_wait_events(timeout_ms: u32) void {
     _ = sdl3.events.waitTimeout(@intCast(timeout_ms));
 }
 
-var app_main_cb: ?*const fn () callconv(.c) void = null;
+/// The host callback zigote_run_app runs as the app's real main (single-shot; the process
+/// lives inside it on iOS, so a global is fine).
+var run_app_main: ?*const fn () callconv(.c) void = null;
 
-fn appMainTrampoline(argc: c_int, argv: [*c][*c]u8) callconv(.c) c_int {
+fn runAppTrampoline(argc: c_int, argv: [*c][*c]u8) callconv(.c) c_int {
     _ = argc;
     _ = argv;
-    const cb = app_main_cb orelse return 1;
+    if (run_app_main) |cb| cb();
+    return 0;
+}
+
+/// Hand the process to SDL's platform main wrapper and run `main_fn` as the app's real main.
+/// On iOS this calls UIApplicationMain and invokes the callback after didFinishLaunching, on
+/// the main thread, with the UIKit runloop serviced from inside SDL's event pump — so the
+/// managed host's classic `while (!quit) Frame()` loop keeps working. On desktop platforms
+/// SDL's generic wrapper just calls the function directly, so hosts may use this entry
+/// unconditionally. The callback must contain the WHOLE app lifetime (init → loop →
+/// shutdown); on iOS this function never returns (SDL exits the process when main_fn does).
+/// Takes a zero-arg callback (argc/argv are meaningless to a managed host) so the generated
+/// C# binding stays a plain `delegate* unmanaged[Cdecl]<void>`.
+export fn zigote_run_app(main_fn: ?*const fn () callconv(.c) void) i32 {
+    run_app_main = main_fn;
+    // Synthesized argv: UIApplicationMain and some SDL internals expect a non-null argv0.
+    const argv0: [*c]u8 = @constCast(@ptrCast("zigote"));
+    var argv = [_][*c]u8{ argv0, null };
+    return @intCast(sdl3.c.SDL_RunApp(1, @ptrCast(&argv), &runAppTrampoline, null));
+}
+
+/// Android inverts the other way round from iOS: Java owns the entry point, and SDL's
+/// `nativeRunMain` dlsyms a named C function out of the app's .so and runs it on the SDL thread
+/// (already wrapped in SDL_RunApp). So the managed host does NOT call zigote_run_app there — it
+/// registers its app-main here during process startup, and Java calls zigote_android_main later.
+var android_main: ?*const fn () callconv(.c) void = null;
+
+/// Register the managed app-main. Must be called before the SDL activity starts the app thread
+/// (the managed Application object's startup runs first, which is what makes this ordering hold).
+export fn zigote_set_android_main(main_fn: ?*const fn () callconv(.c) void) void {
+    android_main = main_fn;
+}
+
+/// SDL's `nativeRunMain` entry point. Returns non-zero when no app-main was registered, which
+/// surfaces as a non-zero exit code rather than a silent blank window.
+export fn zigote_android_main(argc: i32, argv: usize) i32 {
+    // Signature is ABI-identical to SDL_main_func (int, char**); spelled with types the C#
+    // binding generator can map (it does not know c_int or [*c][*c]u8).
+    _ = argc;
+    _ = argv;
+    installAndroidStderrForwarder();
+    const cb = android_main orelse return 1;
     cb();
     return 0;
 }
 
-/// Register the app body for Android bring-up: SDLActivity dlsyms zigote_android_main
-/// out of libzigote.so and calls it on its own thread once the activity is up.
-export fn zigote_set_android_main(f: *const fn () callconv(.c) void) void {
-    app_main_cb = f;
-}
-
-/// Entry point called by SDLActivity on Android (SDL_main_func signature).
-export fn zigote_android_main(argc: c_int, argv: [*c][*c]u8) c_int {
-    return appMainTrampoline(argc, argv);
-}
-
-/// Run the app body under SDL's platform entry protocol: UIApplicationMain on iOS,
-/// a plain call on desktop. Returns when the app exits.
-export fn zigote_run_app(app_main: *const fn () callconv(.c) void) void {
-    app_main_cb = app_main;
-    _ = sdl3.c.SDL_RunApp(0, null, appMainTrampoline, null);
-}
-
-/// Query main-window safe-area insets (left, top, right, bottom) in logical pixels.
-/// Zeros when the whole window is safe (desktop) or the query fails.
+/// Main-window safe-area insets in window coordinates, written as [left, top, right, bottom]
+/// into `insets` (4 floats). The safe area is the region free of OS obstructions — notches,
+/// rounded corners, home indicators, TV overscan. All-zero on desktop and on any query
+/// failure, so callers can apply the insets unconditionally.
 export fn zigote_get_safe_area(handle: u64, insets: [*c]f32) void {
     if (insets == null) return;
     insets[0] = 0;
@@ -1340,6 +1550,49 @@ export fn zigote_get_safe_area(handle: u64, insets: [*c]f32) void {
     insets[1] = @floatFromInt(@max(0, safe.y));
     insets[2] = @floatFromInt(@max(0, @as(i64, @intCast(w)) - safe.x - safe.w));
     insets[3] = @floatFromInt(@max(0, @as(i64, @intCast(h)) - safe.y - safe.h));
+}
+
+/// Rust panics inside wgpu-native print their explanation to raw STDERR, which Android discards —
+/// leaving a SIGABRT with no message as the only trace of a fatal GPU error. Redirect fds 1/2
+/// into a pipe drained onto logcat so that text survives. Android-only, installed once before
+/// the app body runs.
+fn installAndroidStderrForwarder() void {
+    if (comptime !@import("builtin").abi.isAndroid()) return;
+    const linux = std.os.linux;
+    var fds: [2]i32 = undefined;
+    if (linux.pipe2(&fds, .{}) != 0) return;
+    _ = linux.dup2(fds[1], 1);
+    _ = linux.dup2(fds[1], 2);
+    _ = linux.close(fds[1]);
+    const t = std.Thread.spawn(.{}, drainStderrPipe, .{fds[0]}) catch return;
+    t.detach();
+}
+
+fn drainStderrPipe(fd: i32) void {
+    const linux = std.os.linux;
+    var buf: [4096]u8 = undefined;
+    var line: [4096]u8 = undefined;
+    var len: usize = 0;
+    while (true) {
+        const n = linux.read(fd, &buf, buf.len);
+        if (n == 0 or n > buf.len) return; // 0 = EOF; > len = negative errno bit-cast
+        for (buf[0..n]) |ch| {
+            if (ch == '\n' or len == line.len - 1) {
+                if (len > 0) {
+                    line[len] = 0;
+                    android_log.write(.err, line[0..len :0].ptr);
+                }
+                len = 0;
+                if (ch != '\n') {
+                    line[len] = ch;
+                    len += 1;
+                }
+            } else {
+                line[len] = ch;
+                len += 1;
+            }
+        }
+    }
 }
 
 /// Base pointer of the out-of-band UTF-8 text buffer filled by the most recent zigote_poll_events.
@@ -1512,7 +1765,27 @@ export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
                 }
             },
             .window_restored => |w| {
+                // Android does NOT send will_enter_background/did_enter_foreground: the app
+                // lifecycle arrives as window minimize/restore. This is also where the surface
+                // must be rebuilt — the ANativeWindow the app was rendering into died when it
+                // was backgrounded, and presenting to it silently draws nothing (the symptom is
+                // a black screen showing only whatever repainted since).
+                if (comptime @import("builtin").abi.isAndroid()) {
+                    recreateAndroidSurface(state);
+                    zge.kind = EVT_APP_FOREGROUND;
+                    buf[count] = zge;
+                    count += 1;
+                    if (count >= capacity) break;
+                    zge = std.mem.zeroes(ZgEvent);
+                }
                 if (emitWindowRefresh(state, w.id, &zge)) {
+                    buf[count] = zge;
+                    count += 1;
+                }
+            },
+            .window_minimized => {
+                if (comptime @import("builtin").abi.isAndroid()) {
+                    zge.kind = EVT_APP_BACKGROUND;
                     buf[count] = zge;
                     count += 1;
                 }
@@ -1602,6 +1875,75 @@ export fn zigote_poll_events(handle: u64, buf: [*]ZgEvent, capacity: u32) u32 {
                 buf[count] = zge;
                 count += 1;
             },
+            .finger_down => |tf| {
+                if (touchIsDirect(tf.id)) {
+                    if (touchSlotAcquire(state, tf.id.value, tf.finger_id.value)) |slot| {
+                        fillTouchEvent(state, &zge, tf, EVT_TOUCH_DOWN, slot);
+                        buf[count] = zge;
+                        count += 1;
+                    }
+                }
+            },
+            .finger_motion => |tf| {
+                // No touchIsDirect re-check: only direct fingers ever get a slot, so the
+                // lookup itself is the filter (and skips SDL's per-event device-type query).
+                if (touchSlotFind(state, tf.id.value, tf.finger_id.value)) |slot| {
+                    fillTouchEvent(state, &zge, tf, EVT_TOUCH_MOVE, slot);
+                    buf[count] = zge;
+                    count += 1;
+                }
+            },
+            .finger_up => |tf| {
+                if (touchSlotFind(state, tf.id.value, tf.finger_id.value)) |slot| {
+                    fillTouchEvent(state, &zge, tf, EVT_TOUCH_UP, slot);
+                    state.touch_fingers[slot] = null;
+                    buf[count] = zge;
+                    count += 1;
+                }
+            },
+            .finger_canceled => |tf| {
+                if (touchSlotFind(state, tf.id.value, tf.finger_id.value)) |slot| {
+                    fillTouchEvent(state, &zge, tf, EVT_TOUCH_CANCEL, slot);
+                    state.touch_fingers[slot] = null;
+                    buf[count] = zge;
+                    count += 1;
+                }
+            },
+            .will_enter_background => {
+                zge.kind = EVT_APP_BACKGROUND;
+                buf[count] = zge;
+                count += 1;
+            },
+            .did_enter_foreground => {
+                // Must happen before the host resumes rendering: it is still holding the surface
+                // that died when the app was backgrounded.
+                if (comptime @import("builtin").abi.isAndroid()) recreateAndroidSurface(state);
+                zge.kind = EVT_APP_FOREGROUND;
+                buf[count] = zge;
+                count += 1;
+            },
+            .low_memory => {
+                zge.kind = EVT_LOW_MEMORY;
+                buf[count] = zge;
+                count += 1;
+            },
+            // Bare notifications (no window id in the SDL payload); window_id 0 = main window,
+            // which is the only window that exists on the mobile platforms that send these.
+            .screen_keyboard_shown => {
+                zge.kind = EVT_SCREEN_KEYBOARD_SHOWN;
+                buf[count] = zge;
+                count += 1;
+            },
+            .screen_keyboard_hidden => {
+                zge.kind = EVT_SCREEN_KEYBOARD_HIDDEN;
+                buf[count] = zge;
+                count += 1;
+            },
+            // Controller hotplug: rescan lazily on the next gamepad query. Only meaningful once
+            // the subsystem is up (before that, the first query scans anyway).
+            .gamepad_added, .gamepad_removed => {
+                state.gamepad_rescan = true;
+            },
             else => {},
         }
     }
@@ -1635,6 +1977,73 @@ fn systemThemeValue() u8 {
         .light => 1,
         .dark => 2,
     };
+}
+
+/// One entry of EngineState.touch_fingers: the SDL identity of the finger occupying a slot.
+const TouchFingerSlot = struct { touch_id: u64, finger_id: u64 };
+
+/// Whether finger events from this SDL touch device should become EVT_TOUCH_* pointer input.
+/// Direct devices (touchscreens) qualify; trackpads (indirect) must not — their resting
+/// fingers would ghost-tap the UI, and they already speak through cursor + wheel events.
+/// SDL's simulated-touch ids: mouse-simulated touches are skipped (the real mouse events
+/// cover them; letting both through would double-fire), pen-simulated ones pass (a stylus
+/// on a tablet screen is direct input with no other event channel here).
+fn touchIsDirect(id: sdl3.touch.Id) bool {
+    if (id.value == sdl3.touch.Id.mouse.value) return false;
+    if (id.value == sdl3.touch.Id.pen.value) return true;
+    return (id.getType() orelse return false) == .direct;
+}
+
+/// Slot already assigned to this finger, if any.
+fn touchSlotFind(state: *EngineState, touch_id: u64, finger_id: u64) ?u32 {
+    for (state.touch_fingers, 0..) |maybe, i| {
+        const slot = maybe orelse continue;
+        if (slot.touch_id == touch_id and slot.finger_id == finger_id) return @intCast(i);
+    }
+    return null;
+}
+
+/// Assign the lowest free slot to a new finger; null when all MAX_TOUCH_FINGERS are down.
+fn touchSlotAcquire(state: *EngineState, touch_id: u64, finger_id: u64) ?u32 {
+    for (&state.touch_fingers, 0..) |*maybe, i| {
+        if (maybe.* == null) {
+            maybe.* = .{ .touch_id = touch_id, .finger_id = finger_id };
+            return @intCast(i);
+        }
+    }
+    return null;
+}
+
+/// LOGICAL size of the window a finger event targets — the factor that turns SDL's normalized
+/// 0..1 finger position into the coordinate space the UI lays out in.
+///
+/// Derived as pixels / display scale rather than from SDL's window size, because those two agree
+/// only on desktop. On Android SDL reports the window size in PIXELS (1080 wide) while the
+/// display scale is ~2.75, so using the window size directly put every touch ~2.75x too far out
+/// and nothing was hittable. macOS/iOS are unaffected: there the window size already equals
+/// pixels / scale.
+fn touchWindowLogicalSize(state: *EngineState, sdl_id: u32) [2]f32 {
+    const win = if (sdl_id != 0)
+        sdl3.video.Window.fromId(sdl_id) catch state.window
+    else
+        state.window;
+    const w, const h = win.getSizeInPixels() catch return .{ 0, 0 };
+    const scale = win.getDisplayScale() catch 1.0;
+    const safe_scale = if (scale > 0.0) scale else 1.0;
+    return .{ @as(f32, @floatFromInt(w)) / safe_scale, @as(f32, @floatFromInt(h)) / safe_scale };
+}
+
+/// Fill the shared fields of an EVT_TOUCH_* event from an SDL finger event. `slot` was
+/// resolved by the caller (acquire on down, find on move/up/cancel) so this stays a pure
+/// formatter.
+fn fillTouchEvent(state: *EngineState, zge: *ZgEvent, tf: anytype, kind: u8, slot: u32) void {
+    const size = touchWindowLogicalSize(state, tf.window_id orelse 0);
+    zge.kind = kind;
+    zge.x = tf.x * size[0];
+    zge.y = tf.y * size[1];
+    zge.key_scancode = slot;
+    zge.scroll_x = tf.pressure;
+    zge.window_id = tf.window_id orelse 0;
 }
 
 // ── Lazy 3D renderer ──────────────────────────────────────────────────────────
@@ -1673,11 +2082,32 @@ fn ensure3d(state: *EngineState) ?*wgpu_renderer.wgpu_3d.Gpu3d {
 
 const max_gamepads = 8;
 
-// ponytail: one scan at first use, in slot-discovery order — controllers plugged in
-// after that aren't seen until restart; rescan on SDL gamepad-added/removed events
-// if hot-plug ever matters.
+fn rescanGamepads(state: *EngineState) void {
+    for (&state.gamepads) |*slot| {
+        if (slot.*) |g| g.deinit();
+        slot.* = null;
+    }
+    const pads = sdl3.gamepad.getGamepads() catch {
+        std.log.warn("zigote: gamepad enumeration failed", .{});
+        return;
+    };
+    var slot: usize = 0;
+    for (pads) |id| {
+        if (slot >= state.gamepads.len) break;
+        state.gamepads[slot] = sdl3.gamepad.Gamepad.init(id) catch continue;
+        slot += 1;
+    }
+    std.log.info("zigote: {d} game controller(s) connected", .{slot});
+}
+
 fn ensureGamepads(state: *EngineState) void {
-    if (state.gamepad_scanned) return;
+    if (state.gamepad_scanned) {
+        if (state.gamepad_rescan and state.gamepad_sub_ready) {
+            state.gamepad_rescan = false;
+            rescanGamepads(state);
+        }
+        return;
+    }
     // Latch the attempt BEFORE touching SDL so a failure (or a one-time stall) never repeats every
     // frame: gamepad support is best-effort, and the engine must keep running without it.
     state.gamepad_scanned = true;
@@ -1700,23 +2130,8 @@ fn ensureGamepads(state: *EngineState) void {
         std.log.warn("zigote: gamepad subsystem init failed; controller input disabled", .{});
         return;
     };
-    const pads = sdl3.gamepad.getGamepads() catch {
-        std.log.warn("zigote: gamepad enumeration failed; controller input disabled", .{});
-        return;
-    };
-    if (pads.len == 0) {
-        std.log.info("zigote: gamepad subsystem ready; no controllers detected", .{});
-        return;
-    }
-    var opened: u32 = 0;
-    for (pads[0..@min(pads.len, max_gamepads)], 0..) |id, i| {
-        state.gamepads[i] = sdl3.gamepad.Gamepad.init(id) catch {
-            std.log.warn("zigote: failed to open controller {d}", .{i});
-            continue;
-        };
-        opened += 1;
-    }
-    std.log.info("zigote: {d} game controller(s) connected", .{opened});
+    state.gamepad_sub_ready = true;
+    rescanGamepads(state);
 }
 
 fn gamepadAt(state: *EngineState, pad: u8) ?sdl3.gamepad.Gamepad {
@@ -1725,7 +2140,7 @@ fn gamepadAt(state: *EngineState, pad: u8) ?sdl3.gamepad.Gamepad {
     return state.gamepads[pad];
 }
 
-/// Number of connected (and opened) game controllers, up to 8 slots.
+/// Number of connected (opened) game controllers, 0-8. Player slots are packed from 0.
 export fn zigote_input_gamepad_count(handle: u64) u32 {
     const state = stateFromHandle(handle) orelse return 0;
     ensureGamepads(state);
@@ -1766,6 +2181,14 @@ export fn zigote_input_gamepad_button(handle: u64, pad: u8, button: u8) u32 {
 fn ensureAudio(state: *EngineState) ?*audio_ffi.AudioState {
     if (state.audio) |a| return a;
     if (state.audio_scanned) return null;
+    // The iOS SIMULATOR's AudioToolbox abort()s the process on an XPC timeout inside
+    // AURemoteIO::Initialize (audio-daemon wedge; deterministic on current runtimes, and an
+    // abort cannot be caught) — a silent simulator beats a dead app. Devices keep audio.
+    if (comptime @import("builtin").os.tag == .ios and @import("builtin").abi == .simulator) {
+        state.audio_scanned = true;
+        std.log.warn("zigote: audio disabled on the iOS simulator (AudioToolbox XPC abort)", .{});
+        return null;
+    }
     // Latch before touching SDL so a one-time failure never retries every call.
     state.audio_scanned = true;
     std.log.info("zigote: initializing audio subsystem…", .{});
@@ -4060,7 +4483,7 @@ fn createSecondaryWindowImpl(
     );
     errdefer window.deinit();
 
-    const metal_view: ?sdl3.MetalView = if (@import("builtin").os.tag == .macos)
+    const metal_view: ?sdl3.MetalView = if (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .ios)
         (sdl3.MetalView.init(window) orelse return error.MetalViewUnavailable)
     else
         null;

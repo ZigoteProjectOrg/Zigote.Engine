@@ -59,6 +59,29 @@
             .hash = "N-V-__8AACvXrAO11f5LA-Qfgm2C0XyWNhS_0N30HTL-Y5pQ",
             .lazy = true,
         },
+        // Mobile targets (same pinned wgpu-native release). Android is `aarch64-linux-android`
+        // (an ABI of the linux OS tag); iOS device and simulator need DIFFERENT archives — the
+        // simulator slice is a distinct platform, selected by the `simulator` target ABI.
+        .wgpu_android_aarch64 = .{
+            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-android-aarch64-release.zip",
+            .hash = "N-V-__8AANP92gMj0bJTDLcmtwElCPQQKgga3W3mt87F04uu",
+            .lazy = true,
+        },
+        .wgpu_android_x86_64 = .{
+            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-android-x86_64-release.zip",
+            .hash = "N-V-__8AAEMD2wOU3TihKy1U7Is3TVMYEOgFywHBlZgxB_Pd",
+            .lazy = true,
+        },
+        .wgpu_ios_aarch64 = .{
+            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-ios-aarch64-release.zip",
+            .hash = "N-V-__8AAOVBeQLBa1rzkcTYx_IC9HW02t4_vDJ7EhfLNE34",
+            .lazy = true,
+        },
+        .wgpu_ios_aarch64_simulator = .{
+            .url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-ios-aarch64-simulator-release.zip",
+            .hash = "N-V-__8AAAWHeALmUAf8bNN64GD-SFrzdCmHxmRZDcb1jl2M",
+            .lazy = true,
+        },
         // Forked from allyourcodebase/assimp@ec4892c (assimp 5.3.1) into libraries/assimp with a
         // Zig-0.16 fixup (Compile.linkLibC/linkLibCpp → root_module.link_libc/link_libcpp; examples
         // dropped). Builds the assimp C++ importer from source, replacing the Homebrew system lib.

@@ -327,6 +327,12 @@ pub fn select(
     var opts = wgpu.RequestAdapterOptions{
         .power_preference = power.toWgpu(),
         .compatible_surface = surface,
+        // Android: demand the Vulkan adapter. wgpu-native creates every compiled-in backend
+        // regardless of the instance's backend mask, and its GL/EGL adapter otherwise wins this
+        // request — then surface configuration calls eglCreateWindowSurface on an ANativeWindow
+        // that is already connected to another API and aborts the process. Only the adapter's
+        // backend_type actually pins the choice, so the fallback must set it too.
+        .backend_type = if (@import("builtin").abi.isAndroid()) .vulkan else .undefined,
     };
     const resp = instance.requestAdapterSync(&opts, 1_000_000);
     result.adapter = resp.adapter orelse return error.WgpuAdapterUnavailable;

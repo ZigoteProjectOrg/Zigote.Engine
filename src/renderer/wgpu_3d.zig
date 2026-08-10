@@ -74,7 +74,11 @@ fn halton(index: u32, base: u32) f32 {
 /// Prefiltered environment cubemap for image-based lighting. Each mip is a rougher reflection
 /// level; the mesh shader selects a mip by surface roughness. HDR (rgba16float) so bright
 /// studio highlights / HDRI hotspots survive into reflections.
-const ENV_SIZE: u32 = 512; // mip-0 reflection resolution (128 was too soft for chrome mirrors)
+// Mip-0 reflection resolution (128 was too soft for chrome mirrors). A var, not a const:
+// root.zig shrinks it at device init on SOFTWARE Vulkan adapters (the Android emulator's only
+// Vulkan is SwiftShader), where the 512²×6-face×128-sample GGX bake takes long enough that the
+// emulator's fence watchdog declares the device lost. Written once, before any Gpu3d exists.
+pub var ENV_SIZE: u32 = 512;
 const ENV_MIPS: u32 = 6; // 128 → 4 px; max LOD index = ENV_MIPS - 1
 const BLOOM_MIPS: u32 = 6; // mip-chain bloom levels (mip0 full-res, unused; chain output at mip1)
 const ENV_CUBE_FORMAT: wgpu.TextureFormat = .rgba16_float;
@@ -99,7 +103,11 @@ const TOTAL_SHADOW_LAYERS: u32 = NUM_CASCADES + MAX_SPOT_SHADOWS;
 const SHADOW_SLOT: u32 = 256;
 /// Omnidirectional point-light shadows: a depth cube-array. Each shadow-casting point light claims one
 /// cube (6 faces); the mesh shader samples it by direction with a hardware depth comparison.
-const MAX_POINT_SHADOWS: u32 = 2;
+const MAX_POINT_SHADOWS: u32 = if (shaders3d.cube_array_supported) 2 else 1;
+/// Sampled view over the point-shadow faces: a cube array normally, a single cube on the one
+/// target without cube-array support (see shaders3d.cube_array_supported).
+const POINT_SHADOW_VIEW_DIM: wgpu.ViewDimension =
+    if (shaders3d.cube_array_supported) .cube_array else .cube;
 const POINT_SHADOW_SIZE: u32 = 1024; // per cube-face resolution
 const POINT_CUBE_LAYERS: u32 = 6 * MAX_POINT_SHADOWS;
 /// Cube-face look directions + up vectors (WebGPU/D3D cube convention: +X,-X,+Y,-Y,+Z,-Z). Used to
@@ -857,7 +865,7 @@ pub const Gpu3d = struct {
             .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .comparison } },
             .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .cube } },
             .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
-            .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .depth, .view_dimension = .cube_array } },
+            .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .depth, .view_dimension = POINT_SHADOW_VIEW_DIM } },
             // binding 5: refraction source (opaque scene copy) for glass screen-space refraction.
             // Rides in this group because WebGPU caps pipelines at 4 bind groups (0..3).
             .{ .binding = 5, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
@@ -1253,7 +1261,7 @@ pub const Gpu3d = struct {
             .sample_count = 1,
         }) orelse return error.DepthTextureCreateFailed;
         const point_shadow_view = point_shadow_tex.createView(&.{
-            .dimension = .cube_array,
+            .dimension = POINT_SHADOW_VIEW_DIM,
             .base_array_layer = 0,
             .array_layer_count = 6,
             .aspect = .depth_only,
@@ -3316,7 +3324,7 @@ pub const Gpu3d = struct {
             .sample_count = 1,
         }) orelse return error.DepthTextureCreateFailed;
         const view = tex.createView(&.{
-            .dimension = .cube_array,
+            .dimension = POINT_SHADOW_VIEW_DIM,
             .base_array_layer = 0,
             .array_layer_count = face_count,
             .aspect = .depth_only,
