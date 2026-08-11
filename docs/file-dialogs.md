@@ -164,7 +164,11 @@ public static class FileDialog
 Semantics:
 
 - **UI-thread only** (both the `*Async` calls and the pump). Completions run inline on the UI
-  thread, so `await` + widget mutation is safe with no dispatcher.
+  thread, so `await` + widget mutation is safe with no dispatcher. Enforced rather than merely
+  documented: a `*Async` call from any thread but the pumping one throws `InvalidOperationException`
+  synchronously, at the offending call site. The alternative is worse than an exception — on macOS
+  AppKit aborts the process over an `NSWindow` built off the main thread, and the crash names no
+  managed frame. Start the dialog on the UI thread; the task it hands back can be awaited anywhere.
 - `null` (or empty array) result = user cancelled — never an exception. A platform failure (no
   portal/zenity on Linux, SDL error) faults the task with `FileDialogException`; callers that have
   an in-app fallback catch it and degrade.
