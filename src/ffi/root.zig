@@ -45,6 +45,14 @@ comptime {
 comptime {
     _ = @import("chrome.zig");
 }
+// The `zigote_channel_*` exports: named message channels between the managed host and native
+// platform code (a Kotlin service, an Objective-C delegate, a C++ SDK). Nothing in the engine
+// calls them — they exist for the host and its platform head — so the reference is what keeps
+// them in the binary. On every target, not just mobile: a static link (iOS) rejects an undeclared
+// symbol even when unreachable, and desktop heads use the same bus for their own platform code.
+comptime {
+    _ = @import("channel.zig");
+}
 // The native menu bar and OS drag-out are implemented in Objective-C for macOS
 // (src/platform/macos_{menu,drag}.m, compiled only there). Everywhere else this stub supplies
 // the same exports as no-ops, so the FFI surface — and therefore the generated, platform-
@@ -1561,8 +1569,13 @@ fn installAndroidStderrForwarder() void {
     const linux = std.os.linux;
     var fds: [2]i32 = undefined;
     if (linux.pipe2(&fds, .{}) != 0) return;
-    _ = linux.dup2(fds[1], 1);
-    _ = linux.dup2(fds[1], 2);
+    // dup3, not dup2. Android's seccomp filter allows the legacy dup2 syscall on arm64 but NOT on
+    // x86_64, where the process is killed outright with SIGSYS ("seccomp prevented call to
+    // disallowed x86_64 system call 33") — inside this function, before a single line of app code
+    // runs. dup3 is the modern spelling of the same call and is permitted on both, so the emulator
+    // and a real device take the same path. The zero flag makes it behave exactly like dup2.
+    _ = linux.dup3(fds[1], 1, 0);
+    _ = linux.dup3(fds[1], 2, 0);
     _ = linux.close(fds[1]);
     const t = std.Thread.spawn(.{}, drainStderrPipe, .{fds[0]}) catch return;
     t.detach();

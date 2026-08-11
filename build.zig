@@ -646,6 +646,11 @@ pub fn build(b: *std.Build) void {
             .file = b.path("src/platform/macos_file_dialog.m"),
             .flags = &.{"-fno-objc-arc"},
         });
+        // macOS status-bar item (NSStatusItem) — the tray icon, driven from C# by P/Invoke.
+        ffi_mod.addCSourceFile(.{
+            .file = b.path("src/platform/macos_tray.m"),
+            .flags = &.{"-fno-objc-arc"},
+        });
         // macOS unified titlebar (full-size content view + native traffic lights) — backs
         // src/ffi/chrome.zig's mac_unified style.
         ffi_mod.addCSourceFile(.{
