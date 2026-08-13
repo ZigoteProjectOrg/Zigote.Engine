@@ -17,6 +17,7 @@ const is_macos = builtin.os.tag == .macos;
 extern fn zigote_macwin_set_unified(nswindow: ?*anyopaque, enabled: i32) void;
 extern fn zigote_macwin_get_unified(nswindow: ?*anyopaque) i32;
 extern fn zigote_macwin_set_csd(nswindow: ?*anyopaque, enabled: i32, radius: f32) void;
+extern fn zigote_macwin_set_dock_visible(visible: i32) void;
 
 /// Re-assert a window's chrome if the OS dropped it. macOS clears the FullSizeContentView
 /// styleMask bit on fullscreen/zoom round-trips, silently reverting a unified titlebar to
@@ -206,6 +207,16 @@ export fn zigote_window_is_maximized(window_id: u32) bool {
 export fn zigote_window_is_transparent(window_id: u32) bool {
     const win = sdlWindow(window_id) orelse return false;
     return sdl3.c.SDL_GetWindowFlags(win) & sdl3.c.SDL_WINDOW_TRANSPARENT != 0;
+}
+
+/// Whether the whole application appears in the Dock and the ⌘-Tab switcher (macOS; a no-op
+/// elsewhere, where hiding the window already takes the app out of the taskbar).
+///
+/// Application-wide rather than per-window, because the activation policy is: it is what makes a
+/// process a foreground app at all. A previewed app hides its own window and is watched inside the
+/// IDE, so the Dock tile it keeps is for a window nobody can bring back.
+export fn zigote_app_set_dock_visible(visible: bool) void {
+    if (is_macos) zigote_macwin_set_dock_visible(@intFromBool(visible));
 }
 
 /// Maximize, or restore when already maximized (CSD button action).

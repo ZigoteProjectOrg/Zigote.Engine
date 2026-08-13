@@ -67,3 +67,20 @@ ZEXPORT void zigote_macwin_set_csd(void *nswindowPtr, int enabled, float radius)
         layer.masksToBounds = NO;
     }
 }
+
+// Dock tile and ⌘-Tab entry, on or off. Hiding the window is not enough on macOS: the process
+// stays a regular application, so a previewed app the user cannot switch to keeps a bouncing
+// Dock icon and a slot in the app switcher. Accessory is the policy the tray/agent apps use —
+// running, with no tile and no menu bar — and it is settable at runtime, so the trip back to a
+// visible window restores Regular. Activating on the way back is what actually returns the menu
+// bar; without it the app owns the screen with the previous app's menus still up.
+ZEXPORT void zigote_macwin_set_dock_visible(int visible) {
+    NSApplication *app = NSApplication.sharedApplication;
+    if (app == nil) return;
+    if (visible) {
+        [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+        [app activateIgnoringOtherApps:YES];
+    } else {
+        [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    }
+}
