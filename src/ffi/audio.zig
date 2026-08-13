@@ -879,7 +879,7 @@ test "shelfSlope: Q 0.7071 is slope 1 at any gain" {
     // the maximally-steep shelf with no overshoot. If this drifts, every AutoEq profile is subtly
     // wrong in its bass and treble.
     for ([_]f64{ -12, -6, 0, 5.5, 12 }) |gain|
-        try std.testing.expectApproxEqAbs(@as(f64, 1.0), shelfSlope(gain, 0.7071067811865476), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), shelfSlope(gain, 0.7071067811865476), 1e-9);
 }
 
 test "shelfSlope: stays inside the RBJ domain for extreme Q" {
