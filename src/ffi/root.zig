@@ -2688,6 +2688,9 @@ fn fillPaintList(
                     .glow_x = cmd.baseline_x,
                     .glow_y = cmd.baseline_y,
                     .pinch = cmd.font_size,
+                    // Glass never carries text metrics, so line_height is free to be the
+                    // adaptive-luminance knob (see PaintList.AddLiquidGlass).
+                    .adapt = cmd.line_height,
                 } });
             },
             CMD_TEXT => {

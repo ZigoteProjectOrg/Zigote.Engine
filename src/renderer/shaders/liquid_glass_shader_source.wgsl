@@ -11,6 +11,7 @@ struct VertexOut {
   @location(5) glow_pos: vec2<f32>,
   @location(6) pinch_strength: f32,
   @location(7) clear_tint: f32,
+  @location(8) adapt: f32,
 };
 
 @vertex
@@ -24,6 +25,7 @@ fn vs_main(
   @location(6) glow_pos: vec2<f32>,
   @location(7) pinch_strength: f32,
   @location(8) clear_tint: f32,
+  @location(9) adapt: f32,
 ) -> VertexOut {
   var out: VertexOut;
   out.position = vec4<f32>(position, 0.0, 1.0);
@@ -35,6 +37,7 @@ fn vs_main(
   out.glow_pos = glow_pos;
   out.pinch_strength = pinch_strength;
   out.clear_tint = clear_tint;
+  out.adapt = adapt;
   return out;
 }
 
@@ -107,6 +110,31 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     cb = textureSampleLevel(backdrop, backdrop_sampler, uvR - disp * ca, 0.0).b;
   }
   var rgb = vec3<f32>(mix(frosted.r, cr, edge), frosted.g, mix(frosted.b, cb, edge));
+
+  // ── Adaptive luminance (Apple's adaptive glass): pull the backdrop toward a legibility anchor.
+  //    `adapt` < 0 is dark glass (anchored low so LIGHT content always reads), > 0 is light glass
+  //    (anchored high for DARK content); magnitude is strength. Per pixel, so a chip straddling a
+  //    bright sky and a black coat gets a strong scrim only where it needs one. The move is a
+  //    contrast compression about the anchor in perceptual space — a tone curve, not a flat wash:
+  //    backdrops already near the anchor pass through untouched, highlights fold hard. Dimming is
+  //    multiplicative (keeps hue, calmed toward grey); lifting screens toward white, which is what
+  //    makes light glass go milky over a dark photo instead of grey. ──────────────────────────────
+  let adapt = clamp(in.adapt, -1.0, 1.0);
+  if (abs(adapt) > 0.001) {
+    let s = abs(adapt);
+    let lw = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let L = dot(max(rgb, vec3<f32>(0.0)), lw);
+    let Lp = pow(L, 1.0 / 2.2);
+    let anchor_p = select(0.22, 0.85, adapt > 0.0);
+    let keep = 1.0 - s * 0.8;
+    let aim = pow(anchor_p + (Lp - anchor_p) * keep, 2.2);
+    if (aim < L) {
+      let dimmed = rgb * (aim / max(L, 1e-4));
+      rgb = mix(dimmed, vec3<f32>(aim), s * 0.30);
+    } else {
+      rgb = mix(rgb, vec3<f32>(1.0), (aim - L) / max(1.0 - L, 1e-4));
+    }
+  }
 
   // ── Tint. `clear_tint` (0 = clear glass, 1 = strongest) is independent of edge coverage: dark
   //    tints multiply (deepen), light tints screen (brighten), matching the source material. ──────

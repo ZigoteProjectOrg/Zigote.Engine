@@ -88,6 +88,9 @@ pub const LiquidGlass = struct {
     glow_x: f32 = 0,
     glow_y: f32 = 0,
     pinch: f32 = 0,
+    /// Adaptive luminance: <0 anchors the backdrop dark (for light content),
+    /// >0 anchors it light (for dark content), 0 = off. Magnitude is strength.
+    adapt: f32 = 0,
 };
 
 pub const Shadow = struct {

@@ -37,6 +37,9 @@ pub const LiquidGlassVertex = extern struct {
     pinch_strength: f32,
     /// 0 = fully clear glass, 1 = full color tint. RGB comes from `color`.
     clear_tint: f32,
+    /// Adaptive-luminance strength: <0 anchors the backdrop dark (light content),
+    /// >0 anchors it light (dark content), 0 = off. Magnitude is strength.
+    adapt: f32,
 };
 
 pub const ImageVertex = extern struct {
@@ -344,6 +347,11 @@ pub const GpuUi = struct {
                 .format = .float32,
                 .offset = @offsetOf(LiquidGlassVertex, "clear_tint"),
                 .shader_location = 8,
+            },
+            .{
+                .format = .float32,
+                .offset = @offsetOf(LiquidGlassVertex, "adapt"),
+                .shader_location = 9,
             },
         };
 
@@ -1780,6 +1788,7 @@ fn appendPaintOps(
                     lg.glow_y * scale_factor,
                     lg.pinch,
                     liquidGlassClearTint(lg, lg.color),
+                    lg.adapt,
                     frame_width,
                     frame_height,
                 );
@@ -2714,10 +2723,12 @@ fn appendLiquidGlass(
     glow_y: f32,
     pinch: f32,
     clear_tint: f32,
+    adapt: f32,
     frame_width: f32,
     frame_height: f32,
 ) !void {
     if (rect.width <= 0 or rect.height <= 0) return;
+    const adapt_c = std.math.clamp(adapt, -1.0, 1.0);
 
     const x0 = rect.x / frame_width * 2.0 - 1.0;
     const y0 = 1.0 - rect.y / frame_height * 2.0;
@@ -2744,6 +2755,7 @@ fn appendLiquidGlass(
             .glow_pos = glow_pos,
             .pinch_strength = pinch,
             .clear_tint = clamp01(clear_tint),
+            .adapt = adapt_c,
         },
         .{
             .position = .{ x1, y0 },
@@ -2755,6 +2767,7 @@ fn appendLiquidGlass(
             .glow_pos = glow_pos,
             .pinch_strength = pinch,
             .clear_tint = clamp01(clear_tint),
+            .adapt = adapt_c,
         },
         .{
             .position = .{ x0, y1 },
@@ -2766,6 +2779,7 @@ fn appendLiquidGlass(
             .glow_pos = glow_pos,
             .pinch_strength = pinch,
             .clear_tint = clamp01(clear_tint),
+            .adapt = adapt_c,
         },
         // Triangle 2
         .{
@@ -2778,6 +2792,7 @@ fn appendLiquidGlass(
             .glow_pos = glow_pos,
             .pinch_strength = pinch,
             .clear_tint = clamp01(clear_tint),
+            .adapt = adapt_c,
         },
         .{
             .position = .{ x1, y1 },
@@ -2789,6 +2804,7 @@ fn appendLiquidGlass(
             .glow_pos = glow_pos,
             .pinch_strength = pinch,
             .clear_tint = clamp01(clear_tint),
+            .adapt = adapt_c,
         },
         .{
             .position = .{ x0, y1 },
@@ -2800,6 +2816,7 @@ fn appendLiquidGlass(
             .glow_pos = glow_pos,
             .pinch_strength = pinch,
             .clear_tint = clamp01(clear_tint),
+            .adapt = adapt_c,
         },
     });
 }
