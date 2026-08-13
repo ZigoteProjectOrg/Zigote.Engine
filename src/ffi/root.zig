@@ -2943,6 +2943,8 @@ export fn zigote_measure_text(
     max_width: f32,
     font_weight: u16,
     font_style: u8,
+    letter_spacing: f32,
+    word_spacing: f32,
     font_family: [*c]const u8,
     font_family_len: u32,
 ) ZgSize {
@@ -2974,6 +2976,8 @@ export fn zigote_measure_text(
                     .font_family = family,
                     .font_weight = fw,
                     .font_style = fs,
+                    .letter_spacing = letter_spacing,
+                    .word_spacing = word_spacing,
                 }, &out_w, &out_h)) |_| {
                     return .{ .width = out_w, .height = out_h };
                 } else |_| {
@@ -5594,6 +5598,10 @@ export fn zigote_add_emoji_font(handle: u64, name_ptr: [*c]const u8) ZgResult {
     const state = stateFromHandle(handle) orelse return .err;
     if (name_ptr == null) return .err;
     const name = std.mem.span(name_ptr);
+    // Refuse fonts the color path cannot draw (e.g. COLR-outline-only faces): registration
+    // would capture every emoji codepoint and render nothing. The host sees .err and keeps
+    // its monochrome fallback instead.
+    if (!state.gpu_ui.text.emojiFamilyRendersColor(name)) return .err;
     state.gpu_ui.text.addEmojiFontFamily(name);
 
     var it = state.windows.valueIterator();

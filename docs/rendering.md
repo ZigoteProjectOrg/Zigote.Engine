@@ -112,10 +112,22 @@ Text is shaped by HarfBuzz and rasterized into a FreeType glyph atlas (`renderer
 Two caches keep a per-frame-rendering editor fast:
 
 - a **glyph coverage atlas** (starts 1024² R8, grows ×2 to 4096² on overflow), and
-- a **shaped-quad cache** keyed by `(text, family, size)` so repeated text skips `hb_shape` entirely.
+- a **shaped-quad cache** keyed by `(text, family, size, synth-style, spacing-flag)` so repeated
+  text skips `hb_shape` entirely.
 
-A colour-emoji atlas materializes lazily on the first colour glyph. `zigote_text_reset_caches` drops
-every native + managed text cache (needed after a wholesale sizing change or face swap).
+Weight and italic requests the resolved face cannot provide itself are **synthesized** — outline
+embolden proportional to the weight gap (read from OS/2 `usWeightClass`, so real Medium/SemiBold
+faces are never double-bolded) and a 12° shear for oblique. Letter-spacing applies per HarfBuzz
+*cluster* (marks stay attached, ligatures under tracking shape with `liga/clig` off), and the same
+run-splitting drives paint, measurement, cached layouts and caret stops, so they can never disagree.
+
+A colour-emoji atlas materializes lazily on the first colour glyph. Fixed-strike colour fonts
+(Apple Color Emoji sbix, Noto CBDT) select the nearest strike via `FT_Select_Size` and scale the
+quad; the atlas is keyed by strike so a size ramp reuses one bake. On overflow it resets and
+repacks (generation bump re-bakes cached layouts). `zigote_add_emoji_font` probes that the face
+actually produces BGRA bitmaps and refuses ones that don't (COLR-outline-only), so hosts can fall
+back to a monochrome emoji face. `zigote_text_reset_caches` drops every native + managed text
+cache (needed after a wholesale sizing change or face swap).
 
 ## Sprites and particles
 

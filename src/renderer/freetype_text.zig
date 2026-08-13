@@ -6,6 +6,8 @@ const bidi = @import("bidi.zig");
 const ft = @cImport({
     @cInclude("ft2build.h");
     @cInclude("freetype/freetype.h");
+    @cInclude("freetype/tttables.h");
+    @cInclude("freetype/ftoutln.h");
 });
 
 const hb = @cImport({
@@ -69,6 +71,65 @@ const Glyph = struct {
     advance_x: f32,
 };
 
+/// The style a paint command asked for. The renderer resolves it against what the face actually
+/// provides: a face that already is bold/italic (real weight variants registered by the host)
+/// renders untouched, while a face that lacks the style gets a synthetic fallback — emboldened
+/// outlines for weight, a shear for oblique — so `fontWeight`/`fontStyle` never silently no-op.
+pub const FaceStyle = struct {
+    weight: u16 = 400,
+    italic: bool = false,
+};
+
+/// What must actually be synthesized for (face, style): `embolden` is the outline strength in
+/// pixels (0 = none), `oblique` a 12° shear. Derived per glyph bake / shaped run — both are cheap
+/// table reads.
+const Synth = struct {
+    embolden: f32 = 0,
+    oblique: bool = false,
+
+    fn none(self: Synth) bool {
+        return self.embolden == 0 and !self.oblique;
+    }
+
+    /// Embolden strength in 26.6 fixed point, quantized — also the value glyph/run cache keys
+    /// hash, so two requests that synthesize identically share one raster.
+    fn strength266(self: Synth) i32 {
+        return @intFromFloat(@round(self.embolden * 64.0));
+    }
+};
+
+/// The face's own weight class (OS/2 usWeightClass, the field real weight variants like
+/// Inter-Medium carry), falling back to the bold style flag for fonts without an OS/2 table.
+fn faceWeightClass(face: ft.FT_Face) u16 {
+    if (ft.FT_Get_Sfnt_Table(face, ft.FT_SFNT_OS2)) |table| {
+        const os2: *const ft.TT_OS2 = @ptrCast(@alignCast(table));
+        const w = os2.usWeightClass;
+        if (w >= 100 and w <= 1000) return @intCast(w);
+    }
+    return if ((face.*.style_flags & ft.FT_STYLE_FLAG_BOLD) != 0) 700 else 400;
+}
+
+/// Decide what to synthesize: only the style the face cannot deliver itself. A requested weight
+/// above the face's own gets outline emboldening proportional to the gap (700 over a 400 face is
+/// the classic size/24 full-bold strength); requested italic on a non-italic face gets a shear.
+/// Lighter-than-face weights are never synthesized — thinning outlines destroys small sizes.
+fn synthFor(face: ft.FT_Face, style: FaceStyle, pixel_size: u16) Synth {
+    var synth = Synth{};
+    if (style.italic and (face.*.style_flags & ft.FT_STYLE_FLAG_ITALIC) == 0)
+        synth.oblique = true;
+    // The OS/2 read is gated on the request being bolder than regular, so the overwhelmingly
+    // common regular-on-regular path stays table-lookup-free.
+    if (style.weight > 400) {
+        const own = faceWeightClass(face);
+        if (style.weight > own + 50) {
+            const gap: f32 = @floatFromInt(style.weight - own);
+            const t = @min(gap / 300.0, 5.0 / 3.0);
+            synth.embolden = t * @as(f32, @floatFromInt(pixel_size)) / 24.0;
+        }
+    }
+    return synth;
+}
+
 /// One glyph's pixel-relative position (origin = draw baseline) and atlas UVs.
 /// Stored in TextLayoutEntry so the same layout can be drawn at any position.
 pub const TextLayoutGlyph = struct {
@@ -100,6 +161,10 @@ pub const TextCaret = struct {
 /// `text`/`font_family` are owned copies (the originating zg.paint.Text does not outlive the call).
 pub const TextLayoutEntry = struct {
     glyphs: []TextLayoutGlyph,
+    /// Color-emoji quads baked alongside the coverage glyphs, in the same origin-relative logical
+    /// space. Drawn through the image pipeline (see appendLayoutGlyphs); UVs go stale together with
+    /// `glyphs` on a generation bump, and re-bake in the same reshape.
+    color_quads: []PendingColorQuad = &.{},
     carets: []TextCaret,
     width: f32,
     height: f32,
@@ -109,6 +174,7 @@ pub const TextLayoutEntry = struct {
     line_height: f32,
     letter_spacing: f32 = 0,
     word_spacing: f32 = 0,
+    style: FaceStyle = .{},
     raster_scale: f32 = 1,
     generation: u64,
 };
@@ -457,6 +523,7 @@ pub const FreeTypeTextRenderer = struct {
         var layout_it = self.layout_cache.iterator();
         while (layout_it.next()) |entry| {
             self.allocator.free(entry.value_ptr.*.glyphs);
+            self.allocator.free(entry.value_ptr.*.color_quads);
             self.allocator.free(entry.value_ptr.*.carets);
             self.allocator.free(entry.value_ptr.*.text);
             self.allocator.free(entry.value_ptr.*.font_family);
@@ -504,16 +571,9 @@ pub const FreeTypeTextRenderer = struct {
     pub fn resetAllTextCaches(self: *FreeTypeTextRenderer) void {
         self.clearShapedRunCache();
         self.resetAtlas();
-        self.color_glyphs.clearRetainingCapacity();
+        self.resetColorAtlas();
         self.emoji_glyph_cache.clearRetainingCapacity();
         self.route_cache.clearRetainingCapacity();
-        if (self.color_atlas_pixels) |p| {
-            @memset(p, 0);
-            self.color_atlas_dirty = true;
-        }
-        self.color_pen_x = 1;
-        self.color_pen_y = 1;
-        self.color_row_h = 0;
     }
 
     /// Lazily create the color emoji atlas (CPU buffer, and — on the wgpu path — the GPU
@@ -550,6 +610,24 @@ pub const FreeTypeTextRenderer = struct {
         self.color_gpu = .{ .texture = tex, .view = view, .bind_group = bg };
     }
 
+    /// True if `name` resolves to a face the color path can actually draw — one that produces
+    /// BGRA bitmaps under FT_LOAD_COLOR (CBDT/sbix strikes). COLR-outline-only fonts load fine
+    /// but render monochrome; registering one as THE emoji font would capture every emoji
+    /// codepoint and then draw nothing, which is strictly worse than the monochrome fallback.
+    pub fn emojiFamilyRendersColor(self: *FreeTypeTextRenderer, name: []const u8) bool {
+        const face = self.faces.get(name) orelse return false;
+        // Probe a handful of universal emoji — any single one may be absent from a given font.
+        const probes = [_]u21{ 0x1F600, 0x1F389, 0x1F680, 0x2764 };
+        for (probes) |cp| {
+            const index = ft.FT_Get_Char_Index(face, @as(ft.FT_ULong, cp));
+            if (index == 0) continue;
+            _ = emojiSelectSize(face, 32) catch return false;
+            if (ft.FT_Load_Glyph(face, index, ft.FT_LOAD_COLOR | ft.FT_LOAD_RENDER) != 0) continue;
+            return face.*.glyph.*.bitmap.pixel_mode == ft.FT_PIXEL_MODE_BGRA;
+        }
+        return false;
+    }
+
     pub fn addEmojiFontFamily(self: *FreeTypeTextRenderer, name: []const u8) void {
         const duped = self.allocator.dupe(u8, name) catch return;
         self.emoji_families.append(self.allocator, duped) catch {
@@ -578,6 +656,24 @@ pub const FreeTypeTextRenderer = struct {
         primary: []const u8,
         pos: usize = 0,
 
+        /// Presentation the marks *after* a base character request: U+FE0F (VS16) and U+20E3
+        /// (combining keycap) pull an otherwise-text base like '1' or '#' onto the emoji face —
+        /// the keycap/emoji form is a ligature that only exists there. U+FE0E (VS15) is the
+        /// opposite: an explicit request for text presentation.
+        fn markPresentation(self: *const RunSplitter, from: usize) Presentation {
+            var pos = from;
+            while (pos < self.text.len) {
+                const len = std.unicode.utf8ByteSequenceLength(self.text[pos]) catch 1;
+                const end = @min(pos + len, self.text.len);
+                const cp: u21 = std.unicode.utf8Decode(self.text[pos..end]) catch 0xFFFD;
+                if (!isCombining(cp)) break;
+                if (cp == 0xFE0F or cp == 0x20E3) return .emoji;
+                if (cp == 0xFE0E) return .text;
+                pos = end;
+            }
+            return .default;
+        }
+
         fn next(self: *RunSplitter) ?FaceRun {
             if (self.pos >= self.text.len) return null;
 
@@ -591,12 +687,12 @@ pub const FreeTypeTextRenderer = struct {
 
                 if (current) |run| {
                     if (!isCombining(cp)) {
-                        const route = self.renderer.routeFor(cp, self.primary);
+                        const route = self.renderer.routeForCluster(cp, self.primary, self.markPresentation(end));
                         if (route.emoji != run.emoji or !std.mem.eql(u8, route.family, run.family))
                             break;
                     }
                 } else {
-                    current = self.renderer.routeFor(cp, self.primary);
+                    current = self.renderer.routeForCluster(cp, self.primary, self.markPresentation(end));
                 }
 
                 self.pos = end;
@@ -634,6 +730,9 @@ pub const FreeTypeTextRenderer = struct {
     /// names the face to shape with.
     const Route = struct { family: []const u8, emoji: bool };
 
+    /// What a cluster's trailing variation-selector/keycap marks ask for (see markPresentation).
+    const Presentation = enum { default, emoji, text };
+
     /// Cached values of routeFor, packed into the i8 the cache stores.
     const route_primary: i8 = -1;
     const route_emoji: i8 = -2;
@@ -642,9 +741,13 @@ pub const FreeTypeTextRenderer = struct {
     /// fallback that does, else the requested one again (so it renders as that face's .notdef —
     /// a visible box is the honest answer when nothing on the system can draw the character).
     fn routeFor(self: *FreeTypeTextRenderer, cp: u21, primary: []const u8) Route {
-        // Latin-1 is in every text face we ship or fall back to, and is the overwhelming majority
-        // of what gets measured. Skipping the map here keeps the common path free.
-        if (cp < 0x0100) return .{ .family = primary, .emoji = false };
+        // Latin-1 stays on the default UI face without consulting the map — it is the
+        // overwhelming majority of what gets measured, and the default face always covers it.
+        // The shortcut must NOT extend to other primaries: an icon or symbol face typically has
+        // no space/letter glyphs at all, and pinning Latin-1 to it renders every separator in an
+        // icon string as .notdef boxes. Those go through the (memoized) resolver like anything else.
+        if (cp < 0x0100 and std.mem.eql(u8, primary, self.default_font_family))
+            return .{ .family = primary, .emoji = false };
 
         var hasher = std.hash.Wyhash.init(cp);
         hasher.update(primary);
@@ -665,7 +768,10 @@ pub const FreeTypeTextRenderer = struct {
     fn resolveRoute(self: *FreeTypeTextRenderer, cp: u21, primary: []const u8) i8 {
         if (self.emoji_families.items.len > 0 and isEmojiCodepoint(cp) and self.emojiHasGlyph(cp))
             return route_emoji;
+        return self.resolveTextRoute(cp, primary);
+    }
 
+    fn resolveTextRoute(self: *FreeTypeTextRenderer, cp: u21, primary: []const u8) i8 {
         if (self.faces.get(primary)) |face| {
             if (ft.FT_Get_Char_Index(face, @as(ft.FT_ULong, cp)) != 0) return route_primary;
         }
@@ -676,6 +782,31 @@ pub const FreeTypeTextRenderer = struct {
         }
 
         return route_primary;
+    }
+
+    /// routeFor, refined by the presentation the base's trailing marks asked for: VS16/keycap
+    /// promotes a text-face base ('1', '#', '©') onto the emoji face — the emoji form is a
+    /// ligature that only exists there — and VS15 demotes an emoji-block codepoint back onto a
+    /// text face. Both variants are rarer than the mark-less default, so only the default is
+    /// answered from (and stored in) the route cache.
+    fn routeForCluster(
+        self: *FreeTypeTextRenderer,
+        cp: u21,
+        primary: []const u8,
+        presentation: Presentation,
+    ) Route {
+        switch (presentation) {
+            .emoji => if (self.emoji_families.items.len > 0 and self.emojiHasGlyph(cp))
+                return .{ .family = self.emoji_families.items[0], .emoji = true },
+            .text => {
+                const slot = self.resolveTextRoute(cp, primary);
+                if (slot == route_primary or slot >= self.fallback_families.items.len)
+                    return .{ .family = primary, .emoji = false };
+                return .{ .family = self.fallback_families.items[@intCast(slot)], .emoji = false };
+            },
+            .default => {},
+        }
+        return self.routeFor(cp, primary);
     }
 
     /// True only if an emoji font actually contains a glyph for this codepoint. Many symbols
@@ -740,6 +871,7 @@ pub const FreeTypeTextRenderer = struct {
         const line_height = if (text.line_height > 0) text.line_height else text.size * 1.25;
         const font_family = effectiveFontFamily(self, text);
         const color = colorToU8(text.color);
+        const style = styleOf(text);
 
         var pen_x = text.baseline_x;
         var baseline_y = text.baseline_y;
@@ -758,7 +890,7 @@ pub const FreeTypeTextRenderer = struct {
         for (text.text, 0..) |byte, i| {
             if (byte != '\n' and byte != '\r' and byte != '\t') continue;
 
-            try self.flushTextSegment(allocator, vertices, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..i], false, text.letter_spacing, text.word_spacing);
+            try self.flushTextSegment(allocator, vertices, font_family, pixel_size, style, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..i], text.letter_spacing, text.word_spacing);
             switch (byte) {
                 '\n' => {
                     pen_x = text.baseline_x;
@@ -771,7 +903,7 @@ pub const FreeTypeTextRenderer = struct {
             segment_start = i + 1;
         }
 
-        try self.flushTextSegment(allocator, vertices, font_family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..], false, text.letter_spacing, text.word_spacing);
+        try self.flushTextSegment(allocator, vertices, font_family, pixel_size, style, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..], text.letter_spacing, text.word_spacing);
     }
 
     fn flushTextSegment(
@@ -780,6 +912,7 @@ pub const FreeTypeTextRenderer = struct {
         vertices: *std.ArrayList(TextVertex),
         font_family: []const u8,
         pixel_size: u16,
+        style: FaceStyle,
         color: [4]u8,
         offset_x: f32,
         offset_y: f32,
@@ -788,19 +921,17 @@ pub const FreeTypeTextRenderer = struct {
         pen_x: *f32,
         baseline_y: *f32,
         segment: []const u8,
-        is_emoji: bool,
         letter_spacing: f32,
         word_spacing: f32,
     ) !void {
         if (segment.len == 0) return;
-        _ = is_emoji; // the splitter decides this per run now
 
         var runs = self.splitRuns(segment, font_family);
         while (runs.next()) |run| {
             if (run.emoji) {
                 try self.appendEmojiShapedSegment(run.text, run.family, pixel_size, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y);
             } else {
-                try self.appendShapedSegment(allocator, vertices, run.text, run.family, pixel_size, color, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y, letter_spacing, word_spacing);
+                try self.appendShapedSegment(allocator, vertices, run.text, run.family, pixel_size, style, color, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y, letter_spacing, word_spacing);
             }
         }
     }
@@ -813,15 +944,28 @@ pub const FreeTypeTextRenderer = struct {
 
     /// Shape `text` once and cache glyph IDs and positions. Atlas UVs deliberately do not live here:
     /// shaping remains valid across atlas resets and device-scale changes.
+    ///
+    /// `style` participates through what it synthesizes: emboldened glyphs are wider, so the
+    /// strength joins the advances (and the cache key) — measure, carets and paint all read the
+    /// same widened run. `spaced` (letter-spacing active) shapes without optional ligatures:
+    /// tracking pulls letters apart, and an "ffi" fused into one glyph cannot be tracked.
     fn getShapedRun(
         self: *FreeTypeTextRenderer,
+        face: ft.FT_Face,
         text: []const u8,
         font_family: []const u8,
         pixel_size: u16,
+        style: FaceStyle,
+        spaced: bool,
     ) !*const ShapedRun {
+        const synth = synthFor(face, style, pixel_size);
+
         var hasher = std.hash.Wyhash.init(@as(u64, pixel_size));
         hasher.update(font_family);
         hasher.update(&[_]u8{0}); // separator so (family, text) can't alias across the boundary
+        const strength: i32 = synth.strength266(); // oblique changes no advance — not keyed
+        hasher.update(std.mem.asBytes(&strength));
+        hasher.update(&[_]u8{@intFromBool(spaced)});
         hasher.update(text);
         const key = hasher.final();
 
@@ -830,7 +974,6 @@ pub const FreeTypeTextRenderer = struct {
         // Bound the cache; a wholesale clear is fine — entries rebuild lazily when next drawn.
         if (self.shaped_run_cache.count() >= 8192) self.clearShapedRunCache();
 
-        const face = self.resolveFace(font_family) orelse return error.FreeTypeFontNotFound;
         if (ft.FT_Set_Pixel_Sizes(face, 0, @intCast(pixel_size)) != 0)
             return error.FreeTypeSetPixelSizeFailed;
 
@@ -853,16 +996,21 @@ pub const FreeTypeTextRenderer = struct {
         // level knows the widget's locale, which is the only thing that would justify forcing it.
         if (try bidi.analyze(self.allocator, text, null, &dir_runs)) |_| {
             for (dir_runs.items) |r|
-                try self.shapeRunInto(hb_font, text[r.start..r.end], r.start, r.dir(), &shaped_list);
+                try self.shapeRunInto(hb_font, text[r.start..r.end], r.start, r.dir(), spaced, &shaped_list);
         } else {
-            try self.shapeRunInto(hb_font, text, 0, null, &shaped_list);
+            try self.shapeRunInto(hb_font, text, 0, null, spaced, &shaped_list);
         }
 
         const shaped = try self.allocator.dupe(ShapedGlyph, shaped_list.items);
         errdefer self.allocator.free(shaped);
         var advance_x: f32 = 0;
         var advance_y: f32 = 0;
-        for (shaped) |g| {
+        for (shaped) |*g| {
+            // A synthetically emboldened glyph is wider by the stroke growth; folding it into the
+            // cached advance keeps letterfit correct and every consumer consistent. Zero-advance
+            // glyphs (combining marks) ride their base and must not push the pen.
+            if (synth.embolden > 0 and g.x_advance != 0)
+                g.x_advance += synth.embolden;
             advance_x += g.x_advance;
             advance_y -= g.y_advance;
         }
@@ -885,6 +1033,7 @@ pub const FreeTypeTextRenderer = struct {
         run_text: []const u8,
         cluster_base: u32,
         direction: ?bidi.Dir,
+        spaced: bool,
         out: *std.ArrayList(ShapedGlyph),
     ) !void {
         if (run_text.len == 0) return;
@@ -899,10 +1048,15 @@ pub const FreeTypeTextRenderer = struct {
             hb.hb_buffer_set_direction(buffer, if (d == .rtl) hb.HB_DIRECTION_RTL else hb.HB_DIRECTION_LTR);
         // Code faces rely on both standard and contextual ligatures (for example !=, =>, ffi).
         // Specify them explicitly instead of depending on backend/font defaults so cached editor
-        // layouts and immediate text runs shape identically on every platform.
+        // layouts and immediate text runs shape identically on every platform. Under active
+        // letter-spacing the optional ligatures (liga/clig) are turned OFF instead — tracking pulls
+        // letters apart, and a fused "ffi" cannot be tracked — while calt stays on (it substitutes
+        // per-glyph forms without fusing clusters).
+        const lig: [*c]const u8 = if (spaced) "liga=0" else "liga=1";
+        const clig: [*c]const u8 = if (spaced) "clig=0" else "clig=1";
         var features: [3]hb.hb_feature_t = undefined;
-        _ = hb.hb_feature_from_string("liga=1", -1, &features[0]);
-        _ = hb.hb_feature_from_string("clig=1", -1, &features[1]);
+        _ = hb.hb_feature_from_string(lig, -1, &features[0]);
+        _ = hb.hb_feature_from_string(clig, -1, &features[1]);
         _ = hb.hb_feature_from_string("calt=1", -1, &features[2]);
         hb.hb_shape(hb_font, buffer, &features, features.len);
 
@@ -932,6 +1086,7 @@ pub const FreeTypeTextRenderer = struct {
         text: []const u8,
         font_family: []const u8,
         pixel_size: u16,
+        style: FaceStyle,
         color: [4]u8,
         offset_x: f32,
         offset_y: f32,
@@ -945,9 +1100,10 @@ pub const FreeTypeTextRenderer = struct {
         if (text.len == 0) return;
 
         const face = self.resolveFace(font_family) orelse return error.FreeTypeFontNotFound;
-        const run = try self.getShapedRun(text, font_family, pixel_size);
-        for (run.glyphs) |shaped| {
-            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, pixel_size);
+        const spaced = letter_spacing != 0;
+        const run = try self.getShapedRun(face, text, font_family, pixel_size, style, spaced);
+        for (run.glyphs, 0..) |shaped, i| {
+            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, pixel_size, style);
             if (glyph.width > 0 and glyph.height > 0) {
                 // Snap the quad origin to the physical pixel grid: each glyph exists as ONE
                 // integer-origin raster in the atlas, so a fractional origin makes the linear
@@ -979,11 +1135,16 @@ pub const FreeTypeTextRenderer = struct {
                 );
             }
 
-            var spacing = letter_spacing;
-            if (clusterIsSpace(text, shaped.cluster)) spacing += word_spacing;
-            if (shaped.x_advance < 0) spacing = -spacing;
-            pen_x.* += shaped.x_advance + spacing;
+            pen_x.* += shaped.x_advance;
             baseline_y.* -= shaped.y_advance;
+            // Tracking applies per CLUSTER, after its final glyph — never between a base and the
+            // combining marks that ride it (a mark pushed sideways by letter-spacing detaches
+            // from its base) and never inside a ligature.
+            if (clusterEndsAt(run.glyphs, i)) {
+                var spacing = letter_spacing;
+                if (clusterIsSpace(text, shaped.cluster)) spacing += word_spacing;
+                pen_x.* += spacing;
+            }
         }
     }
 
@@ -997,17 +1158,22 @@ pub const FreeTypeTextRenderer = struct {
         const pixel_size = fontPixelSize(text.size);
         const line_height = if (text.line_height > 0) text.line_height else text.size * 1.25;
         const font_family = effectiveFontFamily(self, text);
+        const style = styleOf(text);
 
         var glyph_list: std.ArrayList(TextLayoutGlyph) = .empty;
         defer glyph_list.deinit(allocator);
+        var color_list: std.ArrayList(PendingColorQuad) = .empty;
+        defer color_list.deinit(allocator);
 
         var width: f32 = 0.0;
         var height: f32 = 0.0;
         try self.buildLayoutGlyphs(
             allocator,
             &glyph_list,
+            &color_list,
             text.text,
             font_family,
+            style,
             pixel_size,
             pixel_size,
             1.0,
@@ -1027,11 +1193,14 @@ pub const FreeTypeTextRenderer = struct {
         errdefer self.allocator.free(owned_family);
         const owned_glyphs = try self.allocator.dupe(TextLayoutGlyph, glyph_list.items);
         errdefer self.allocator.free(owned_glyphs);
-        const owned_carets = try self.buildCaretStops(text.text, font_family, pixel_size, line_height, text.letter_spacing, text.word_spacing);
+        const owned_colors = try self.allocator.dupe(PendingColorQuad, color_list.items);
+        errdefer self.allocator.free(owned_colors);
+        const owned_carets = try self.buildCaretStops(text.text, font_family, pixel_size, style, line_height, text.letter_spacing, text.word_spacing);
         errdefer self.allocator.free(owned_carets);
 
         const entry = TextLayoutEntry{
             .glyphs = owned_glyphs,
+            .color_quads = owned_colors,
             .carets = owned_carets,
             .width = width,
             .height = height,
@@ -1041,6 +1210,7 @@ pub const FreeTypeTextRenderer = struct {
             .line_height = line_height,
             .letter_spacing = text.letter_spacing,
             .word_spacing = text.word_spacing,
+            .style = style,
             .raster_scale = 1.0,
             // Read after building: a large layout can itself overflow and reset the atlas mid-build.
             .generation = self.atlas_generation,
@@ -1059,8 +1229,10 @@ pub const FreeTypeTextRenderer = struct {
         self: *FreeTypeTextRenderer,
         allocator: std.mem.Allocator,
         glyph_list: *std.ArrayList(TextLayoutGlyph),
+        color_list: *std.ArrayList(PendingColorQuad),
         text: []const u8,
         font_family: []const u8,
+        style: FaceStyle,
         shape_pixel_size: u16,
         raster_pixel_size: u16,
         raster_scale: f32,
@@ -1080,19 +1252,19 @@ pub const FreeTypeTextRenderer = struct {
         while (i < text.len) : (i += 1) {
             switch (text[i]) {
                 '\n' => {
-                    try self.appendShapedSegmentLayout(allocator, glyph_list, text[segment_start..i], font_family, shape_pixel_size, raster_pixel_size, raster_scale, letter_spacing, word_spacing, &pen_x, &baseline_y);
+                    try self.appendShapedSegmentLayout(allocator, glyph_list, color_list, text[segment_start..i], font_family, style, shape_pixel_size, raster_pixel_size, raster_scale, letter_spacing, word_spacing, &pen_x, &baseline_y);
                     max_x = @max(max_x, pen_x);
                     pen_x = 0.0;
                     baseline_y += line_height;
                     segment_start = i + 1;
                 },
                 '\r' => {
-                    try self.appendShapedSegmentLayout(allocator, glyph_list, text[segment_start..i], font_family, shape_pixel_size, raster_pixel_size, raster_scale, letter_spacing, word_spacing, &pen_x, &baseline_y);
+                    try self.appendShapedSegmentLayout(allocator, glyph_list, color_list, text[segment_start..i], font_family, style, shape_pixel_size, raster_pixel_size, raster_scale, letter_spacing, word_spacing, &pen_x, &baseline_y);
                     max_x = @max(max_x, pen_x);
                     segment_start = i + 1;
                 },
                 '\t' => {
-                    try self.appendShapedSegmentLayout(allocator, glyph_list, text[segment_start..i], font_family, shape_pixel_size, raster_pixel_size, raster_scale, letter_spacing, word_spacing, &pen_x, &baseline_y);
+                    try self.appendShapedSegmentLayout(allocator, glyph_list, color_list, text[segment_start..i], font_family, style, shape_pixel_size, raster_pixel_size, raster_scale, letter_spacing, word_spacing, &pen_x, &baseline_y);
                     max_x = @max(max_x, pen_x);
                     pen_x += size * 2.0;
                     segment_start = i + 1;
@@ -1100,7 +1272,7 @@ pub const FreeTypeTextRenderer = struct {
                 else => {},
             }
         }
-        try self.appendShapedSegmentLayout(allocator, glyph_list, text[segment_start..], font_family, shape_pixel_size, raster_pixel_size, raster_scale, letter_spacing, word_spacing, &pen_x, &baseline_y);
+        try self.appendShapedSegmentLayout(allocator, glyph_list, color_list, text[segment_start..], font_family, style, shape_pixel_size, raster_pixel_size, raster_scale, letter_spacing, word_spacing, &pen_x, &baseline_y);
         max_x = @max(max_x, pen_x);
 
         out_w.* = max_x;
@@ -1110,6 +1282,7 @@ pub const FreeTypeTextRenderer = struct {
     pub fn releaseTextLayout(self: *FreeTypeTextRenderer, handle: u64) void {
         if (self.layout_cache.fetchRemove(handle)) |kv| {
             self.allocator.free(kv.value.glyphs);
+            self.allocator.free(kv.value.color_quads);
             self.allocator.free(kv.value.carets);
             self.allocator.free(kv.value.text);
             self.allocator.free(kv.value.font_family);
@@ -1134,6 +1307,7 @@ pub const FreeTypeTextRenderer = struct {
         text: []const u8,
         font_family: []const u8,
         pixel_size: u16,
+        style: FaceStyle,
         line_height: f32,
         letter_spacing: f32,
         word_spacing: f32,
@@ -1143,6 +1317,8 @@ pub const FreeTypeTextRenderer = struct {
 
         var cluster_scratch: std.ArrayList(u32) = .empty;
         defer cluster_scratch.deinit(self.allocator);
+
+        const spaced = letter_spacing != 0;
 
         var line_start: usize = 0;
         var line_index: usize = 0;
@@ -1159,50 +1335,68 @@ pub const FreeTypeTextRenderer = struct {
                     .y = y,
                 });
             } else {
-                const run = try self.getShapedRun(line, font_family, pixel_size);
+                // Walk the line the way the painter does — split into face runs, shape each with
+                // its own face — so caret geometry lands exactly where the glyphs were drawn.
+                // A whole-line shape against the primary face put every caret after a
+                // fallback-rendered (CJK, emoji) stretch at the wrong x.
                 var pen_x: f32 = 0;
-                var glyph_index: usize = 0;
-                const rtl = run.glyphs.len > 1 and
-                    run.glyphs[0].cluster > run.glyphs[run.glyphs.len - 1].cluster;
+                var runs = self.splitRuns(line, font_family);
+                while (runs.next()) |face_run| {
+                    const run_offset = @intFromPtr(face_run.text.ptr) - @intFromPtr(line.ptr);
+                    const run_opt: ?*const ShapedRun = if (face_run.emoji) blk: {
+                        const face = self.faces.get(face_run.family) orelse break :blk null;
+                        break :blk self.getEmojiShapedRun(face, face_run.text, face_run.family, pixel_size) catch null;
+                    } else blk: {
+                        const face = self.resolveFace(face_run.family) orelse break :blk null;
+                        break :blk self.getShapedRun(face, face_run.text, face_run.family, pixel_size, style, spaced) catch null;
+                    };
+                    const run = run_opt orelse continue;
 
-                // One sorted sweep of the run's cluster values replaces a per-group rescan of
-                // every glyph: a group's logical end is the smallest cluster value above its own.
-                cluster_scratch.clearRetainingCapacity();
-                for (run.glyphs) |g| {
-                    if (cluster_scratch.items.len == 0 or cluster_scratch.items[cluster_scratch.items.len - 1] != g.cluster)
-                        try cluster_scratch.append(self.allocator, g.cluster);
-                }
-                std.mem.sort(u32, cluster_scratch.items, {}, std.sort.asc(u32));
+                    const glyphs = run.glyphs;
+                    const rtl = glyphs.len > 1 and glyphs[0].cluster > glyphs[glyphs.len - 1].cluster;
 
-                while (glyph_index < run.glyphs.len) {
-                    const cluster = run.glyphs[glyph_index].cluster;
-                    var group_end = glyph_index;
-                    var advance: f32 = 0;
-                    while (group_end < run.glyphs.len and run.glyphs[group_end].cluster == cluster) : (group_end += 1) {
-                        const glyph = run.glyphs[group_end];
-                        var spacing = letter_spacing;
-                        if (clusterIsSpace(line, glyph.cluster)) spacing += word_spacing;
-                        if (glyph.x_advance < 0) spacing = -spacing;
-                        advance += glyph.x_advance + spacing;
+                    // One sorted sweep of the run's cluster values replaces a per-group rescan of
+                    // every glyph: a group's logical end is the smallest cluster value above its own.
+                    cluster_scratch.clearRetainingCapacity();
+                    for (glyphs) |g| {
+                        if (cluster_scratch.items.len == 0 or cluster_scratch.items[cluster_scratch.items.len - 1] != g.cluster)
+                            try cluster_scratch.append(self.allocator, g.cluster);
                     }
+                    std.mem.sort(u32, cluster_scratch.items, {}, std.sort.asc(u32));
 
-                    const logical_end: usize = if (nextClusterAbove(cluster_scratch.items, cluster)) |next|
-                        @min(line.len, @as(usize, next))
-                    else
-                        line.len;
+                    var glyph_index: usize = 0;
+                    while (glyph_index < glyphs.len) {
+                        const cluster = glyphs[glyph_index].cluster;
+                        var group_end = glyph_index;
+                        var advance: f32 = 0;
+                        while (group_end < glyphs.len and glyphs[group_end].cluster == cluster) : (group_end += 1) {
+                            advance += glyphs[group_end].x_advance;
+                        }
+                        // Per-cluster tracking, matching the emitters (never applied to emoji runs).
+                        if (!face_run.emoji) {
+                            advance += letter_spacing;
+                            if (clusterIsSpace(face_run.text, cluster)) advance += word_spacing;
+                        }
 
-                    try result.append(self.allocator, .{
-                        .text_offset = @intCast(line_start + if (rtl) logical_end else cluster),
-                        .x = pen_x,
-                        .y = y,
-                    });
-                    pen_x += advance;
-                    try result.append(self.allocator, .{
-                        .text_offset = @intCast(line_start + if (rtl) cluster else logical_end),
-                        .x = pen_x,
-                        .y = y,
-                    });
-                    glyph_index = group_end;
+                        const logical_end: usize = if (nextClusterAbove(cluster_scratch.items, cluster)) |next|
+                            @min(face_run.text.len, @as(usize, next))
+                        else
+                            face_run.text.len;
+
+                        const base = line_start + run_offset;
+                        try result.append(self.allocator, .{
+                            .text_offset = @intCast(base + if (rtl) logical_end else cluster),
+                            .x = pen_x,
+                            .y = y,
+                        });
+                        pen_x += advance;
+                        try result.append(self.allocator, .{
+                            .text_offset = @intCast(base + if (rtl) cluster else logical_end),
+                            .x = pen_x,
+                            .y = y,
+                        });
+                        glyph_index = group_end;
+                    }
                 }
             }
 
@@ -1289,6 +1483,7 @@ pub const FreeTypeTextRenderer = struct {
         out_w: *f32,
         out_h: *f32,
     ) !void {
+        _ = allocator;
         const line_height = if (text.line_height > 0) text.line_height else text.size * 1.25;
         out_w.* = 0;
         out_h.* = line_height;
@@ -1296,8 +1491,7 @@ pub const FreeTypeTextRenderer = struct {
 
         const pixel_size = fontPixelSize(text.size);
         const font_family = effectiveFontFamily(self, text);
-
-        _ = allocator;
+        const style = styleOf(text);
 
         var pen_x: f32 = 0.0;
         var baseline_y: f32 = 0.0;
@@ -1308,19 +1502,19 @@ pub const FreeTypeTextRenderer = struct {
         while (i < text.text.len) : (i += 1) {
             switch (text.text[i]) {
                 '\n' => {
-                    try self.advanceShapedSegment(text.text[segment_start..i], font_family, pixel_size, text.letter_spacing, text.word_spacing, &pen_x, &baseline_y);
+                    try self.advanceShapedSegment(text.text[segment_start..i], font_family, pixel_size, style, text.letter_spacing, text.word_spacing, &pen_x, &baseline_y);
                     max_x = @max(max_x, pen_x);
                     pen_x = 0.0;
                     baseline_y += line_height;
                     segment_start = i + 1;
                 },
                 '\r' => {
-                    try self.advanceShapedSegment(text.text[segment_start..i], font_family, pixel_size, text.letter_spacing, text.word_spacing, &pen_x, &baseline_y);
+                    try self.advanceShapedSegment(text.text[segment_start..i], font_family, pixel_size, style, text.letter_spacing, text.word_spacing, &pen_x, &baseline_y);
                     max_x = @max(max_x, pen_x);
                     segment_start = i + 1;
                 },
                 '\t' => {
-                    try self.advanceShapedSegment(text.text[segment_start..i], font_family, pixel_size, text.letter_spacing, text.word_spacing, &pen_x, &baseline_y);
+                    try self.advanceShapedSegment(text.text[segment_start..i], font_family, pixel_size, style, text.letter_spacing, text.word_spacing, &pen_x, &baseline_y);
                     max_x = @max(max_x, pen_x);
                     pen_x += text.size * 2.0;
                     segment_start = i + 1;
@@ -1328,7 +1522,7 @@ pub const FreeTypeTextRenderer = struct {
                 else => {},
             }
         }
-        try self.advanceShapedSegment(text.text[segment_start..], font_family, pixel_size, text.letter_spacing, text.word_spacing, &pen_x, &baseline_y);
+        try self.advanceShapedSegment(text.text[segment_start..], font_family, pixel_size, style, text.letter_spacing, text.word_spacing, &pen_x, &baseline_y);
         max_x = @max(max_x, pen_x);
 
         out_w.* = max_x;
@@ -1343,6 +1537,7 @@ pub const FreeTypeTextRenderer = struct {
         text: []const u8,
         font_family: []const u8,
         pixel_size: u16,
+        style: FaceStyle,
         letter_spacing: f32,
         word_spacing: f32,
         pen_x: *f32,
@@ -1350,21 +1545,39 @@ pub const FreeTypeTextRenderer = struct {
     ) !void {
         if (text.len == 0) return;
 
+        const spaced = letter_spacing != 0;
         var runs = self.splitRuns(text, font_family);
         while (runs.next()) |face_run| {
-            const run = try self.getShapedRun(face_run.text, face_run.family, pixel_size);
+            // Emoji runs advance by the emoji face's own (strike-scaled) metrics, exactly like
+            // the painter — measuring them against a text face put every mixed label off by the
+            // difference before a single glyph was drawn.
+            if (face_run.emoji) {
+                if (self.faces.get(face_run.family)) |face| {
+                    if (self.getEmojiShapedRun(face, face_run.text, face_run.family, pixel_size)) |run| {
+                        pen_x.* += run.advance_x;
+                        baseline_y.* += run.advance_y;
+                    } else |_| {}
+                }
+                continue;
+            }
+
+            const face = self.resolveFace(face_run.family) orelse return error.FreeTypeFontNotFound;
+            const run = try self.getShapedRun(face, face_run.text, face_run.family, pixel_size, style, spaced);
             if (letter_spacing == 0 and word_spacing == 0) {
                 pen_x.* += run.advance_x;
                 baseline_y.* += run.advance_y;
                 continue;
             }
 
-            for (run.glyphs) |shaped| {
-                var spacing = letter_spacing;
-                if (clusterIsSpace(face_run.text, shaped.cluster)) spacing += word_spacing;
-                if (shaped.x_advance < 0) spacing = -spacing;
-                pen_x.* += shaped.x_advance + spacing;
+            for (run.glyphs, 0..) |shaped, i| {
+                pen_x.* += shaped.x_advance;
                 baseline_y.* -= shaped.y_advance;
+                // Per-cluster tracking — see appendShapedSegment.
+                if (clusterEndsAt(run.glyphs, i)) {
+                    var spacing = letter_spacing;
+                    if (clusterIsSpace(face_run.text, shaped.cluster)) spacing += word_spacing;
+                    pen_x.* += spacing;
+                }
             }
         }
     }
@@ -1388,6 +1601,20 @@ pub const FreeTypeTextRenderer = struct {
         const raster_scale = @max(scale_factor, 0.01);
         if (entry.generation != self.atlas_generation or @abs(entry.raster_scale - raster_scale) > 0.001)
             try self.reshapeLayoutEntry(allocator, entry, raster_scale);
+        // Color emoji baked into the layout ride the pending queue exactly like the immediate
+        // path; the caller flushes them into the image pipeline after this command.
+        for (entry.color_quads) |q| {
+            try self.pending_color_quads.append(self.allocator, .{
+                .x = (q.x + draw_x) * scale_factor,
+                .y = (q.y + draw_y) * scale_factor,
+                .w = q.w * scale_factor,
+                .h = q.h * scale_factor,
+                .u0 = q.u0,
+                .v0 = q.v0,
+                .u1 = q.u1,
+                .v1 = q.v1,
+            });
+        }
         for (entry.glyphs) |g| {
             // Same pixel-grid snap as the immediate path: the origin lands on a physical pixel
             // and the quad keeps the raster's exact integer size ((x1-x0)·scale is the glyph
@@ -1433,14 +1660,18 @@ pub const FreeTypeTextRenderer = struct {
 
         var glyph_list: std.ArrayList(TextLayoutGlyph) = .empty;
         defer glyph_list.deinit(allocator);
+        var color_list: std.ArrayList(PendingColorQuad) = .empty;
+        defer color_list.deinit(allocator);
 
         var width: f32 = 0.0;
         var height: f32 = 0.0;
         try self.buildLayoutGlyphs(
             allocator,
             &glyph_list,
+            &color_list,
             entry.text,
             entry.font_family,
+            entry.style,
             shape_pixel_size,
             raster_pixel_size,
             raster_scale,
@@ -1453,8 +1684,12 @@ pub const FreeTypeTextRenderer = struct {
         );
 
         const new_glyphs = try self.allocator.dupe(TextLayoutGlyph, glyph_list.items);
+        errdefer self.allocator.free(new_glyphs);
+        const new_colors = try self.allocator.dupe(PendingColorQuad, color_list.items);
         self.allocator.free(entry.glyphs);
+        self.allocator.free(entry.color_quads);
         entry.glyphs = new_glyphs;
+        entry.color_quads = new_colors;
         entry.width = width;
         entry.height = height;
         entry.raster_scale = raster_scale;
@@ -1466,8 +1701,10 @@ pub const FreeTypeTextRenderer = struct {
         self: *FreeTypeTextRenderer,
         allocator: std.mem.Allocator,
         glyphs_out: *std.ArrayList(TextLayoutGlyph),
+        colors_out: *std.ArrayList(PendingColorQuad),
         text: []const u8,
         font_family: []const u8,
+        style: FaceStyle,
         shape_pixel_size: u16,
         raster_pixel_size: u16,
         raster_scale: f32,
@@ -1483,18 +1720,34 @@ pub const FreeTypeTextRenderer = struct {
         // against the primary face would bake the wrong glyphs and the wrong advances into the
         // handle, and every later draw would replay them.
         var runs = self.splitRuns(text, font_family);
-        while (runs.next()) |face_run| try self.appendLayoutRun(
-            allocator,
-            glyphs_out,
-            face_run,
-            shape_pixel_size,
-            raster_pixel_size,
-            inv_raster_scale,
-            letter_spacing,
-            word_spacing,
-            pen_x,
-            baseline_y,
-        );
+        while (runs.next()) |face_run| {
+            if (face_run.emoji) {
+                try self.appendEmojiLayoutRun(
+                    allocator,
+                    colors_out,
+                    face_run,
+                    shape_pixel_size,
+                    raster_pixel_size,
+                    inv_raster_scale,
+                    pen_x,
+                    baseline_y,
+                );
+            } else {
+                try self.appendLayoutRun(
+                    allocator,
+                    glyphs_out,
+                    face_run,
+                    style,
+                    shape_pixel_size,
+                    raster_pixel_size,
+                    inv_raster_scale,
+                    letter_spacing,
+                    word_spacing,
+                    pen_x,
+                    baseline_y,
+                );
+            }
+        }
     }
 
     fn appendLayoutRun(
@@ -1502,6 +1755,7 @@ pub const FreeTypeTextRenderer = struct {
         allocator: std.mem.Allocator,
         glyphs_out: *std.ArrayList(TextLayoutGlyph),
         face_run: FaceRun,
+        style: FaceStyle,
         shape_pixel_size: u16,
         raster_pixel_size: u16,
         inv_raster_scale: f32,
@@ -1514,10 +1768,11 @@ pub const FreeTypeTextRenderer = struct {
         const font_family = face_run.family;
 
         const face = self.resolveFace(font_family) orelse return error.FreeTypeFontNotFound;
-        const run = try self.getShapedRun(text, font_family, shape_pixel_size);
+        const spaced = letter_spacing != 0;
+        const run = try self.getShapedRun(face, text, font_family, shape_pixel_size, style, spaced);
 
-        for (run.glyphs) |shaped| {
-            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, raster_pixel_size);
+        for (run.glyphs, 0..) |shaped, i| {
+            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, raster_pixel_size, style);
 
             if (glyph.width > 0 and glyph.height > 0) {
                 const x0 = pen_x.* + shaped.x_offset + glyph.bearing_x * inv_raster_scale;
@@ -1542,10 +1797,59 @@ pub const FreeTypeTextRenderer = struct {
                 });
             }
 
-            var spacing = letter_spacing;
-            if (clusterIsSpace(text, shaped.cluster)) spacing += word_spacing;
-            if (shaped.x_advance < 0) spacing = -spacing;
-            pen_x.* += shaped.x_advance + spacing;
+            pen_x.* += shaped.x_advance;
+            baseline_y.* -= shaped.y_advance;
+            // Per-cluster tracking — see appendShapedSegment.
+            if (clusterEndsAt(run.glyphs, i)) {
+                var spacing = letter_spacing;
+                if (clusterIsSpace(text, shaped.cluster)) spacing += word_spacing;
+                pen_x.* += spacing;
+            }
+        }
+    }
+
+    /// The cached-layout counterpart of appendEmojiShapedSegment: bakes the run's color glyphs and
+    /// appends origin-relative logical-space quads to `colors_out`. Emoji that cannot bake (no
+    /// BGRA bitmap) still advance the pen, so surrounding text never shifts.
+    fn appendEmojiLayoutRun(
+        self: *FreeTypeTextRenderer,
+        allocator: std.mem.Allocator,
+        colors_out: *std.ArrayList(PendingColorQuad),
+        face_run: FaceRun,
+        shape_pixel_size: u16,
+        raster_pixel_size: u16,
+        inv_raster_scale: f32,
+        pen_x: *f32,
+        baseline_y: *f32,
+    ) !void {
+        if (face_run.text.len == 0) return;
+        // Direct lookup only — no fallback to a text face (it has no color glyphs).
+        const face = self.faces.get(face_run.family) orelse return;
+
+        const run = self.getEmojiShapedRun(face, face_run.text, face_run.family, shape_pixel_size) catch return;
+
+        for (run.glyphs) |shaped| {
+            if (self.rasterEmojiGlyph(face, face_run.family, shaped.glyph_index, raster_pixel_size)) |raster| {
+                const glyph = raster.glyph;
+                if (glyph.width > 0 and glyph.height > 0) {
+                    // Strike px → logical: the raster scale maps strike to device px, and
+                    // inv_raster_scale maps device to layout units.
+                    const to_logical = raster.scale * inv_raster_scale;
+                    const cw_f = @as(f32, @floatFromInt(ColorAtlas.width));
+                    const ch_f = @as(f32, @floatFromInt(ColorAtlas.height));
+                    try colors_out.append(allocator, .{
+                        .x = pen_x.* + shaped.x_offset + glyph.bearing_x * to_logical,
+                        .y = baseline_y.* - shaped.y_offset - glyph.bearing_y * to_logical,
+                        .w = @as(f32, @floatFromInt(glyph.width)) * to_logical,
+                        .h = @as(f32, @floatFromInt(glyph.height)) * to_logical,
+                        .u0 = @as(f32, @floatFromInt(glyph.atlas_x)) / cw_f,
+                        .v0 = @as(f32, @floatFromInt(glyph.atlas_y)) / ch_f,
+                        .u1 = @as(f32, @floatFromInt(glyph.atlas_x + glyph.width)) / cw_f,
+                        .v1 = @as(f32, @floatFromInt(glyph.atlas_y + glyph.height)) / ch_f,
+                    });
+                }
+            }
+            pen_x.* += shaped.x_advance;
             baseline_y.* -= shaped.y_advance;
         }
     }
@@ -1590,8 +1894,12 @@ pub const FreeTypeTextRenderer = struct {
         font_family: []const u8,
         glyph_index: u32,
         size: u16,
+        style: FaceStyle,
     ) !Glyph {
-        const key = glyphKey(font_family, glyph_index, size);
+        // Keyed by what is actually rasterized (the synth result), not by the request: every
+        // (weight, italic) combination the face satisfies natively shares one atlas entry.
+        const synth = synthFor(face, style, size);
+        const key = glyphKey(font_family, glyph_index, size, synth);
 
         if (self.glyphs.get(key)) |glyph| {
             return glyph;
@@ -1602,12 +1910,27 @@ pub const FreeTypeTextRenderer = struct {
         // matching CoreText/Skia behavior at editor sizes without SDF's small-text blur.
         if (ft.FT_Set_Pixel_Sizes(face, 0, @intCast(size)) != 0)
             return error.FreeTypeSetPixelSizeFailed;
-        const load_flags = ft.FT_LOAD_DEFAULT | ft.FT_LOAD_NO_BITMAP | ft.FT_LOAD_TARGET_LIGHT;
-        if (ft.FT_Load_Glyph(face, @intCast(glyph_index), load_flags) != 0 or
-            ft.FT_Render_Glyph(face.*.glyph, ft.FT_RENDER_MODE_NORMAL) != 0)
+        // Synthetic styles transform the outline, so hinting would fight the shear/embolden —
+        // load unhinted in that case (matches how browsers rasterize faux bold/italic).
+        const target: c_long = if (synth.none()) ft.FT_LOAD_TARGET_LIGHT else ft.FT_LOAD_NO_HINTING;
+        const load_flags: i32 = @intCast(ft.FT_LOAD_DEFAULT | ft.FT_LOAD_NO_BITMAP | target);
+        if (ft.FT_Load_Glyph(face, @intCast(glyph_index), load_flags) != 0)
             return error.FreeTypeLoadGlyphFailed;
 
         const slot = face.*.glyph;
+        if (!synth.none() and slot.*.format == ft.FT_GLYPH_FORMAT_OUTLINE) {
+            if (synth.embolden > 0) {
+                const s = synth.strength266();
+                _ = ft.FT_Outline_EmboldenXY(&slot.*.outline, s, s);
+            }
+            if (synth.oblique) {
+                // ~12° shear (tan ≈ 0.2126 in 16.16), the same slant FT_GlyphSlot_Oblique uses.
+                var shear = ft.FT_Matrix{ .xx = 0x10000, .xy = 0x0366A, .yx = 0, .yy = 0x10000 };
+                ft.FT_Outline_Transform(&slot.*.outline, &shear);
+            }
+        }
+        if (ft.FT_Render_Glyph(slot, ft.FT_RENDER_MODE_NORMAL) != 0)
+            return error.FreeTypeLoadGlyphFailed;
         const bitmap = slot.*.bitmap;
 
         const bitmap_width: u32 = bitmap.width;
@@ -1828,10 +2151,51 @@ pub const FreeTypeTextRenderer = struct {
         self.dirty_max_y = @max(self.dirty_max_y, y + height);
     }
 
+    /// A strike (or exact size) selected on an emoji face: `actual_px` is what FreeType will
+    /// rasterize, `scale` maps that to the requested size. Scalable faces select exactly
+    /// (scale 1); bitmap-only faces (Apple Color Emoji sbix, Noto CBDT) carry fixed strikes,
+    /// where FT_Set_Pixel_Sizes simply fails — the closest strike is selected and drawn scaled.
+    const EmojiSize = struct { actual_px: u16, scale: f32 };
+
+    fn emojiSelectSize(face: ft.FT_Face, want: u16) !EmojiSize {
+        if ((face.*.face_flags & ft.FT_FACE_FLAG_SCALABLE) != 0) {
+            if (ft.FT_Set_Pixel_Sizes(face, 0, @intCast(want)) != 0)
+                return error.FreeTypeSetPixelSizeFailed;
+            return .{ .actual_px = want, .scale = 1 };
+        }
+
+        const count: usize = @intCast(face.*.num_fixed_sizes);
+        if (count == 0) return error.FreeTypeSetPixelSizeFailed;
+        // Smallest strike at or above the request (downscaling keeps edges clean); if the request
+        // exceeds every strike, the largest available.
+        var best: usize = 0;
+        var best_h: i32 = @intCast(face.*.available_sizes[0].height);
+        for (1..count) |i| {
+            const h: i32 = @intCast(face.*.available_sizes[i].height);
+            const want_i: i32 = @intCast(want);
+            const better = if (best_h >= want_i)
+                h >= want_i and h < best_h
+            else
+                h > best_h;
+            if (better) {
+                best = i;
+                best_h = h;
+            }
+        }
+        if (ft.FT_Select_Size(face, @intCast(best)) != 0)
+            return error.FreeTypeSetPixelSizeFailed;
+        return .{
+            .actual_px = @intCast(best_h),
+            .scale = @as(f32, @floatFromInt(want)) / @as(f32, @floatFromInt(best_h)),
+        };
+    }
+
     /// Shape an emoji segment once and cache it in shaped_run_cache. Own key namespace
     /// (separator byte 1 vs getShapedRun's 0): emoji segments are shaped against the directly
     /// looked-up emoji face with HarfBuzz default features, so they must never alias a regular
     /// run of the same (family, text, size) shaped via resolveFace with explicit features.
+    /// Cached advances are already scaled to the requested pixel size, so fixed-strike faces
+    /// measure and draw identically at every size.
     fn getEmojiShapedRun(
         self: *FreeTypeTextRenderer,
         face: ft.FT_Face,
@@ -1849,6 +2213,8 @@ pub const FreeTypeTextRenderer = struct {
 
         // Bound the cache; a wholesale clear is fine — entries rebuild lazily when next drawn.
         if (self.shaped_run_cache.count() >= 8192) self.clearShapedRunCache();
+
+        const sel = try emojiSelectSize(face, pixel_size);
 
         const hb_font = hb_ft_font_create_referenced(face) orelse return error.HarfBuzzFontCreateFailed;
         defer hb.hb_font_destroy(hb_font);
@@ -1876,10 +2242,10 @@ pub const FreeTypeTextRenderer = struct {
             out.* = .{
                 .glyph_index = info.codepoint,
                 .cluster = info.cluster,
-                .x_offset = hbPositionToPixels(pos.x_offset),
-                .y_offset = hbPositionToPixels(pos.y_offset),
-                .x_advance = hbPositionToPixels(pos.x_advance),
-                .y_advance = hbPositionToPixels(pos.y_advance),
+                .x_offset = hbPositionToPixels(pos.x_offset) * sel.scale,
+                .y_offset = hbPositionToPixels(pos.y_offset) * sel.scale,
+                .x_advance = hbPositionToPixels(pos.x_advance) * sel.scale,
+                .y_advance = hbPositionToPixels(pos.y_advance) * sel.scale,
             };
             advance_x += out.x_advance;
             advance_y -= out.y_advance;
@@ -1891,6 +2257,89 @@ pub const FreeTypeTextRenderer = struct {
             .advance_y = advance_y,
         });
         return self.shaped_run_cache.getPtr(key).?;
+    }
+
+    /// One baked color glyph plus the factor mapping its strike pixels to the requested size.
+    const EmojiRaster = struct { glyph: Glyph, scale: f32 };
+
+    /// Bake (or fetch) a color glyph at the strike closest to `want_px`. The cache and the atlas
+    /// hold ONE image per (family, glyph, strike) — every requested size maps to a strike and
+    /// scales the quad, so a size ramp doesn't multiply 128×128 bakes. Returns null when the
+    /// face can't produce a BGRA bitmap for the glyph (the caller advances the pen regardless);
+    /// a null is remembered as an empty marker so a CBDT PNG decode isn't retried every frame.
+    fn rasterEmojiGlyph(
+        self: *FreeTypeTextRenderer,
+        face: ft.FT_Face,
+        emoji_family: []const u8,
+        glyph_index: u32,
+        want_px: u16,
+    ) ?EmojiRaster {
+        const sel = emojiSelectSize(face, want_px) catch return null;
+        const key = glyphKey(emoji_family, glyph_index, sel.actual_px, .{});
+
+        if (self.color_glyphs.get(key)) |glyph| {
+            return .{ .glyph = glyph, .scale = sel.scale };
+        }
+
+        const load_flags = ft.FT_LOAD_COLOR | ft.FT_LOAD_RENDER;
+        if (ft.FT_Load_Glyph(face, @intCast(glyph_index), load_flags) != 0) return null;
+
+        const slot = face.*.glyph;
+        const bitmap = slot.*.bitmap;
+        const bw: u32 = bitmap.width;
+        const bh: u32 = bitmap.rows;
+
+        if (bitmap.pixel_mode == ft.FT_PIXEL_MODE_BGRA and bw > 0 and bh > 0) {
+            // First color glyph materializes the atlas; on failure nothing is cached and the
+            // next bake retries.
+            self.ensureColorAtlas() catch return null;
+            // A full atlas resets and repacks (mirroring the coverage atlas): live layouts and
+            // this frame's earlier quads go stale, but the generation bump re-bakes them — far
+            // better than a permanently emoji-less session that re-decodes PNGs every frame.
+            const atlas_pos = self.reserveColorAtlas(bw, bh) catch blk: {
+                self.resetColorAtlas();
+                break :blk self.reserveColorAtlas(bw, bh) catch return null;
+            };
+            self.copyColorBitmapToAtlas(bitmap, atlas_pos.x, atlas_pos.y) catch {};
+            const glyph = Glyph{
+                .atlas_x = atlas_pos.x,
+                .atlas_y = atlas_pos.y,
+                .width = bw,
+                .height = bh,
+                .bearing_x = @floatFromInt(slot.*.bitmap_left),
+                .bearing_y = @floatFromInt(slot.*.bitmap_top),
+                .advance_x = @as(f32, @floatFromInt(slot.*.advance.x)) / 64.0,
+            };
+            self.color_glyphs.put(key, glyph) catch {};
+            return .{ .glyph = glyph, .scale = sel.scale };
+        }
+
+        // Monochrome or zero-sized: never drawn (no fallback to the text atlas to avoid font
+        // confusion). Cache an empty marker so the load isn't repeated every frame.
+        self.color_glyphs.put(key, .{
+            .atlas_x = 0,
+            .atlas_y = 0,
+            .width = 0,
+            .height = 0,
+            .bearing_x = 0,
+            .bearing_y = 0,
+            .advance_x = 0,
+        }) catch {};
+        return null;
+    }
+
+    /// Zero the color atlas and forget every baked color glyph, bumping the shared atlas
+    /// generation so cached layouts re-bake their (now stale) color UVs on next draw.
+    fn resetColorAtlas(self: *FreeTypeTextRenderer) void {
+        self.color_glyphs.clearRetainingCapacity();
+        if (self.color_atlas_pixels) |pixels| {
+            @memset(pixels, 0);
+            self.color_atlas_dirty = true;
+        }
+        self.color_pen_x = 1;
+        self.color_pen_y = 1;
+        self.color_row_h = 0;
+        self.atlas_generation +%= 1;
     }
 
     /// Shape and rasterize a run of emoji codepoints using the given emoji font face.
@@ -1909,78 +2358,29 @@ pub const FreeTypeTextRenderer = struct {
         pen_x: *f32,
         baseline_y: *f32,
     ) !void {
+        _ = frame_width;
+        _ = frame_height;
         if (text.len == 0) return;
 
         // Direct lookup only — no fallback to default font. If the emoji face isn't
         // loaded, bail silently rather than using a font that has no color glyphs.
         const face = self.faces.get(emoji_family) orelse return;
 
-        if (ft.FT_Set_Pixel_Sizes(face, 0, @intCast(pixel_size)) != 0) return;
-
         const run = self.getEmojiShapedRun(face, text, emoji_family, pixel_size) catch return;
 
         for (run.glyphs) |shaped| {
-            const key = glyphKey(emoji_family, shaped.glyph_index, pixel_size);
-            var glyph_opt: ?Glyph = self.color_glyphs.get(key);
-
-            if (glyph_opt == null) {
-                const load_flags = ft.FT_LOAD_COLOR | ft.FT_LOAD_RENDER;
-                if (ft.FT_Load_Glyph(face, @intCast(shaped.glyph_index), load_flags) != 0) {
-                    pen_x.* += shaped.x_advance;
-                    continue;
-                }
-
-                const slot = face.*.glyph;
-                const bitmap = slot.*.bitmap;
-                const bw: u32 = bitmap.width;
-                const bh: u32 = bitmap.rows;
-
-                if (bitmap.pixel_mode == ft.FT_PIXEL_MODE_BGRA and bw > 0 and bh > 0) {
-                    // First color glyph materializes the atlas; on failure glyph_opt stays null,
-                    // no quad is appended, nothing is cached, and the next bake retries.
-                    if (self.ensureColorAtlas()) |_| {
-                        if (self.reserveColorAtlas(bw, bh)) |atlas_pos| {
-                            self.copyColorBitmapToAtlas(bitmap, atlas_pos.x, atlas_pos.y) catch {};
-                            const g = Glyph{
-                                .atlas_x = atlas_pos.x,
-                                .atlas_y = atlas_pos.y,
-                                .width = bw,
-                                .height = bh,
-                                .bearing_x = @floatFromInt(slot.*.bitmap_left),
-                                .bearing_y = @floatFromInt(slot.*.bitmap_top),
-                                .advance_x = @as(f32, @floatFromInt(slot.*.advance.x)) / 64.0,
-                            };
-                            self.color_glyphs.put(key, g) catch {};
-                            glyph_opt = g;
-                        } else |_| {}
-                    } else |_| {}
-                } else {
-                    // Monochrome or zero-sized emoji: never drawn (no fallback to the text atlas to
-                    // avoid font confusion). Cache an empty marker so the glyph — a PNG decode for
-                    // CBDT faces — isn't re-loaded every frame.
-                    self.color_glyphs.put(key, .{
-                        .atlas_x = 0,
-                        .atlas_y = 0,
-                        .width = 0,
-                        .height = 0,
-                        .bearing_x = 0,
-                        .bearing_y = 0,
-                        .advance_x = 0,
-                    }) catch {};
-                }
-            }
-
-            if (glyph_opt) |glyph| {
+            if (self.rasterEmojiGlyph(face, emoji_family, shaped.glyph_index, pixel_size)) |raster| {
+                const glyph = raster.glyph;
                 if (glyph.width > 0 and glyph.height > 0) {
-                    const x0 = pen_x.* + shaped.x_offset + glyph.bearing_x;
-                    const y0 = baseline_y.* - shaped.y_offset - glyph.bearing_y;
+                    const x0 = pen_x.* + shaped.x_offset + glyph.bearing_x * raster.scale;
+                    const y0 = baseline_y.* - shaped.y_offset - glyph.bearing_y * raster.scale;
                     const cw_f = @as(f32, @floatFromInt(ColorAtlas.width));
                     const ch_f = @as(f32, @floatFromInt(ColorAtlas.height));
                     self.pending_color_quads.append(self.allocator, .{
                         .x = x0 - offset_x,
                         .y = y0 - offset_y,
-                        .w = @as(f32, @floatFromInt(glyph.width)),
-                        .h = @as(f32, @floatFromInt(glyph.height)),
+                        .w = @as(f32, @floatFromInt(glyph.width)) * raster.scale,
+                        .h = @as(f32, @floatFromInt(glyph.height)) * raster.scale,
                         .u0 = @as(f32, @floatFromInt(glyph.atlas_x)) / cw_f,
                         .v0 = @as(f32, @floatFromInt(glyph.atlas_y)) / ch_f,
                         .u1 = @as(f32, @floatFromInt(glyph.atlas_x + glyph.width)) / cw_f,
@@ -1992,8 +2392,6 @@ pub const FreeTypeTextRenderer = struct {
             pen_x.* += shaped.x_advance;
             baseline_y.* -= shaped.y_advance;
         }
-        _ = frame_width;
-        _ = frame_height;
     }
 
     /// Reserve a region in the RGBA color atlas. Returns error.AtlasFull on overflow.
@@ -2111,11 +2509,16 @@ fn isEmojiCodepoint(cp: u21) bool {
     };
 }
 
-fn glyphKey(font_family: []const u8, glyph_index: u32, size: u16) u64 {
+fn glyphKey(font_family: []const u8, glyph_index: u32, size: u16, synth: Synth) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(font_family);
     hasher.update(std.mem.asBytes(&size));
     hasher.update(std.mem.asBytes(&glyph_index));
+    if (!synth.none()) {
+        const strength: i32 = synth.strength266();
+        hasher.update(std.mem.asBytes(&strength));
+        hasher.update(&[_]u8{@intFromBool(synth.oblique)});
+    }
     return hasher.final();
 }
 
@@ -2136,6 +2539,21 @@ fn nextClusterAbove(sorted: []const u32, cluster: u32) ?u32 {
         if (sorted[mid] <= cluster) lo = mid + 1 else hi = mid;
     }
     return if (lo < sorted.len) sorted[lo] else null;
+}
+
+/// True when glyph `i` is the last glyph of its HarfBuzz cluster — the only place per-cluster
+/// tracking (letter/word spacing) may advance the pen. Works for LTR and RTL runs alike: either
+/// way, a cluster's glyphs are contiguous and share one cluster value.
+fn clusterEndsAt(glyphs: []const ShapedGlyph, i: usize) bool {
+    return i + 1 >= glyphs.len or glyphs[i + 1].cluster != glyphs[i].cluster;
+}
+
+/// The FaceStyle a paint command carries (paint.Text stores weight/style as enums).
+fn styleOf(text: zg.paint.Text) FaceStyle {
+    return .{
+        .weight = @intFromEnum(text.font_weight),
+        .italic = text.font_style == .italic,
+    };
 }
 
 fn clusterIsSpace(text: []const u8, cluster: u32) bool {
@@ -2279,12 +2697,17 @@ const text_shader_source =
     \\
     \\@fragment
     \\fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    \\  // Coverage gamma (~1/1.2): the swapchain is sRGB, so straight alpha blending happens in
-    \\  // non-linear space and eats the antialiased edges — small light-on-dark text reads thin
-    \\  // and washy at 1x DPI. Boosting coverage slightly compensates without fattening solid
-    \\  // pixels (pow leaves 0 and 1 fixed). Quad origins are pixel-snapped at emit, so the
-    \\  // linear filter only ever smooths genuine sub-glyph detail, not placement error.
-    \\  let coverage = pow(textureSample(text_tex, text_sampler, in.uv).r, 1.0 / 1.2);
+    \\  // Coverage gamma: the swapchain is sRGB, so straight alpha blending happens in non-linear
+    \\  // space, and the error is asymmetric — light-on-dark text loses its antialiased edges and
+    \\  // reads thin and washy, while dark-on-light text gains ink and reads smudged. One fixed
+    \\  // exponent can't serve both themes, so it follows the text's own luminance: bright glyphs
+    \\  // boost coverage (~1/1.2), dark glyphs thin it slightly (~1.08), mid-tones blend. pow
+    \\  // leaves 0 and 1 fixed either way, so solid pixels never fatten and holes never fill.
+    \\  // Quad origins are pixel-snapped at emit, so the linear filter only ever smooths genuine
+    \\  // sub-glyph detail, not placement error.
+    \\  let lum = dot(in.color.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    \\  let exponent = mix(1.08, 1.0 / 1.2, lum);
+    \\  let coverage = pow(textureSample(text_tex, text_sampler, in.uv).r, exponent);
     \\  return vec4<f32>(in.color.rgb, in.color.a * coverage * rounded_clip_coverage(in.position.xy));
     \\}
 ;

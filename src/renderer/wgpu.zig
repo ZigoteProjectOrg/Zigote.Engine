@@ -2053,6 +2053,29 @@ fn appendPaintOps(
                     .clip_rect = current_clip,
                     .clip_offset = current_clip_offset,
                 });
+
+                // Cached layouts bake color-emoji quads too; flush them exactly like the
+                // immediate-text path above (same lazily-created atlas, same image pipeline).
+                if (text_renderer.pending_color_quads.items.len > 0) {
+                    if (text_renderer.color_gpu) |cg| {
+                        const color_start = frame.image_vertices.items.len;
+                        for (text_renderer.pending_color_quads.items) |pq| {
+                            try appendImage(allocator, &frame.image_vertices, .{ .x = pq.x, .y = pq.y, .width = pq.w, .height = pq.h }, pq.u0, pq.v0, pq.u1, pq.v1, .{ 255, 255, 255, 255 }, 0.0, 0.0, frame_width, frame_height);
+                        }
+                        const color_added = frame.image_vertices.items.len - color_start;
+                        try appendOrMergeImageOp(allocator, frame, .{
+                            .vertex_offset = @intCast(color_start),
+                            .vertex_count = @intCast(color_added),
+                            .clip_rect = current_clip,
+                            .clip_offset = current_clip_offset,
+                            .texture = cg.texture,
+                            .texture_view = cg.view,
+                            .bind_group = cg.bind_group,
+                            .owns_resources = false,
+                        });
+                    }
+                    text_renderer.pending_color_quads.clearRetainingCapacity();
+                }
             },
 
             .glyph_run => |gr| {
