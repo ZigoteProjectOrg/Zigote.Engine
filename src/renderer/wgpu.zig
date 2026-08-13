@@ -813,7 +813,6 @@ pub fn renderFrame(
     // dialogs/popovers live in the overlay list, and evaluating the predicate earlier would
     // miss them. Apps that never emit a glass/shader-effect op never allocate the backdrop.
     const has_backdrop = frameHasBackdropOp(&frame);
-    if (has_backdrop) try ensureBackdropTexture(gpu_ui, device, frame_width, frame_height);
 
     // Direct-to-swapchain fast path: when the caller never persists the scene across frames
     // (persistent_scene = false ⇒ no partial repaint) AND no op samples the scene as a backdrop, render
@@ -829,6 +828,12 @@ pub fn renderFrame(
         scene_view = gpu_ui.scene_texture_view orelse return error.WgpuTextureViewUnavailable;
         scene_tex = gpu_ui.scene_texture orelse return error.WgpuTextureUnavailable;
     }
+    // Strictly after ensureSceneTexture: a size change releases + nulls the backdrop trio there
+    // (scene and backdrop extents must match), so ensuring the backdrop first would validate a
+    // stale-size trio that the scene recreation is about to null — and the first resized frame
+    // with glass on screen would then fail with WgpuBackdropUnavailable. (has_backdrop ⇒ !direct,
+    // so the scene branch above always ran.)
+    if (has_backdrop) try ensureBackdropTexture(gpu_ui, device, frame_width, frame_height);
     const backdrop_tex = gpu_ui.backdrop_texture;
     const backdrop_bg = gpu_ui.backdrop_bind_group;
 
