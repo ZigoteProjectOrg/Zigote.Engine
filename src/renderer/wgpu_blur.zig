@@ -16,49 +16,49 @@ pub const BlurParams = extern struct {
 // ── WGSL: horizontal pass (blur along X) ─────────────────────────────────────
 
 const h_wgsl =
-\\struct BlurParams { sigma: f32, width: u32, height: u32, _pad: u32 }
-\\@group(0) @binding(0) var src  : texture_2d<f32>;
-\\@group(0) @binding(1) var<uniform> p : BlurParams;
-\\@group(0) @binding(2) var dst  : texture_storage_2d<rgba8unorm, write>;
-\\@compute @workgroup_size(8, 8, 1)
-\\fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
-\\    if (id.x >= p.width || id.y >= p.height) { return; }
-\\    let sigma  = max(p.sigma, 0.001);
-\\    let radius = i32(ceil(3.0 * sigma));
-\\    var color  = vec4<f32>(0.0);
-\\    var w_sum  = 0.0;
-\\    for (var i = -radius; i <= radius; i++) {
-\\        let sx = clamp(i32(id.x) + i, 0, i32(p.width) - 1);
-\\        let w  = exp(-f32(i * i) / (2.0 * sigma * sigma));
-\\        color += textureLoad(src, vec2<i32>(sx, i32(id.y)), 0) * w;
-\\        w_sum += w;
-\\    }
-\\    textureStore(dst, vec2<i32>(id.xy), color / w_sum);
-\\}
+    \\struct BlurParams { sigma: f32, width: u32, height: u32, _pad: u32 }
+    \\@group(0) @binding(0) var src  : texture_2d<f32>;
+    \\@group(0) @binding(1) var<uniform> p : BlurParams;
+    \\@group(0) @binding(2) var dst  : texture_storage_2d<rgba8unorm, write>;
+    \\@compute @workgroup_size(8, 8, 1)
+    \\fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    \\    if (id.x >= p.width || id.y >= p.height) { return; }
+    \\    let sigma  = max(p.sigma, 0.001);
+    \\    let radius = i32(ceil(3.0 * sigma));
+    \\    var color  = vec4<f32>(0.0);
+    \\    var w_sum  = 0.0;
+    \\    for (var i = -radius; i <= radius; i++) {
+    \\        let sx = clamp(i32(id.x) + i, 0, i32(p.width) - 1);
+    \\        let w  = exp(-f32(i * i) / (2.0 * sigma * sigma));
+    \\        color += textureLoad(src, vec2<i32>(sx, i32(id.y)), 0) * w;
+    \\        w_sum += w;
+    \\    }
+    \\    textureStore(dst, vec2<i32>(id.xy), color / w_sum);
+    \\}
 ;
 
 // ── WGSL: vertical pass (blur along Y) ───────────────────────────────────────
 
 const v_wgsl =
-\\struct BlurParams { sigma: f32, width: u32, height: u32, _pad: u32 }
-\\@group(0) @binding(0) var src  : texture_2d<f32>;
-\\@group(0) @binding(1) var<uniform> p : BlurParams;
-\\@group(0) @binding(2) var dst  : texture_storage_2d<rgba8unorm, write>;
-\\@compute @workgroup_size(8, 8, 1)
-\\fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
-\\    if (id.x >= p.width || id.y >= p.height) { return; }
-\\    let sigma  = max(p.sigma, 0.001);
-\\    let radius = i32(ceil(3.0 * sigma));
-\\    var color  = vec4<f32>(0.0);
-\\    var w_sum  = 0.0;
-\\    for (var i = -radius; i <= radius; i++) {
-\\        let sy = clamp(i32(id.y) + i, 0, i32(p.height) - 1);
-\\        let w  = exp(-f32(i * i) / (2.0 * sigma * sigma));
-\\        color += textureLoad(src, vec2<i32>(i32(id.x), sy), 0) * w;
-\\        w_sum += w;
-\\    }
-\\    textureStore(dst, vec2<i32>(id.xy), color / w_sum);
-\\}
+    \\struct BlurParams { sigma: f32, width: u32, height: u32, _pad: u32 }
+    \\@group(0) @binding(0) var src  : texture_2d<f32>;
+    \\@group(0) @binding(1) var<uniform> p : BlurParams;
+    \\@group(0) @binding(2) var dst  : texture_storage_2d<rgba8unorm, write>;
+    \\@compute @workgroup_size(8, 8, 1)
+    \\fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    \\    if (id.x >= p.width || id.y >= p.height) { return; }
+    \\    let sigma  = max(p.sigma, 0.001);
+    \\    let radius = i32(ceil(3.0 * sigma));
+    \\    var color  = vec4<f32>(0.0);
+    \\    var w_sum  = 0.0;
+    \\    for (var i = -radius; i <= radius; i++) {
+    \\        let sy = clamp(i32(id.y) + i, 0, i32(p.height) - 1);
+    \\        let w  = exp(-f32(i * i) / (2.0 * sigma * sigma));
+    \\        color += textureLoad(src, vec2<i32>(i32(id.x), sy), 0) * w;
+    \\        w_sum += w;
+    \\    }
+    \\    textureStore(dst, vec2<i32>(id.xy), color / w_sum);
+    \\}
 ;
 
 // ── GaussianBlur ──────────────────────────────────────────────────────────────
@@ -197,11 +197,11 @@ pub const GaussianBlur = struct {
         const p = BlurParams{ .sigma = @max(sigma, 0.001), .width = w, .height = h };
         self.queue.writeBuffer(self.params_buf, 0, @ptrCast(&p), @sizeOf(BlurParams));
 
-        const src_view  = src.createView(null)  orelse return error.BlurViewFailed;
+        const src_view = src.createView(null) orelse return error.BlurViewFailed;
         defer src_view.release();
         const temp_view = temp.createView(null) orelse return error.BlurViewFailed;
         defer temp_view.release();
-        const dst_view  = dst.createView(null)  orelse return error.BlurViewFailed;
+        const dst_view = dst.createView(null) orelse return error.BlurViewFailed;
         defer dst_view.release();
 
         // H-pass: src → temp

@@ -3,12 +3,12 @@
 
 pub const math = @import("math/root.zig");
 
-pub const Color       = math.Color;
+pub const Color = math.Color;
 pub const Constraints = math.Constraints;
-pub const EdgeInsets  = math.EdgeInsets;
-pub const Offset      = math.Offset;
-pub const Rect        = math.Rect;
-pub const Size        = math.Size;
+pub const EdgeInsets = math.EdgeInsets;
+pub const Offset = math.Offset;
+pub const Rect = math.Rect;
+pub const Size = math.Size;
 
 test {
     _ = math;

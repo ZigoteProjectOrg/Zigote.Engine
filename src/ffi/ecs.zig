@@ -6,7 +6,6 @@
 /// All handles are u64. World handles come from zigote_ecs_world_create() and are
 /// INDEPENDENT of the engine EngineState (no zigote_init / SDL window required).
 /// Entity ids are ecs_entity_t (u64), which packs index+generation; 0 = null entity.
-
 const std = @import("std");
 
 pub const flecs = @cImport({
@@ -329,15 +328,25 @@ pub fn instantiate(world: u64, prefab: u64) u64 {
 
 // ── Built-in entity ids ────────────────────────────────────────────────────────
 
-pub fn builtinChildOf() u64 { return flecs.EcsChildOf; }
-pub fn builtinIsA() u64 { return flecs.EcsIsA; }
-pub fn builtinPrefab() u64 { return flecs.EcsPrefab; }
+pub fn builtinChildOf() u64 {
+    return flecs.EcsChildOf;
+}
+pub fn builtinIsA() u64 {
+    return flecs.EcsIsA;
+}
+pub fn builtinPrefab() u64 {
+    return flecs.EcsPrefab;
+}
 
 // Component-instantiation traits. flecs v4 defaults a component to (OnInstantiate, Override) — copied to
 // each instance (owned). Adding (OnInstantiate, Inherit) makes it SHARED via (IsA, prefab) instead, so a
 // prefab edit propagates to non-overriding instances and ecs_owns distinguishes an explicit override.
-pub fn builtinOnInstantiate() u64 { return flecs.EcsOnInstantiate; }
-pub fn builtinInherit() u64 { return flecs.EcsInherit; }
+pub fn builtinOnInstantiate() u64 {
+    return flecs.EcsOnInstantiate;
+}
+pub fn builtinInherit() u64 {
+    return flecs.EcsInherit;
+}
 
 /// 0=OnStart 1=PreFrame 2=OnLoad 3=PostLoad 4=PreUpdate 5=OnUpdate 6=OnValidate
 /// 7=PostUpdate 8=PreStore 9=OnStore 10=PostFrame
@@ -358,55 +367,115 @@ pub fn builtinPhase(which: u8) u64 {
     };
 }
 
-pub fn eventOnSet() u64 { return flecs.EcsOnSet; }
-pub fn eventOnRemove() u64 { return flecs.EcsOnRemove; }
-pub fn eventOnAdd() u64 { return flecs.EcsOnAdd; }
+pub fn eventOnSet() u64 {
+    return flecs.EcsOnSet;
+}
+pub fn eventOnRemove() u64 {
+    return flecs.EcsOnRemove;
+}
+pub fn eventOnAdd() u64 {
+    return flecs.EcsOnAdd;
+}
 
 // ── ECS (flecs) ───────────────────────────────────────────────────────────────
 // Thin C-ABI shims delegating to  All handles are u64; entity ids are
 // ecs_entity_t (u64 packed index+generation); 0 = null entity.
 // ECS worlds are INDEPENDENT of the engine EngineState — no zigote_init required.
 
-export fn zigote_ecs_world_create() u64 { return worldCreate(); }
-export fn zigote_ecs_world_destroy(world: u64) void { worldDestroy(world); }
-export fn zigote_ecs_progress(world: u64, dt: f32) u8 { return progress(world, dt); }
-export fn zigote_ecs_set_threads(world: u64, threads: i32) void { setThreads(world, threads); }
-export fn zigote_ecs_set_target_fps(world: u64, fps: f32) void { setTargetFps(world, fps); }
-export fn zigote_ecs_defer_begin(world: u64) void { deferBegin(world); }
-export fn zigote_ecs_defer_end(world: u64) void { deferEnd(world); }
+export fn zigote_ecs_world_create() u64 {
+    return worldCreate();
+}
+export fn zigote_ecs_world_destroy(world: u64) void {
+    worldDestroy(world);
+}
+export fn zigote_ecs_progress(world: u64, dt: f32) u8 {
+    return progress(world, dt);
+}
+export fn zigote_ecs_set_threads(world: u64, threads: i32) void {
+    setThreads(world, threads);
+}
+export fn zigote_ecs_set_target_fps(world: u64, fps: f32) void {
+    setTargetFps(world, fps);
+}
+export fn zigote_ecs_defer_begin(world: u64) void {
+    deferBegin(world);
+}
+export fn zigote_ecs_defer_end(world: u64) void {
+    deferEnd(world);
+}
 
 export fn zigote_ecs_component_register(world: u64, name: [*c]const u8, size: usize, alignment: usize) u64 {
     return componentRegister(world, name, size, alignment);
 }
 
-export fn zigote_ecs_entity_create(world: u64) u64 { return entityCreate(world); }
-export fn zigote_ecs_entity_create_named(world: u64, name: [*c]const u8) u64 { return entityCreateNamed(world, name); }
-export fn zigote_ecs_entity_destroy(world: u64, entity: u64) void { entityDestroy(world, entity); }
-export fn zigote_ecs_entity_is_alive(world: u64, entity: u64) u8 { return entityIsAlive(world, entity); }
-export fn zigote_ecs_add(world: u64, entity: u64, component: u64) void { addId(world, entity, component); }
-export fn zigote_ecs_remove(world: u64, entity: u64, component: u64) void { removeId(world, entity, component); }
-export fn zigote_ecs_has(world: u64, entity: u64, component: u64) u8 { return hasId(world, entity, component); }
-export fn zigote_ecs_owns(world: u64, entity: u64, component: u64) u8 { return ownsId(world, entity, component); }
+export fn zigote_ecs_entity_create(world: u64) u64 {
+    return entityCreate(world);
+}
+export fn zigote_ecs_entity_create_named(world: u64, name: [*c]const u8) u64 {
+    return entityCreateNamed(world, name);
+}
+export fn zigote_ecs_entity_destroy(world: u64, entity: u64) void {
+    entityDestroy(world, entity);
+}
+export fn zigote_ecs_entity_is_alive(world: u64, entity: u64) u8 {
+    return entityIsAlive(world, entity);
+}
+export fn zigote_ecs_add(world: u64, entity: u64, component: u64) void {
+    addId(world, entity, component);
+}
+export fn zigote_ecs_remove(world: u64, entity: u64, component: u64) void {
+    removeId(world, entity, component);
+}
+export fn zigote_ecs_has(world: u64, entity: u64, component: u64) u8 {
+    return hasId(world, entity, component);
+}
+export fn zigote_ecs_owns(world: u64, entity: u64, component: u64) u8 {
+    return ownsId(world, entity, component);
+}
 
 export fn zigote_ecs_set(world: u64, entity: u64, component: u64, data: [*c]const u8, size: usize) void {
     setId(world, entity, component, data, size);
 }
-export fn zigote_ecs_get(world: u64, entity: u64, component: u64) [*c]const u8 { return getId(world, entity, component); }
-export fn zigote_ecs_get_mut(world: u64, entity: u64, component: u64) [*c]u8 { return getMutId(world, entity, component); }
-export fn zigote_ecs_ensure(world: u64, entity: u64, component: u64, size: usize) [*c]u8 { return ensureId(world, entity, component, size); }
-export fn zigote_ecs_modified(world: u64, entity: u64, component: u64) void { modifiedId(world, entity, component); }
+export fn zigote_ecs_get(world: u64, entity: u64, component: u64) [*c]const u8 {
+    return getId(world, entity, component);
+}
+export fn zigote_ecs_get_mut(world: u64, entity: u64, component: u64) [*c]u8 {
+    return getMutId(world, entity, component);
+}
+export fn zigote_ecs_ensure(world: u64, entity: u64, component: u64, size: usize) [*c]u8 {
+    return ensureId(world, entity, component, size);
+}
+export fn zigote_ecs_modified(world: u64, entity: u64, component: u64) void {
+    modifiedId(world, entity, component);
+}
 
 export fn zigote_ecs_query_create(world: u64, components: [*c]const u64, count: u32) u64 {
     return queryCreate(world, components, count);
 }
-export fn zigote_ecs_query_destroy(query: u64) void { queryDestroy(query); }
-export fn zigote_ecs_query_iter(world: u64, query: u64) u64 { return queryIter(world, query); }
-export fn zigote_ecs_query_next(iter: u64) u8 { return queryNext(iter); }
-export fn zigote_ecs_iter_count(iter: u64) i32 { return iterCount(iter); }
-export fn zigote_ecs_iter_entities(iter: u64) [*c]const u64 { return iterEntities(iter); }
-export fn zigote_ecs_iter_field(iter: u64, term_index: i32, size: usize) [*c]u8 { return iterField(iter, term_index, size); }
-export fn zigote_ecs_iter_fini(iter: u64) void { iterFini(iter); }
-export fn zigote_ecs_iter_free(iter: u64) void { iterFree(iter); }
+export fn zigote_ecs_query_destroy(query: u64) void {
+    queryDestroy(query);
+}
+export fn zigote_ecs_query_iter(world: u64, query: u64) u64 {
+    return queryIter(world, query);
+}
+export fn zigote_ecs_query_next(iter: u64) u8 {
+    return queryNext(iter);
+}
+export fn zigote_ecs_iter_count(iter: u64) i32 {
+    return iterCount(iter);
+}
+export fn zigote_ecs_iter_entities(iter: u64) [*c]const u64 {
+    return iterEntities(iter);
+}
+export fn zigote_ecs_iter_field(iter: u64, term_index: i32, size: usize) [*c]u8 {
+    return iterField(iter, term_index, size);
+}
+export fn zigote_ecs_iter_fini(iter: u64) void {
+    iterFini(iter);
+}
+export fn zigote_ecs_iter_free(iter: u64) void {
+    iterFree(iter);
+}
 
 export fn zigote_ecs_system_create(world: u64, name: [*c]const u8, phase: u64, components: [*c]const u64, count: u32, callback: usize, ctx: u64) u64 {
     return systemCreate(world, name, phase, components, count, callback, ctx);
@@ -414,28 +483,74 @@ export fn zigote_ecs_system_create(world: u64, name: [*c]const u8, phase: u64, c
 export fn zigote_ecs_observer_create(world: u64, name: [*c]const u8, evt: u64, components: [*c]const u64, count: u32, callback: usize, ctx: u64) u64 {
     return observerCreate(world, name, evt, components, count, callback, ctx);
 }
-export fn zigote_ecs_iter_field_from_ptr(iter_ptr: usize, term_index: i32, size: usize) [*c]u8 { return iterFieldFromPtr(iter_ptr, term_index, size); }
-export fn zigote_ecs_iter_count_from_ptr(iter_ptr: usize) i32 { return iterCountFromPtr(iter_ptr); }
-export fn zigote_ecs_iter_entities_from_ptr(iter_ptr: usize) [*c]const u64 { return iterEntitiesFromPtr(iter_ptr); }
-export fn zigote_ecs_iter_ctx(iter_ptr: usize) u64 { return iterCtx(iter_ptr); }
+export fn zigote_ecs_iter_field_from_ptr(iter_ptr: usize, term_index: i32, size: usize) [*c]u8 {
+    return iterFieldFromPtr(iter_ptr, term_index, size);
+}
+export fn zigote_ecs_iter_count_from_ptr(iter_ptr: usize) i32 {
+    return iterCountFromPtr(iter_ptr);
+}
+export fn zigote_ecs_iter_entities_from_ptr(iter_ptr: usize) [*c]const u64 {
+    return iterEntitiesFromPtr(iter_ptr);
+}
+export fn zigote_ecs_iter_ctx(iter_ptr: usize) u64 {
+    return iterCtx(iter_ptr);
+}
 
-export fn zigote_ecs_make_pair(relation: u64, target: u64) u64 { return makePair(relation, target); }
-export fn zigote_ecs_add_pair(world: u64, e: u64, relation: u64, target: u64) void { addPair(world, e, relation, target); }
-export fn zigote_ecs_remove_pair(world: u64, e: u64, relation: u64, target: u64) void { removePair(world, e, relation, target); }
-export fn zigote_ecs_has_pair(world: u64, e: u64, relation: u64, target: u64) u8 { return hasPair(world, e, relation, target); }
-export fn zigote_ecs_new_w_pair(world: u64, relation: u64, target: u64) u64 { return newWPair(world, relation, target); }
-export fn zigote_ecs_set_parent(world: u64, child: u64, parent: u64) void { setParent(world, child, parent); }
-export fn zigote_ecs_get_parent(world: u64, child: u64) u64 { return getParent(world, child); }
-export fn zigote_ecs_is_a(world: u64, e: u64, baseEntity: u64) void { isA(world, e, baseEntity); }
-export fn zigote_ecs_new_prefab(world: u64, name: [*c]const u8) u64 { return newPrefab(world, name); }
-export fn zigote_ecs_instantiate(world: u64, prefab: u64) u64 { return instantiate(world, prefab); }
+export fn zigote_ecs_make_pair(relation: u64, target: u64) u64 {
+    return makePair(relation, target);
+}
+export fn zigote_ecs_add_pair(world: u64, e: u64, relation: u64, target: u64) void {
+    addPair(world, e, relation, target);
+}
+export fn zigote_ecs_remove_pair(world: u64, e: u64, relation: u64, target: u64) void {
+    removePair(world, e, relation, target);
+}
+export fn zigote_ecs_has_pair(world: u64, e: u64, relation: u64, target: u64) u8 {
+    return hasPair(world, e, relation, target);
+}
+export fn zigote_ecs_new_w_pair(world: u64, relation: u64, target: u64) u64 {
+    return newWPair(world, relation, target);
+}
+export fn zigote_ecs_set_parent(world: u64, child: u64, parent: u64) void {
+    setParent(world, child, parent);
+}
+export fn zigote_ecs_get_parent(world: u64, child: u64) u64 {
+    return getParent(world, child);
+}
+export fn zigote_ecs_is_a(world: u64, e: u64, baseEntity: u64) void {
+    isA(world, e, baseEntity);
+}
+export fn zigote_ecs_new_prefab(world: u64, name: [*c]const u8) u64 {
+    return newPrefab(world, name);
+}
+export fn zigote_ecs_instantiate(world: u64, prefab: u64) u64 {
+    return instantiate(world, prefab);
+}
 
-export fn zigote_ecs_builtin_childof() u64 { return builtinChildOf(); }
-export fn zigote_ecs_builtin_isa() u64 { return builtinIsA(); }
-export fn zigote_ecs_builtin_prefab() u64 { return builtinPrefab(); }
-export fn zigote_ecs_builtin_oninstantiate() u64 { return builtinOnInstantiate(); }
-export fn zigote_ecs_builtin_inherit() u64 { return builtinInherit(); }
-export fn zigote_ecs_builtin_phase(which: u8) u64 { return builtinPhase(which); }
-export fn zigote_ecs_event_onset() u64 { return eventOnSet(); }
-export fn zigote_ecs_event_onremove() u64 { return eventOnRemove(); }
-export fn zigote_ecs_event_onadd() u64 { return eventOnAdd(); }
+export fn zigote_ecs_builtin_childof() u64 {
+    return builtinChildOf();
+}
+export fn zigote_ecs_builtin_isa() u64 {
+    return builtinIsA();
+}
+export fn zigote_ecs_builtin_prefab() u64 {
+    return builtinPrefab();
+}
+export fn zigote_ecs_builtin_oninstantiate() u64 {
+    return builtinOnInstantiate();
+}
+export fn zigote_ecs_builtin_inherit() u64 {
+    return builtinInherit();
+}
+export fn zigote_ecs_builtin_phase(which: u8) u64 {
+    return builtinPhase(which);
+}
+export fn zigote_ecs_event_onset() u64 {
+    return eventOnSet();
+}
+export fn zigote_ecs_event_onremove() u64 {
+    return eventOnRemove();
+}
+export fn zigote_ecs_event_onadd() u64 {
+    return eventOnAdd();
+}

@@ -2,6 +2,10 @@
 """Generate src/renderer/bidi_table.zig from the Unicode Character Database.
 
     python3 tools/gen_bidi_table.py DerivedBidiClass.txt BidiBrackets.txt > src/renderer/bidi_table.zig
+    zig fmt src/renderer/bidi_table.zig
+
+The `zig fmt` pass is not optional: it column-aligns the table rows this script emits
+single-spaced, and the committed file is formatted. Skipping it re-diffs all 380 lines.
 
 Both inputs come from https://www.unicode.org/Public/UCD/latest/ucd/
 (DerivedBidiClass.txt lives under extracted/). Regenerate on a Unicode upgrade;

@@ -3,8 +3,8 @@
 // (ZigoteCS/Zigote.UI) and are no longer compiled in Zig.
 
 pub const geometry = @import("geometry.zig");
-pub const text     = @import("text.zig");
-pub const render   = struct {
+pub const text = @import("text.zig");
+pub const render = struct {
     pub const paint = @import("render/paint.zig");
 };
 
@@ -13,4 +13,3 @@ test {
     _ = text;
     _ = render.paint;
 }
-

@@ -8,7 +8,6 @@
 /// Broad-phase mirrors object layers 1-to-1:
 ///   BPLayer 0 = NON_MOVING
 ///   BPLayer 1 = MOVING
-
 const std = @import("std");
 
 const joltc = @cImport({
@@ -117,7 +116,7 @@ pub fn init(allocator: std.mem.Allocator, max_bodies: u32, num_threads: i32) !*P
 
     const job_sys = joltc.JPC_JobSystem_Create(
         2048, // JPC_MAX_PHYSICS_JOBS
-        8,    // JPC_MAX_PHYSICS_BARRIERS
+        8, // JPC_MAX_PHYSICS_BARRIERS
         num_threads,
     ) orelse return error.PhysicsJobSystemFailed;
     errdefer joltc.JPC_JobSystem_Destroy(job_sys);

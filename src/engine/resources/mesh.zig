@@ -203,34 +203,34 @@ pub const Mesh = struct {
         const verts = [_]Vertex{
             // +X face
             .{ .position = .{ 0.5, -0.5, -0.5 }, .normal = .{ 1, 0, 0 }, .uv = .{ 0, 1 } },
-            .{ .position = .{ 0.5,  0.5, -0.5 }, .normal = .{ 1, 0, 0 }, .uv = .{ 0, 0 } },
-            .{ .position = .{ 0.5,  0.5,  0.5 }, .normal = .{ 1, 0, 0 }, .uv = .{ 1, 0 } },
-            .{ .position = .{ 0.5, -0.5,  0.5 }, .normal = .{ 1, 0, 0 }, .uv = .{ 1, 1 } },
+            .{ .position = .{ 0.5, 0.5, -0.5 }, .normal = .{ 1, 0, 0 }, .uv = .{ 0, 0 } },
+            .{ .position = .{ 0.5, 0.5, 0.5 }, .normal = .{ 1, 0, 0 }, .uv = .{ 1, 0 } },
+            .{ .position = .{ 0.5, -0.5, 0.5 }, .normal = .{ 1, 0, 0 }, .uv = .{ 1, 1 } },
             // -X face
-            .{ .position = .{ -0.5, -0.5,  0.5 }, .normal = .{ -1, 0, 0 }, .uv = .{ 0, 1 } },
-            .{ .position = .{ -0.5,  0.5,  0.5 }, .normal = .{ -1, 0, 0 }, .uv = .{ 0, 0 } },
-            .{ .position = .{ -0.5,  0.5, -0.5 }, .normal = .{ -1, 0, 0 }, .uv = .{ 1, 0 } },
+            .{ .position = .{ -0.5, -0.5, 0.5 }, .normal = .{ -1, 0, 0 }, .uv = .{ 0, 1 } },
+            .{ .position = .{ -0.5, 0.5, 0.5 }, .normal = .{ -1, 0, 0 }, .uv = .{ 0, 0 } },
+            .{ .position = .{ -0.5, 0.5, -0.5 }, .normal = .{ -1, 0, 0 }, .uv = .{ 1, 0 } },
             .{ .position = .{ -0.5, -0.5, -0.5 }, .normal = .{ -1, 0, 0 }, .uv = .{ 1, 1 } },
             // +Y face
             .{ .position = .{ -0.5, 0.5, -0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 0, 1 } },
-            .{ .position = .{ -0.5, 0.5,  0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 0, 0 } },
-            .{ .position = .{  0.5, 0.5,  0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 1, 0 } },
-            .{ .position = .{  0.5, 0.5, -0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 1, 1 } },
+            .{ .position = .{ -0.5, 0.5, 0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 0, 0 } },
+            .{ .position = .{ 0.5, 0.5, 0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 1, 0 } },
+            .{ .position = .{ 0.5, 0.5, -0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 1, 1 } },
             // -Y face
-            .{ .position = .{ -0.5, -0.5,  0.5 }, .normal = .{ 0, -1, 0 }, .uv = .{ 0, 1 } },
+            .{ .position = .{ -0.5, -0.5, 0.5 }, .normal = .{ 0, -1, 0 }, .uv = .{ 0, 1 } },
             .{ .position = .{ -0.5, -0.5, -0.5 }, .normal = .{ 0, -1, 0 }, .uv = .{ 0, 0 } },
-            .{ .position = .{  0.5, -0.5, -0.5 }, .normal = .{ 0, -1, 0 }, .uv = .{ 1, 0 } },
-            .{ .position = .{  0.5, -0.5,  0.5 }, .normal = .{ 0, -1, 0 }, .uv = .{ 1, 1 } },
+            .{ .position = .{ 0.5, -0.5, -0.5 }, .normal = .{ 0, -1, 0 }, .uv = .{ 1, 0 } },
+            .{ .position = .{ 0.5, -0.5, 0.5 }, .normal = .{ 0, -1, 0 }, .uv = .{ 1, 1 } },
             // +Z face
-            .{ .position = .{  0.5, -0.5, 0.5 }, .normal = .{ 0, 0, 1 }, .uv = .{ 0, 1 } },
-            .{ .position = .{  0.5,  0.5, 0.5 }, .normal = .{ 0, 0, 1 }, .uv = .{ 0, 0 } },
-            .{ .position = .{ -0.5,  0.5, 0.5 }, .normal = .{ 0, 0, 1 }, .uv = .{ 1, 0 } },
+            .{ .position = .{ 0.5, -0.5, 0.5 }, .normal = .{ 0, 0, 1 }, .uv = .{ 0, 1 } },
+            .{ .position = .{ 0.5, 0.5, 0.5 }, .normal = .{ 0, 0, 1 }, .uv = .{ 0, 0 } },
+            .{ .position = .{ -0.5, 0.5, 0.5 }, .normal = .{ 0, 0, 1 }, .uv = .{ 1, 0 } },
             .{ .position = .{ -0.5, -0.5, 0.5 }, .normal = .{ 0, 0, 1 }, .uv = .{ 1, 1 } },
             // -Z face
             .{ .position = .{ -0.5, -0.5, -0.5 }, .normal = .{ 0, 0, -1 }, .uv = .{ 0, 1 } },
-            .{ .position = .{ -0.5,  0.5, -0.5 }, .normal = .{ 0, 0, -1 }, .uv = .{ 0, 0 } },
-            .{ .position = .{  0.5,  0.5, -0.5 }, .normal = .{ 0, 0, -1 }, .uv = .{ 1, 0 } },
-            .{ .position = .{  0.5, -0.5, -0.5 }, .normal = .{ 0, 0, -1 }, .uv = .{ 1, 1 } },
+            .{ .position = .{ -0.5, 0.5, -0.5 }, .normal = .{ 0, 0, -1 }, .uv = .{ 0, 0 } },
+            .{ .position = .{ 0.5, 0.5, -0.5 }, .normal = .{ 0, 0, -1 }, .uv = .{ 1, 0 } },
+            .{ .position = .{ 0.5, -0.5, -0.5 }, .normal = .{ 0, 0, -1 }, .uv = .{ 1, 1 } },
         };
 
         const face_indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
@@ -254,9 +254,9 @@ pub const Mesh = struct {
     /// Create a unit quad on the XZ plane (horizontal floor) centered at the origin, normal pointing +Y.
     pub fn createQuad(allocator: std.mem.Allocator) !Mesh {
         const verts = [_]Vertex{
-            .{ .position = .{ -0.5, 0.0,  0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 0, 0 }, .tangent = .{ 1, 0, 0, 1 } },
-            .{ .position = .{  0.5, 0.0,  0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 1, 0 }, .tangent = .{ 1, 0, 0, 1 } },
-            .{ .position = .{  0.5, 0.0, -0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 1, 1 }, .tangent = .{ 1, 0, 0, 1 } },
+            .{ .position = .{ -0.5, 0.0, 0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 0, 0 }, .tangent = .{ 1, 0, 0, 1 } },
+            .{ .position = .{ 0.5, 0.0, 0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 1, 0 }, .tangent = .{ 1, 0, 0, 1 } },
+            .{ .position = .{ 0.5, 0.0, -0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 1, 1 }, .tangent = .{ 1, 0, 0, 1 } },
             .{ .position = .{ -0.5, 0.0, -0.5 }, .normal = .{ 0, 1, 0 }, .uv = .{ 0, 1 }, .tangent = .{ 1, 0, 0, 1 } },
         };
         const indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
@@ -307,8 +307,12 @@ pub const Mesh = struct {
                 // CCW winding (matches glTF) so outward faces are front-facing under
                 // front_face=.ccw + back-cull. (Was a,c,b / b,c,d — inverted, which back-face-culled
                 // the visible hemisphere so every procedural primitive read as grey chrome.)
-                indices[ii] = a; indices[ii+1] = b; indices[ii+2] = c;
-                indices[ii+3] = b; indices[ii+4] = d; indices[ii+5] = c;
+                indices[ii] = a;
+                indices[ii + 1] = b;
+                indices[ii + 2] = c;
+                indices[ii + 3] = b;
+                indices[ii + 4] = d;
+                indices[ii + 5] = c;
                 ii += 6;
             }
         }

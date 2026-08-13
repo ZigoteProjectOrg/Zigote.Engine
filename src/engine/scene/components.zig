@@ -57,9 +57,9 @@ pub const Light = struct {
     kind: LightKind = .directional,
     color: Vec3 = .{ .x = 1, .y = 1, .z = 1 },
     intensity: f32 = 1.0,
-    range: f32 = 10.0,       // for point/spot
-    inner_angle: f32 = 0.3,  // for spot (radians)
-    outer_angle: f32 = 0.5,  // for spot (radians)
+    range: f32 = 10.0, // for point/spot
+    inner_angle: f32 = 0.3, // for spot (radians)
+    outer_angle: f32 = 0.5, // for spot (radians)
     cast_shadows: bool = false,
 };
 

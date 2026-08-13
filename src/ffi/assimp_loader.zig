@@ -152,10 +152,22 @@ inline fn nodeChild(n: *const c.aiNode, i: usize) *const c.aiNode {
 /// Convert a (row-major) Assimp matrix into the engine's column-major `Mat4`.
 fn mat4FromAi(m: *const c.aiMatrix4x4) Mat4 {
     var out = Mat4.identity;
-    out.setElement(0, 0, m.a1); out.setElement(1, 0, m.a2); out.setElement(2, 0, m.a3); out.setElement(3, 0, m.a4);
-    out.setElement(0, 1, m.b1); out.setElement(1, 1, m.b2); out.setElement(2, 1, m.b3); out.setElement(3, 1, m.b4);
-    out.setElement(0, 2, m.c1); out.setElement(1, 2, m.c2); out.setElement(2, 2, m.c3); out.setElement(3, 2, m.c4);
-    out.setElement(0, 3, m.d1); out.setElement(1, 3, m.d2); out.setElement(2, 3, m.d3); out.setElement(3, 3, m.d4);
+    out.setElement(0, 0, m.a1);
+    out.setElement(1, 0, m.a2);
+    out.setElement(2, 0, m.a3);
+    out.setElement(3, 0, m.a4);
+    out.setElement(0, 1, m.b1);
+    out.setElement(1, 1, m.b2);
+    out.setElement(2, 1, m.b3);
+    out.setElement(3, 1, m.b4);
+    out.setElement(0, 2, m.c1);
+    out.setElement(1, 2, m.c2);
+    out.setElement(2, 2, m.c3);
+    out.setElement(3, 2, m.c4);
+    out.setElement(0, 3, m.d1);
+    out.setElement(1, 3, m.d2);
+    out.setElement(2, 3, m.d3);
+    out.setElement(3, 3, m.d4);
     return out;
 }
 

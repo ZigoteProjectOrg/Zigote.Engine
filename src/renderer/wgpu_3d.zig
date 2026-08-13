@@ -7,7 +7,6 @@
 ///   - Camera UBO updated once per frame
 ///   - Per-object model matrix uploaded as a small uniform buffer
 ///   - Mesh GPU buffers cached by MeshHandle in a HashMap
-
 const std = @import("std");
 const wgpu = @import("wgpu");
 const zpool = @import("zpool");
@@ -114,9 +113,9 @@ const POINT_CUBE_LAYERS: u32 = 6 * MAX_POINT_SHADOWS;
 /// build the 6 per-face view matrices for point-light shadows so a direction sample hits the face the
 /// renderer drew it into.
 const CUBE_FACE_DIRS = [6]Vec3{
-    .{ .x = 1, .y = 0, .z = 0 },  .{ .x = -1, .y = 0, .z = 0 },
-    .{ .x = 0, .y = 1, .z = 0 },  .{ .x = 0, .y = -1, .z = 0 },
-    .{ .x = 0, .y = 0, .z = 1 },  .{ .x = 0, .y = 0, .z = -1 },
+    .{ .x = 1, .y = 0, .z = 0 }, .{ .x = -1, .y = 0, .z = 0 },
+    .{ .x = 0, .y = 1, .z = 0 }, .{ .x = 0, .y = -1, .z = 0 },
+    .{ .x = 0, .y = 0, .z = 1 }, .{ .x = 0, .y = 0, .z = -1 },
 };
 const CUBE_FACE_UPS = [6]Vec3{
     .{ .x = 0, .y = -1, .z = 0 }, .{ .x = 0, .y = -1, .z = 0 },
@@ -273,7 +272,6 @@ pub const Stats3D = extern struct {
     visible_objects: u32 = 0,
 };
 
-
 const TextureViewGpu = struct {
     texture: *wgpu.Texture,
     texture_view: *wgpu.TextureView,
@@ -329,10 +327,14 @@ fn createSolidTextureView(
     errdefer texture_view.release();
 
     var upload: [256]u8 = .{0} ** 256;
-    upload[0] = rgba[0]; upload[1] = rgba[1]; upload[2] = rgba[2]; upload[3] = rgba[3];
+    upload[0] = rgba[0];
+    upload[1] = rgba[1];
+    upload[2] = rgba[2];
+    upload[3] = rgba[3];
     queue.writeTexture(
         &.{ .texture = texture, .mip_level = 0, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = .all },
-        &upload, upload.len,
+        &upload,
+        upload.len,
         &.{ .offset = 0, .bytes_per_row = 256, .rows_per_image = 1 },
         &.{ .width = 1, .height = 1, .depth_or_array_layers = 1 },
     );
@@ -895,10 +897,10 @@ pub const Gpu3d = struct {
         // transparent/glass/instanced/shadow), so shadow pipelines that read only a subset of the
         // locations get the same stride automatically.
         const vertex_attrs = [_]wgpu.VertexAttribute{
-            .{ .format = .float32x3, .offset = 0,  .shader_location = 0 }, // position
-            .{ .format = .snorm8x4,  .offset = 12, .shader_location = 1 }, // normal (xyz; w unused)
+            .{ .format = .float32x3, .offset = 0, .shader_location = 0 }, // position
+            .{ .format = .snorm8x4, .offset = 12, .shader_location = 1 }, // normal (xyz; w unused)
             .{ .format = .float32x2, .offset = 16, .shader_location = 2 }, // uv
-            .{ .format = .snorm8x4,  .offset = 24, .shader_location = 3 }, // tangent (xyz + w handedness)
+            .{ .format = .snorm8x4, .offset = 24, .shader_location = 3 }, // tangent (xyz + w handedness)
         };
         const vertex_buf_layout = wgpu.VertexBufferLayout{
             .array_stride = @sizeOf(resources_mod.GpuVertex),
@@ -2912,7 +2914,6 @@ pub const Gpu3d = struct {
         if (self.effectiveSettings().dof_enabled != 0.0) try self.ensureDofTargets();
     }
 
-
     fn createTextureViewFromPixels(
         self: *Gpu3d,
         queue: *wgpu.Queue,
@@ -3613,7 +3614,6 @@ pub const Gpu3d = struct {
         light_data.fog_color = .{ s.fog_color[0], s.fog_color[1], s.fog_color[2], s.fog_density };
         light_data.fog_params = .{ s.fog_height_falloff, s.fog_height, s.fog_sun_inscatter, s.fog_anisotropy };
 
-
         var shadow_dir = (Vec3{ .x = 1.0, .y = 2.0, .z = 1.5 }).normalize();
         var has_shadow_light = false;
 
@@ -4197,7 +4197,6 @@ pub const Gpu3d = struct {
         queue.writeBuffer(ring, @intCast(start), range.ptr, range.len);
         self.model_flushed = upto;
     }
-
 
     pub fn renderShadowPass(
         self: *Gpu3d,

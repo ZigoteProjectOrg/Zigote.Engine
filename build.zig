@@ -623,8 +623,8 @@ pub fn build(b: *std.Build) void {
         // Every module that reaches an NDK header through @cImport needs the bionic translation
         // workarounds and the sysroot's per-architecture paths.
         for ([_]*std.Build.Module{
-            wgpu_mod,   zaudio_mod, zmath_mod, zpool_mod, zmesh_opt_mod,
-            core_mod,   ui_mod,     engine_mod, zigote_mod, ffi_mod,
+            wgpu_mod, zaudio_mod, zmath_mod,  zpool_mod,  zmesh_opt_mod,
+            core_mod, ui_mod,     engine_mod, zigote_mod, ffi_mod,
         }) |mod| addAndroidSysrootPaths(b, mod, target);
     }
 
@@ -673,8 +673,8 @@ pub fn build(b: *std.Build) void {
     // PR #23384). It is a toolchain bug, not something the engine can fix properly.
     if (target.result.os.tag == .windows) {
         for ([_]*std.Build.Module{
-            core_mod, ui_mod,   engine_mod, zigote_mod,   ffi_mod,
-            wgpu_mod, zaudio_mod, zmath_mod, zpool_mod,   zmesh_opt_mod,
+            core_mod, ui_mod,     engine_mod, zigote_mod, ffi_mod,
+            wgpu_mod, zaudio_mod, zmath_mod,  zpool_mod,  zmesh_opt_mod,
         }) |m| m.addCMacro("_FORTIFY_SOURCE", "0");
 
         // The sdl3 package builds its `c` module with its own TranslateC step and exposes no option

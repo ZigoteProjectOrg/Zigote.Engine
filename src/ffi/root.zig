@@ -1511,7 +1511,7 @@ fn runAppTrampoline(argc: c_int, argv: [*c][*c]u8) callconv(.c) c_int {
 export fn zigote_run_app(main_fn: ?*const fn () callconv(.c) void) i32 {
     run_app_main = main_fn;
     // Synthesized argv: UIApplicationMain and some SDL internals expect a non-null argv0.
-    const argv0: [*c]u8 = @constCast(@ptrCast("zigote"));
+    const argv0: [*c]u8 = @ptrCast(@constCast("zigote"));
     var argv = [_][*c]u8{ argv0, null };
     return @intCast(sdl3.c.SDL_RunApp(1, @ptrCast(&argv), &runAppTrampoline, null));
 }
@@ -4528,9 +4528,9 @@ fn createSecondaryWindowImpl(
         .alpha_mode = if (pending_transparent_window)
             pickAlphaMode(&capabilities, true)
         else if (capabilities.alpha_mode_count > 0)
-                capabilities.alpha_modes[0]
-            else
-                .auto,
+            capabilities.alpha_modes[0]
+        else
+            .auto,
     };
     surface.configure(&config);
 
@@ -5636,7 +5636,7 @@ var pending_transparent_window: bool = false;
 fn pickAlphaMode(caps: *const wgpu.SurfaceCapabilities, want_transparent: bool) wgpu.CompositeAlphaMode {
     if (want_transparent) {
         for (caps.alpha_modes[0..caps.alpha_mode_count]) |m|
-        if (m == .premultiplied) return m;
+            if (m == .premultiplied) return m;
     }
     return if (caps.alpha_mode_count > 0) caps.alpha_modes[0] else .auto;
 }
@@ -6805,16 +6805,16 @@ export fn zigote_set_render_settings_3d(handle: u64, settings: ZgRenderSettings3
     const ns = g.settings;
     const env_changed =
         old.ambient_intensity != ns.ambient_intensity or
-            !std.meta.eql(old.sky_horizon, ns.sky_horizon) or
-            !std.meta.eql(old.sky_zenith, ns.sky_zenith) or
-            !std.meta.eql(old.sky_ground, ns.sky_ground) or
-            !std.meta.eql(old.env_avg, ns.env_avg) or
-            old.sun_azimuth_deg != ns.sun_azimuth_deg or
-            old.sun_elevation_deg != ns.sun_elevation_deg or
-            old.sun_intensity != ns.sun_intensity or
-            old.overhead != ns.overhead or
-            old.horizon_glow != ns.horizon_glow or
-            old.sun_sharpness != ns.sun_sharpness;
+        !std.meta.eql(old.sky_horizon, ns.sky_horizon) or
+        !std.meta.eql(old.sky_zenith, ns.sky_zenith) or
+        !std.meta.eql(old.sky_ground, ns.sky_ground) or
+        !std.meta.eql(old.env_avg, ns.env_avg) or
+        old.sun_azimuth_deg != ns.sun_azimuth_deg or
+        old.sun_elevation_deg != ns.sun_elevation_deg or
+        old.sun_intensity != ns.sun_intensity or
+        old.overhead != ns.overhead or
+        old.horizon_glow != ns.horizon_glow or
+        old.sun_sharpness != ns.sun_sharpness;
     if (env_changed) g.env_dirty = true;
 }
 

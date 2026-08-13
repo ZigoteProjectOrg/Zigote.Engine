@@ -6,7 +6,6 @@
 /// `init` fails, so `EngineState.physics` stays null and every wrapper short-circuits on its
 /// `state.physics orelse return` guard — these bodies never actually run. Mirrors the Assimp stub
 /// pattern in root.zig. All parameters are named `_` since none are used.
-
 const std = @import("std");
 
 pub const INVALID_BODY_ID: u32 = 0xFFFF_FFFF;

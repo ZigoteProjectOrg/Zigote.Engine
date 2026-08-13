@@ -10,4 +10,3 @@ pub const Size = geometry.Size;
 test {
     _ = geometry;
 }
-

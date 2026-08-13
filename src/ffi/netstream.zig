@@ -364,7 +364,7 @@ fn writeRing(self: *NetStream, samples: []const f32) void {
         const count: usize = @intCast(run * channels);
         @memcpy(
             self.pcm[at .. at + count],
-            samples[@intCast(offset * channels) .. @intCast((offset + run) * channels)],
+            samples[@intCast(offset * channels)..@intCast((offset + run) * channels)],
         );
         offset += run;
     }
