@@ -890,7 +890,7 @@ pub const FreeTypeTextRenderer = struct {
         for (text.text, 0..) |byte, i| {
             if (byte != '\n' and byte != '\r' and byte != '\t') continue;
 
-            try self.flushTextSegment(allocator, vertices, font_family, pixel_size, style, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..i], text.letter_spacing, text.word_spacing);
+            try self.flushTextSegment(allocator, vertices, font_family, pixel_size, style, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..i], text.letter_spacing, text.word_spacing, text.blur);
             switch (byte) {
                 '\n' => {
                     pen_x = text.baseline_x;
@@ -903,7 +903,7 @@ pub const FreeTypeTextRenderer = struct {
             segment_start = i + 1;
         }
 
-        try self.flushTextSegment(allocator, vertices, font_family, pixel_size, style, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..], text.letter_spacing, text.word_spacing);
+        try self.flushTextSegment(allocator, vertices, font_family, pixel_size, style, color, offset_x, offset_y, frame_width, frame_height, &pen_x, &baseline_y, text.text[segment_start..], text.letter_spacing, text.word_spacing, text.blur);
     }
 
     fn flushTextSegment(
@@ -923,15 +923,27 @@ pub const FreeTypeTextRenderer = struct {
         segment: []const u8,
         letter_spacing: f32,
         word_spacing: f32,
+        blur: f32,
     ) !void {
         if (segment.len == 0) return;
 
         var runs = self.splitRuns(segment, font_family);
         while (runs.next()) |run| {
             if (run.emoji) {
-                try self.appendEmojiShapedSegment(run.text, run.family, pixel_size, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y);
+                // Color emoji cast no text-shadow (matches browsers); a blurred pass skips them
+                // but must still advance the pen so following glyphs keep their positions.
+                if (blur > 0) {
+                    var dx: f32 = 0;
+                    var dy: f32 = 0;
+                    try self.appendEmojiShapedSegment(run.text, run.family, pixel_size, offset_x, offset_y, frame_width, frame_height, &dx, &dy);
+                    self.pending_color_quads.clearRetainingCapacity();
+                    pen_x.* += dx;
+                    baseline_y.* += dy;
+                } else {
+                    try self.appendEmojiShapedSegment(run.text, run.family, pixel_size, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y);
+                }
             } else {
-                try self.appendShapedSegment(allocator, vertices, run.text, run.family, pixel_size, style, color, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y, letter_spacing, word_spacing);
+                try self.appendShapedSegment(allocator, vertices, run.text, run.family, pixel_size, style, color, offset_x, offset_y, frame_width, frame_height, pen_x, baseline_y, letter_spacing, word_spacing, blur);
             }
         }
     }
@@ -1096,6 +1108,7 @@ pub const FreeTypeTextRenderer = struct {
         baseline_y: *f32,
         letter_spacing: f32,
         word_spacing: f32,
+        blur: f32,
     ) !void {
         if (text.len == 0) return;
 
@@ -1103,7 +1116,7 @@ pub const FreeTypeTextRenderer = struct {
         const spaced = letter_spacing != 0;
         const run = try self.getShapedRun(face, text, font_family, pixel_size, style, spaced);
         for (run.glyphs, 0..) |shaped, i| {
-            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, pixel_size, style);
+            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, pixel_size, style, blur);
             if (glyph.width > 0 and glyph.height > 0) {
                 // Snap the quad origin to the physical pixel grid: each glyph exists as ONE
                 // integer-origin raster in the atlas, so a fractional origin makes the linear
@@ -1772,7 +1785,7 @@ pub const FreeTypeTextRenderer = struct {
         const run = try self.getShapedRun(face, text, font_family, shape_pixel_size, style, spaced);
 
         for (run.glyphs, 0..) |shaped, i| {
-            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, raster_pixel_size, style);
+            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, raster_pixel_size, style, 0);
 
             if (glyph.width > 0 and glyph.height > 0) {
                 const x0 = pen_x.* + shaped.x_offset + glyph.bearing_x * inv_raster_scale;
@@ -1895,11 +1908,14 @@ pub const FreeTypeTextRenderer = struct {
         glyph_index: u32,
         size: u16,
         style: FaceStyle,
+        blur: f32,
     ) !Glyph {
         // Keyed by what is actually rasterized (the synth result), not by the request: every
         // (weight, italic) combination the face satisfies natively shares one atlas entry.
+        // Blur is quantized to quarter-pixel buckets so shadow passes bake once per radius.
         const synth = synthFor(face, style, size);
-        const key = glyphKey(font_family, glyph_index, size, synth);
+        const blur_q: u16 = if (blur > 0) @intFromFloat(@min(@round(blur * 4.0), 4096.0)) else 0;
+        const key = glyphKey(font_family, glyph_index, size, synth, blur_q);
 
         if (self.glyphs.get(key)) |glyph| {
             return glyph;
@@ -1936,6 +1952,14 @@ pub const FreeTypeTextRenderer = struct {
         const bitmap_width: u32 = bitmap.width;
         const bitmap_height: u32 = bitmap.rows;
 
+        if (blur_q > 0 and bitmap_width > 0 and bitmap_height > 0 and
+            bitmap.pixel_mode == ft.FT_PIXEL_MODE_GRAY and bitmap.buffer != null)
+        {
+            const glyph = try self.bakeBlurredGlyph(bitmap, @as(f32, @floatFromInt(blur_q)) / 4.0, slot);
+            try self.glyphs.put(key, glyph);
+            return glyph;
+        }
+
         // Overflow first grows the atlas ×2 (up to Atlas.max) — glyphs re-bake lazily into the
         // larger store via the generation bump — and only at max size falls back to the
         // destructive reset-and-repack.
@@ -1966,6 +1990,72 @@ pub const FreeTypeTextRenderer = struct {
 
         try self.glyphs.put(key, glyph);
         return glyph;
+    }
+
+    /// Bake a blurred copy of a freshly rendered glyph into the coverage atlas. The bitmap is
+    /// zero-padded so the halo fits, box-blurred 3× (separable, ≈ Gaussian with σ = blur/2 —
+    /// CSS text-shadow radius semantics), and stored with pad-adjusted bearings so quad
+    /// emission downstream needs no changes.
+    // ponytail: per-glyph blur double-darkens where adjacent halos overlap (vs whole-run blur);
+    // invisible at radii ≤ ~8px — switch to a run-level mask bake if large radii are ever needed.
+    fn bakeBlurredGlyph(self: *FreeTypeTextRenderer, bitmap: ft.FT_Bitmap, blur: f32, slot: ft.FT_GlyphSlot) !Glyph {
+        const sigma = blur * 0.5;
+        // Box radius r such that 3 passes ≈ Gaussian σ: 3 · r(r+1)/3 = σ².
+        const rf = (@sqrt(1.0 + 4.0 * sigma * sigma) - 1.0) * 0.5;
+        const r: u32 = @max(1, @as(u32, @intFromFloat(@round(rf))));
+        const pad: u32 = 3 * r; // each pass spreads at most r per side
+        const w: u32 = bitmap.width + 2 * pad;
+        const h: u32 = bitmap.rows + 2 * pad;
+        const len = @as(usize, w) * @as(usize, h);
+
+        const buf = try self.allocator.alloc(u8, len);
+        defer self.allocator.free(buf);
+        const tmp = try self.allocator.alloc(u8, len);
+        defer self.allocator.free(tmp);
+        @memset(buf, 0);
+
+        const pitch_abs: usize = if (bitmap.pitch < 0) @intCast(-bitmap.pitch) else @intCast(bitmap.pitch);
+        const src_base: [*]const u8 = @ptrCast(bitmap.buffer);
+        var row: usize = 0;
+        while (row < bitmap.rows) : (row += 1) {
+            const src_row_index = if (bitmap.pitch < 0) bitmap.rows - 1 - row else row;
+            const src_row = src_base + src_row_index * pitch_abs;
+            const dst_off = (@as(usize, pad) + row) * w + pad;
+            @memcpy(buf[dst_off .. dst_off + bitmap.width], src_row[0..bitmap.width]);
+        }
+
+        var pass: usize = 0;
+        while (pass < 3) : (pass += 1) {
+            boxBlurRows(buf, tmp, w, h, r);
+            boxBlurCols(tmp, buf, w, h, r);
+        }
+
+        const atlas_pos = blk: {
+            while (true) {
+                if (self.reserveAtlas(w, h)) |pos| {
+                    break :blk pos;
+                } else |_| {}
+                if (!self.tryGrowAtlas())
+                    break :blk try self.reserveAtlasAfterReset(w, h);
+            }
+        };
+
+        row = 0;
+        while (row < h) : (row += 1) {
+            const dst_offset = (@as(usize, atlas_pos.y) + row) * @as(usize, self.atlas_width) + @as(usize, atlas_pos.x);
+            @memcpy(self.atlas_pixels[dst_offset .. dst_offset + w], buf[row * @as(usize, w) ..][0..w]);
+        }
+        self.markAtlasDirty(atlas_pos.x, atlas_pos.y, w, h);
+
+        return Glyph{
+            .atlas_x = atlas_pos.x,
+            .atlas_y = atlas_pos.y,
+            .width = w,
+            .height = h,
+            .bearing_x = @as(f32, @floatFromInt(slot.*.bitmap_left)) - @as(f32, @floatFromInt(pad)),
+            .bearing_y = @as(f32, @floatFromInt(slot.*.bitmap_top)) + @as(f32, @floatFromInt(pad)),
+            .advance_x = @as(f32, @floatFromInt(slot.*.advance.x)) / 64.0,
+        };
     }
 
     fn resolveFace(self: *const FreeTypeTextRenderer, font_family: []const u8) ?ft.FT_Face {
@@ -2275,7 +2365,7 @@ pub const FreeTypeTextRenderer = struct {
         want_px: u16,
     ) ?EmojiRaster {
         const sel = emojiSelectSize(face, want_px) catch return null;
-        const key = glyphKey(emoji_family, glyph_index, sel.actual_px, .{});
+        const key = glyphKey(emoji_family, glyph_index, sel.actual_px, .{}, 0);
 
         if (self.color_glyphs.get(key)) |glyph| {
             return .{ .glyph = glyph, .scale = sel.scale };
@@ -2509,7 +2599,47 @@ fn isEmojiCodepoint(cp: u21) bool {
     };
 }
 
-fn glyphKey(font_family: []const u8, glyph_index: u32, size: u16, synth: Synth) u64 {
+/// One horizontal box-blur pass (window 2r+1, out-of-range treated as zero — matches the
+/// zero-padded scratch buffer bakeBlurredGlyph builds). Running-sum, O(w·h).
+fn boxBlurRows(src: []const u8, dst: []u8, w: u32, h: u32, r: u32) void {
+    const wu: usize = w;
+    const win: u32 = 2 * r + 1;
+    var y: usize = 0;
+    while (y < h) : (y += 1) {
+        const row = src[y * wu ..][0..wu];
+        const out = dst[y * wu ..][0..wu];
+        var sum: u32 = 0;
+        var i: usize = 0;
+        while (i < @min(r + 1, wu)) : (i += 1) sum += row[i];
+        var x: usize = 0;
+        while (x < wu) : (x += 1) {
+            out[x] = @intCast(sum / win);
+            if (x + r + 1 < wu) sum += row[x + r + 1];
+            if (x >= r) sum -= row[x - r];
+        }
+    }
+}
+
+/// Vertical counterpart of boxBlurRows.
+fn boxBlurCols(src: []const u8, dst: []u8, w: u32, h: u32, r: u32) void {
+    const wu: usize = w;
+    const hu: usize = h;
+    const win: u32 = 2 * r + 1;
+    var x: usize = 0;
+    while (x < wu) : (x += 1) {
+        var sum: u32 = 0;
+        var i: usize = 0;
+        while (i < @min(r + 1, hu)) : (i += 1) sum += src[i * wu + x];
+        var y: usize = 0;
+        while (y < hu) : (y += 1) {
+            dst[y * wu + x] = @intCast(sum / win);
+            if (y + r + 1 < hu) sum += src[(y + r + 1) * wu + x];
+            if (y >= r) sum -= src[(y - r) * wu + x];
+        }
+    }
+}
+
+fn glyphKey(font_family: []const u8, glyph_index: u32, size: u16, synth: Synth, blur_q: u16) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(font_family);
     hasher.update(std.mem.asBytes(&size));
@@ -2519,6 +2649,7 @@ fn glyphKey(font_family: []const u8, glyph_index: u32, size: u16, synth: Synth) 
         hasher.update(std.mem.asBytes(&strength));
         hasher.update(&[_]u8{@intFromBool(synth.oblique)});
     }
+    if (blur_q > 0) hasher.update(std.mem.asBytes(&blur_q));
     return hasher.final();
 }
 

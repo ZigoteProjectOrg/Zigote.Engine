@@ -610,8 +610,10 @@ const EngineState = struct {
     font_name_buf: [256]u8,
     font_name_len: usize,
     image_registry: std.AutoHashMap(u64, LoadedImage),
-    next_image_handle: u64,
-    /// Guards image_registry + next_image_handle so zigote_load_texture* can be called from a
+    /// One counter for every handle that can name a GPU texture — decoded images *and* render
+    /// textures, because both end up as keys in the one image cache. See `nextGpuHandle`.
+    next_gpu_handle: u64,
+    /// Guards image_registry + next_gpu_handle so zigote_load_texture* can be called from a
     /// worker thread while the render thread paints. Decoding a page-sized JPEG takes tens of
     /// milliseconds — far too long to sit on the frame loop.
     image_lock: SpinLock = .{},
@@ -681,7 +683,6 @@ const EngineState = struct {
 
     // ── Render textures ────────────────────────────────────────────────────────
     render_textures: std.AutoHashMap(u64, RenderTextureEntry),
-    next_rt_handle: u64,
     blur_requests: std.ArrayListUnmanaged(BlurRequest),
     gaussian_blur: ?wgpu_blur.GaussianBlur,
 
@@ -1260,7 +1261,7 @@ fn zigote_init_impl(
         .font_name_buf = undefined,
         .font_name_len = 0,
         .image_registry = std.AutoHashMap(u64, LoadedImage).init(allocator),
-        .next_image_handle = 1,
+        .next_gpu_handle = 1,
         .node_handles = std.AutoHashMap(u64, void).init(allocator),
         .selected_node_ptr = 0,
         .world = zg.World.init(allocator),
@@ -1279,7 +1280,6 @@ fn zigote_init_impl(
         .pending_scale = 1.0,
         .pending_dt = 0.0,
         .render_textures = std.AutoHashMap(u64, RenderTextureEntry).init(allocator),
-        .next_rt_handle = 1,
         .blur_requests = .empty,
         .gaussian_blur = null,
         .windows = std.AutoHashMap(u64, *SecondaryWindow).init(allocator),
@@ -2705,6 +2705,30 @@ fn fillPaintList(
                         cmd.pixels_ptr[0..cmd.pixels_len]
                     else
                         null;
+                // Text shadow rides in slots CMD_TEXT never used (rect = color, radius /
+                // border_width = offset, img_pixel_w = blur bitcast). Present iff alpha > 0;
+                // drawn as a second blurred text run underneath the real one.
+                if (cmd.rect_h > 0) {
+                    try current.appendOwnedText(alloc, .{
+                        .baseline_x = cmd.baseline_x + cmd.radius,
+                        .baseline_y = cmd.baseline_y + cmd.border_width,
+                        .text = text_slice,
+                        .color = zg.geometry.Color.rgba(
+                            @intFromFloat(std.math.clamp(cmd.rect_x * 255, 0, 255)),
+                            @intFromFloat(std.math.clamp(cmd.rect_y * 255, 0, 255)),
+                            @intFromFloat(std.math.clamp(cmd.rect_w * 255, 0, 255)),
+                            @intFromFloat(std.math.clamp(cmd.rect_h * 255, 0, 255)),
+                        ),
+                        .size = cmd.font_size,
+                        .line_height = cmd.line_height,
+                        .font_family = font_family,
+                        .font_weight = fw,
+                        .font_style = fs,
+                        .letter_spacing = cmd.letter_spacing,
+                        .word_spacing = cmd.word_spacing,
+                        .blur = @bitCast(cmd.img_pixel_w),
+                    });
+                }
                 try current.appendOwnedText(alloc, .{
                     .baseline_x = cmd.baseline_x,
                     .baseline_y = cmd.baseline_y,
@@ -4132,6 +4156,10 @@ export fn zigote_render_3d(handle: u64, width: u32, height: u32) u64 {
                 .texture = state.offscreen_3d_texture.?,
                 .texture_view = state.offscreen_3d_view.?,
                 .bind_group = bg,
+                // state.offscreen_3d_* owns these — the cache is only how a paint command reaches
+                // them by key.
+                .pinned = true,
+                .borrowed = true,
             }) catch {
                 bg.release();
             };
@@ -4156,6 +4184,8 @@ export fn zigote_render_3d(handle: u64, width: u32, height: u32) u64 {
                     .texture = state.offscreen_3d_texture.?,
                     .texture_view = state.offscreen_3d_view.?,
                     .bind_group = bg,
+                    .pinned = true,
+                    .borrowed = true,
                 }) catch {
                     bg.release();
                 };
@@ -4944,6 +4974,22 @@ export fn zigote_shutdown(handle: u64) void {
     // ponytail: intentional leak; refcount the handle if init/shutdown ever cycles in-process.
 }
 
+/// The next handle for anything that can end up as a key in `gpu_ui.image_cache`.
+///
+/// There is one counter because there is one cache. Images and render textures used to have a
+/// counter each, both starting at 1, and a paint command carries only the number — so image 1 and
+/// render texture 1 were the same slot: whichever registered last replaced the other's texture, and
+/// releasing the image released the render texture's GPU memory. It surfaced as an intermittent
+/// wgpu panic in the blur pass ("Texture[Id(15,1)] does not exist") one frame after a resize, which
+/// is where an app is most likely to drop an image and keep a render texture.
+fn nextGpuHandle(state: *EngineState) u64 {
+    state.image_lock.lock();
+    defer state.image_lock.unlock();
+    const handle = state.next_gpu_handle;
+    state.next_gpu_handle += 1;
+    return handle;
+}
+
 /// Take ownership of a decoded RGBA buffer and hand back the handle the paint stream refers to.
 /// Frees `bytes` and returns 0 if the registry cannot grow, so callers never leak on failure.
 fn registerImage(state: *EngineState, w: u32, h: u32, bytes: []u8) u64 {
@@ -4957,8 +5003,9 @@ fn registerImage(state: *EngineState, w: u32, h: u32, bytes: []u8) u64 {
         return 0;
     }
 
-    const img_handle = state.next_image_handle;
-    state.next_image_handle += 1;
+    // The counter itself, not nextGpuHandle: the lock is already held here and it is not reentrant.
+    const img_handle = state.next_gpu_handle;
+    state.next_gpu_handle += 1;
     state.image_registry.put(img_handle, .{
         .width = w,
         .height = h,
@@ -6072,6 +6119,9 @@ fn passRtPrepass(ctx: *PassContext) anyerror!void {
                 .texture = rt.texture,
                 .texture_view = rt.view,
                 .bind_group = bg,
+                // The RenderTextureEntry owns both; the cache only points at them.
+                .pinned = true,
+                .borrowed = true,
             }) catch bg.release();
         }
     }
@@ -6152,6 +6202,9 @@ fn passBlur(ctx: *PassContext) anyerror!void {
                     .texture = blur_tex,
                     .texture_view = blur_view,
                     .bind_group = bg,
+                    // Same owner as the unblurred entry above: rt.blur_texture / rt.blur_view.
+                    .pinned = true,
+                    .borrowed = true,
                 }) catch bg.release();
             }
         }
@@ -6219,6 +6272,8 @@ fn passScene3dBegin(ctx: *PassContext) anyerror!void {
                 .texture = state.offscreen_3d_texture.?,
                 .texture_view = state.offscreen_3d_view.?,
                 .bind_group = bg,
+                .pinned = true,
+                .borrowed = true,
             }) catch bg.release();
         }
     }
@@ -6479,8 +6534,9 @@ export fn zigote_render_texture_create(handle: u64, width: u32, height: u32) u64
         return 0;
     };
 
-    const rt_handle = state.next_rt_handle;
-    state.next_rt_handle += 1;
+    // From the shared counter: the handle doubles as this texture's key in the image cache, which
+    // decoded images key too. See nextGpuHandle.
+    const rt_handle = nextGpuHandle(state);
 
     state.render_textures.put(rt_handle, .{
         .width = width,
@@ -7169,6 +7225,39 @@ test "every audio FFI export takes audio_lock" {
 
     // A rename that silently matches nothing would otherwise make this test vacuously pass.
     try std.testing.expect(checked >= 40);
+}
+
+// Every GPU handle an app can hold — a decoded image, a render texture — is a key in the one image
+// cache, so they must come from the one counter. Two counters is what this was, both starting at 1,
+// and the collision stayed silent until it freed a live texture: whichever registered second
+// replaced the other's cache entry, and releasing the image released the render texture's GPU
+// memory, which surfaced as a wgpu panic in the blur pass a frame after a resize. Nothing about a
+// second counter looks wrong at the call site, and no test without a GPU can catch the consequence
+// — so the check is on the source, where adding one is visible.
+test "one counter hands out every GPU handle" {
+    const src = @embedFile("root.zig");
+    const decl = "\n    next_";
+
+    var counters: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, decl)) |found| {
+        at = found + decl.len;
+        // A field declaration is `    name: type,` — anything else on the line is not one.
+        const name_start = found + decl.len - "next_".len;
+        const colon = std.mem.indexOfScalarPos(u8, src, name_start, ':') orelse continue;
+        const name = src[name_start..colon];
+        if (std.mem.indexOfScalar(u8, name, ' ') != null) continue;
+        if (!std.mem.endsWith(u8, name, "_handle")) continue;
+
+        if (!std.mem.eql(u8, name, "next_gpu_handle")) {
+            std.debug.print("second GPU handle counter: {s}\n", .{name});
+            return error.SplitHandleSpace;
+        }
+        counters += 1;
+    }
+
+    // The counter must exist, or a rename makes this pass by matching nothing at all.
+    try std.testing.expectEqual(@as(usize, 1), counters);
 }
 
 // downsampleFromPixels reads the decoder's own buffer rather than a converted RGBA copy, so the

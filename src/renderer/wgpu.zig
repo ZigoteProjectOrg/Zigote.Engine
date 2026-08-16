@@ -64,6 +64,17 @@ pub const CachedImage = struct {
     /// upload. Unpinned entries are keyed by a hash of inline pixels that arrive again with every
     /// paint command, so re-uploading one is always possible.
     pinned: bool = false,
+    /// The texture and the view belong to something else — a render texture, the 3D offscreen
+    /// target — and this entry only points at them so a draw command can find them by key. Removing
+    /// the entry must then release the bind group and stop there: the owner frees the rest, and
+    /// freeing it here leaves the owner holding a dead handle.
+    ///
+    /// That is not hypothetical. Render-texture handles and image handles were counted separately
+    /// and both started at 1, so they named the same cache slot; releasing image 1 freed render
+    /// texture 1's GPU memory, and the next frame's blur pass died inside wgpu on a texture that no
+    /// longer existed. The two spaces are one counter now (see `nextGpuHandle`) — this flag is what
+    /// makes the ownership legible at the place where the sharing happens.
+    borrowed: bool = false,
 };
 
 pub const GpuUi = struct {
@@ -120,6 +131,24 @@ pub const GpuUi = struct {
     blit_vertex_buffer_size: usize = 0,
     scene_frame_width: u32 = 0,
     scene_frame_height: u32 = 0,
+    // Grow-only allocation for the scene/backdrop pair during live resizes. The textures are
+    // allocated at alloc dims (≥ frame dims, rounded up in AllocStep chunks while a drag grows the
+    // window) and the frame renders into their top-left frame-sized region via a viewport — so a
+    // resize drag reallocates the W×H×4 pair a handful of times instead of every frame. Once the
+    // size holds still for SettleFrames frames, the pair is re-created at the exact size, restoring
+    // the alloc == frame steady state every sampler is exact in.
+    scene_alloc_width: u32 = 0,
+    scene_alloc_height: u32 = 0,
+    scene_stable_frames: u32 = 0,
+    // The scene texture's pixels did not survive the last (re)allocation. Partial repaint replays
+    // damage rects over the preserved scene, which is garbage right after a realloc — the frame
+    // that observes this flag falls back to a full redraw and clears it. Size-change frames get a
+    // full redraw from the host anyway; this exists for the settle realloc, which happens at a
+    // STABLE size where the host has no reason to widen the damage itself.
+    scene_contents_lost: bool = false,
+    // UV extent currently written in the blit quad buffer (frame/alloc; 1,1 in steady state).
+    blit_quad_u1: f32 = 1.0,
+    blit_quad_v1: f32 = 1.0,
     custom_shader_pipelines: std.AutoHashMap(u32, *wgpu.RenderPipeline) = undefined,
     shader_effect_vertex_buffer: ?*wgpu.Buffer = null,
     shader_effect_vertex_buffer_size: usize = 0,
@@ -151,11 +180,11 @@ pub const GpuUi = struct {
         const atlas = self.text.atlasBytes();
         const surf_bpp: u64 = 4; // bgra8/rgba8 surface format
         const scene: u64 = if (self.scene_texture != null)
-            @as(u64, self.scene_frame_width) * self.scene_frame_height * surf_bpp
+            @as(u64, self.scene_alloc_width) * self.scene_alloc_height * surf_bpp
         else
             0;
         const backdrop: u64 = if (self.backdrop_texture != null)
-            @as(u64, self.scene_frame_width) * self.scene_frame_height * surf_bpp
+            @as(u64, self.scene_alloc_width) * self.scene_alloc_height * surf_bpp
         else
             0;
         const vbuf: u64 = self.shape_vertex_buffer_size + self.liquid_glass_vertex_buffer_size +
@@ -580,7 +609,10 @@ pub const GpuUi = struct {
     pub fn releaseCachedImage(self: *GpuUi, key: u64) bool {
         const kv = self.image_cache.fetchRemove(key) orelse return false;
         if (!kv.value.pinned and self.unpinned_cached > 0) self.unpinned_cached -= 1;
+        // The bind group is always ours — it is built here, per entry. The texture and view are only
+        // ours when the entry is not borrowed; see CachedImage.borrowed.
         kv.value.bind_group.release();
+        if (kv.value.borrowed) return true;
         kv.value.texture_view.release();
         kv.value.texture.release();
         return true;
@@ -801,6 +833,10 @@ pub fn renderFrame(
     var frame = FramePaint{};
     defer frame.deinit(scratch_allocator);
 
+    // Planned BEFORE buildFrameOps: shader-effect UVs normalize over the alloc extents, so the ops
+    // must be built against the dims ensureSceneTexture will materialize later this frame.
+    const alloc = planSceneAlloc(gpu_ui, frame_width, frame_height);
+
     try buildFrameOps(
         device,
         queue,
@@ -811,6 +847,8 @@ pub fn renderFrame(
         overlay_paint_list,
         @floatFromInt(frame_width),
         @floatFromInt(frame_height),
+        @floatFromInt(alloc.w),
+        @floatFromInt(alloc.h),
         scale_factor,
     );
 
@@ -832,16 +870,16 @@ pub fn renderFrame(
     var scene_view: *wgpu.TextureView = view;
     var scene_tex: ?*wgpu.Texture = null;
     if (!direct) {
-        try ensureSceneTexture(gpu_ui, device, frame_width, frame_height);
+        try ensureSceneTexture(gpu_ui, device, frame_width, frame_height, alloc);
         scene_view = gpu_ui.scene_texture_view orelse return error.WgpuTextureViewUnavailable;
         scene_tex = gpu_ui.scene_texture orelse return error.WgpuTextureUnavailable;
     }
-    // Strictly after ensureSceneTexture: a size change releases + nulls the backdrop trio there
-    // (scene and backdrop extents must match), so ensuring the backdrop first would validate a
-    // stale-size trio that the scene recreation is about to null — and the first resized frame
+    // Strictly after ensureSceneTexture: an allocation change releases + nulls the backdrop trio
+    // there (scene and backdrop extents must match), so ensuring the backdrop first would validate
+    // a stale-size trio that the scene recreation is about to null — and the first resized frame
     // with glass on screen would then fail with WgpuBackdropUnavailable. (has_backdrop ⇒ !direct,
     // so the scene branch above always ran.)
-    if (has_backdrop) try ensureBackdropTexture(gpu_ui, device, frame_width, frame_height);
+    if (has_backdrop) try ensureBackdropTexture(gpu_ui, device);
     const backdrop_tex = gpu_ui.backdrop_texture;
     const backdrop_bg = gpu_ui.backdrop_bind_group;
 
@@ -864,9 +902,10 @@ pub fn renderFrame(
     else
         wgpu.Color{ .r = 0.08, .g = 0.10, .b = 0.16, .a = 1.0 };
 
-    // Partial repaint: when C# supplied damage rects and this frame has no backdrop-sampling op (glass /
-    // custom shader needs the whole scene as a refraction source), preserve the persistent scene texture
-    // (loadOp=load) and redraw only the damaged rects. Otherwise clear + redraw the whole frame.
+    // Partial repaint: when C# supplied damage rects, preserve the persistent scene texture
+    // (loadOp=load) and redraw only the damaged rects — including any backdrop-sampling op a rect
+    // hits, which re-captures its refraction source mid-sweep (see replayFramePaintDamage).
+    // Otherwise clear + redraw the whole frame.
     //
     // CORRECTNESS CONTRACT: this relies on the framework's mandated opaque, full-screen root background
     // (op[0]; see the "Root background must be opaque" rule in the C# ThemeData/UiApp docs). Scissored to a
@@ -874,7 +913,10 @@ pub fn renderFrame(
     // the loaded (already-composited) pixels are discarded, not double-blended — and the animated clear
     // colour it covers is never visible, so no seam appears against the preserved region. An app that
     // violates this contract (non-opaque / non-full-screen root) should turn off `render.partial_repaint`.
-    if (damage.len > 0 and !has_backdrop) {
+    // scene_contents_lost: the texture was just (re)allocated, so the "preserved" pixels damage
+    // replay would composite over are garbage — the settle realloc is the case the host cannot
+    // know to widen damage for. One full redraw resets the persistence baseline.
+    if (damage.len > 0 and !gpu_ui.scene_contents_lost) {
         // Unreachable in direct mode: direct ⇒ !persistent_scene ⇒ the caller passes empty damage.
         try replayFramePaintDamage(
             encoder,
@@ -882,6 +924,8 @@ pub fn renderFrame(
             gpu_ui,
             &frame,
             uploaded,
+            scene_tex,
+            backdrop_tex,
             backdrop_bg,
             damage,
             scale_factor,
@@ -904,6 +948,9 @@ pub fn renderFrame(
             frame_height,
         );
     }
+    // Either path just repainted the full frame (or valid damage over intact contents) — the
+    // persistence baseline is whole again.
+    gpu_ui.scene_contents_lost = false;
 
     // Blit scene_texture -> swapchain. Skipped in direct mode — the ops were rendered straight into the
     // swapchain view above, so there is nothing to copy.
@@ -955,6 +1002,11 @@ fn buildFrameOps(
     overlay_paint_list: ?zg.PaintList,
     frame_width: f32,
     frame_height: f32,
+    // Extents of the backdrop texture shader-effect UVs normalize over — the scene ALLOCATION this
+    // frame will render with (== frame dims except while resize headroom is live; always frame
+    // dims for renderToTexture, whose targets are exact).
+    backdrop_width: f32,
+    backdrop_height: f32,
     scale_factor: f32,
 ) !void {
     var attempts: u32 = 0;
@@ -970,6 +1022,8 @@ fn buildFrameOps(
             paint_list,
             frame_width,
             frame_height,
+            backdrop_width,
+            backdrop_height,
             scale_factor,
         );
         if (overlay_paint_list) |overlay| {
@@ -984,6 +1038,8 @@ fn buildFrameOps(
                     overlay,
                     frame_width,
                     frame_height,
+                    backdrop_width,
+                    backdrop_height,
                     scale_factor,
                 );
             }
@@ -1161,17 +1217,27 @@ fn replayFramePaint(
     frame_width: u32,
     frame_height: u32,
 ) !void {
-    var pass = try beginScenePassClear(encoder, scene_view, clear);
+    var pass = try beginScenePassClear(encoder, scene_view, clear, frame_width, frame_height);
 
+    // One capture serves every consecutive backdrop-sampling op: the capture only goes stale when
+    // a NON-backdrop op has drawn into the scene since. Glass deliberately never refracts sibling
+    // glass — a blend group's overlapping shapes must read as one lens — so a backdrop op's own
+    // output never staled the capture either way, and skipping the copy also skips a full-frame
+    // texture copy plus a render-pass break per op, which is what made a row of glass capsules
+    // drop frames during live resizes.
+    var backdrop_fresh = false;
     for (frame.ops.items) |*op| {
         if (drawOpNeedsBackdrop(op.*)) {
-            const bt = backdrop_tex orelse return error.WgpuBackdropUnavailable;
-            const st = scene_tex orelse return error.WgpuTextureUnavailable;
-            pass.end();
-            pass.release();
-            copySceneToBackdrop(encoder, st, bt, frame_width, frame_height);
-            pass = try beginScenePassLoad(encoder, scene_view);
-        }
+            if (!backdrop_fresh) {
+                const bt = backdrop_tex orelse return error.WgpuBackdropUnavailable;
+                const st = scene_tex orelse return error.WgpuTextureUnavailable;
+                pass.end();
+                pass.release();
+                copySceneToBackdrop(encoder, st, bt, frame_width, frame_height);
+                pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
+                backdrop_fresh = true;
+            }
+        } else backdrop_fresh = false;
 
         try drawOp(
             pass,
@@ -1211,16 +1277,21 @@ fn replayFramePaintLoad(
     frame_width: u32,
     frame_height: u32,
 ) !void {
-    var pass = try beginScenePassLoad(encoder, scene_view);
+    var pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
 
+    // Same consecutive-op capture sharing as replayFramePaint — see the comment there.
+    var backdrop_fresh = false;
     for (frame.ops.items) |*op| {
         if (drawOpNeedsBackdrop(op.*)) {
-            const bt = backdrop_tex orelse return error.WgpuBackdropUnavailable;
-            pass.end();
-            pass.release();
-            copySceneToBackdrop(encoder, scene_tex, bt, frame_width, frame_height);
-            pass = try beginScenePassLoad(encoder, scene_view);
-        }
+            if (!backdrop_fresh) {
+                const bt = backdrop_tex orelse return error.WgpuBackdropUnavailable;
+                pass.end();
+                pass.release();
+                copySceneToBackdrop(encoder, scene_tex, bt, frame_width, frame_height);
+                pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
+                backdrop_fresh = true;
+            }
+        } else backdrop_fresh = false;
 
         try drawOp(
             pass,
@@ -1239,9 +1310,9 @@ fn replayFramePaintLoad(
     pass.release();
 }
 
-/// True if any op samples the scene as a backdrop (Liquid Glass / custom shader effect). Such ops need
-/// the whole current scene as a refraction source, so a frame containing one cannot be partially
-/// repainted — it falls back to the full clear + redraw path.
+/// True if any op samples the scene as a backdrop (Liquid Glass / custom shader effect). Gates the
+/// lazy backdrop-texture allocation and the direct-to-swapchain fast path; partial repaint handles
+/// these ops in-sweep (see replayFramePaintDamage), so it no longer forces a full redraw.
 fn frameHasBackdropOp(frame: *const FramePaint) bool {
     for (frame.ops.items) |op| {
         if (drawOpNeedsBackdrop(op)) return true;
@@ -1299,16 +1370,35 @@ fn aabbHitsDamage(aabb: zg.Rect, region: zg.Rect, scale_factor: f32) bool {
 
 /// Partial-repaint replay: preserve the persistent scene texture (loadOp=load) and redraw the frame's
 /// ops scissored to each damaged rect. Runs one op sweep per damage rect; because C# keeps the rects
-/// pairwise non-overlapping, no pixel is drawn twice (which for alpha-blended ops would be wrong). The
-/// caller guarantees the frame has no backdrop-sampling op, so there is no mid-pass backdrop barrier —
-/// every op is a pure draw, so skipping ops whose bounds miss a rect cannot desync any replay state.
+/// pairwise non-overlapping, no pixel is drawn twice (which for alpha-blended ops would be wrong).
+///
+/// Backdrop-sampling ops (Liquid Glass / custom shaders) participate too. One whose AABB misses
+/// every damage rect keeps its previous pixels — the scene texture persists, so skipping it is
+/// exact. When any rect DOES hit one, the sweep degrades to a single merged region: the union of
+/// all damage rects plus every hit backdrop op's full bounds (transitively, since the union can
+/// reach further glass). Glass never re-renders a partial patch of itself — patches rendered
+/// against backdrops from different frames disagree, and the seams read as smears of content that
+/// is no longer there (observed as a stale color band on the player bar). Inside the merged region
+/// the usual barrier applies (end pass → capture scene → resume), taken AFTER the ops under the
+/// glass redrew, so the refraction source is current everywhere the glass can tap. A ticking label
+/// inside a glass bar therefore costs a bar-sized redraw, not a full-window one.
+fn damageUnion(a: zg.Rect, b: zg.Rect) zg.Rect {
+    const x0 = @min(a.x, b.x);
+    const y0 = @min(a.y, b.y);
+    const x1 = @max(a.x + a.width, b.x + b.width);
+    const y1 = @max(a.y + a.height, b.y + b.height);
+    return .{ .x = x0, .y = y0, .width = x1 - x0, .height = y1 - y0 };
+}
 fn replayFramePaintDamage(
     encoder: *wgpu.CommandEncoder,
     scene_view: *wgpu.TextureView,
     gpu_ui: *GpuUi,
     frame: *const FramePaint,
     uploaded: UploadedFrameVertices,
-    // Never unwrapped: the caller only takes this path when !frameHasBackdropOp.
+    // Null only when the frame has no backdrop op — then no barrier ever runs and neither is
+    // unwrapped.
+    scene_tex: ?*wgpu.Texture,
+    backdrop_tex: ?*wgpu.Texture,
     backdrop_bind_group: ?*wgpu.BindGroup,
     damage: []const zg.Rect,
     scale_factor: f32,
@@ -1324,14 +1414,73 @@ fn replayFramePaintDamage(
         aabb.* = opDeviceAabb(frame, op, fw, fh);
     }
 
-    const pass = try beginScenePassLoad(encoder, scene_view);
+    // Glass involvement check — see the function doc. If any damage rect hits a backdrop op,
+    // collapse the sweep to ONE region: the union of every damage rect and every hit backdrop op's
+    // full logical bounds, iterated to a fixpoint because the growing union can reach further
+    // glass. One region also cannot overlap itself, so nothing double-blends.
+    var merged: ?zg.Rect = null;
+    {
+        var grew = true;
+        while (grew) {
+            grew = false;
+            for (frame.ops.items, aabbs) |*op, aabb| {
+                if (!drawOpNeedsBackdrop(op.*)) continue;
+                const bounds = aabb orelse continue;
+                const hit = blk: {
+                    if (merged) |m| break :blk aabbHitsDamage(bounds, m, scale_factor);
+                    for (damage) |region| {
+                        if (aabbHitsDamage(bounds, region, scale_factor)) break :blk true;
+                    }
+                    break :blk false;
+                };
+                if (!hit) continue;
+                // Device-space AABB → logical, since damage regions are logical.
+                const logical = zg.Rect{
+                    .x = bounds.x / scale_factor,
+                    .y = bounds.y / scale_factor,
+                    .width = bounds.width / scale_factor,
+                    .height = bounds.height / scale_factor,
+                };
+                var m = merged orelse blk: {
+                    var acc = damage[0];
+                    for (damage[1..]) |region| acc = damageUnion(acc, region);
+                    break :blk acc;
+                };
+                const before = m;
+                m = damageUnion(m, logical);
+                if (merged == null or m.x != before.x or m.y != before.y or
+                    m.width != before.width or m.height != before.height) grew = true;
+                merged = m;
+            }
+        }
+    }
+    // The merged region's edges are synthetic — device-space op AABBs divided by the scale — so
+    // unlike host damage rects they carry no inflation margin, and applyScissor's truncation of a
+    // fractional device edge would leave the region's last row/column stale every sweep (a visible
+    // hairline exactly on a glass bound under fractional display scales). One logical pixel of
+    // outset covers the truncated row and the AA fringe both; being a single region, there is no
+    // neighbouring sweep to double-blend with, and applyScissor's shrink-clamp keeps a negative
+    // origin from shifting the box.
+    if (merged) |*m| {
+        m.x -= 1;
+        m.y -= 1;
+        m.width += 2;
+        m.height += 2;
+    }
+    const sweep: []const zg.Rect = if (merged) |*m| m[0..1] else damage;
+
+    var pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
     defer {
         pass.end();
         pass.release();
     }
 
+    // Same capture-freshness rule as replayFramePaint: one capture serves consecutive backdrop
+    // ops; any other op drawn (in any region) stales it.
+    var backdrop_fresh = false;
+
     const debug_replay = std.c.getenv("ZIGOTE_DEBUG_REPLAY") != null;
-    for (damage) |region| {
+    for (sweep) |region| {
         var drawn: u32 = 0;
         var culled: u32 = 0;
         for (frame.ops.items, aabbs, 0..) |*op, aabb, op_idx| {
@@ -1344,6 +1493,17 @@ fn replayFramePaintDamage(
                 );
                 continue;
             }
+            if (drawOpNeedsBackdrop(op.*)) {
+                if (!backdrop_fresh) {
+                    const bt = backdrop_tex orelse return error.WgpuBackdropUnavailable;
+                    const st = scene_tex orelse return error.WgpuTextureUnavailable;
+                    pass.end();
+                    pass.release();
+                    copySceneToBackdrop(encoder, st, bt, frame_width, frame_height);
+                    pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
+                    backdrop_fresh = true;
+                }
+            } else backdrop_fresh = false;
             drawn += 1;
             try drawOp(
                 pass,
@@ -1382,6 +1542,8 @@ fn beginScenePassClear(
     encoder: *wgpu.CommandEncoder,
     scene_view: *wgpu.TextureView,
     clear: wgpu.Color,
+    frame_width: u32,
+    frame_height: u32,
 ) !*wgpu.RenderPassEncoder {
     const attachment = wgpu.ColorAttachment{
         .view = scene_view,
@@ -1393,12 +1555,19 @@ fn beginScenePassClear(
         .color_attachment_count = 1,
         .color_attachments = @ptrCast(&attachment),
     };
-    return encoder.beginRenderPass(&pass_descriptor) orelse error.WgpuRenderPassUnavailable;
+    const pass = encoder.beginRenderPass(&pass_descriptor) orelse return error.WgpuRenderPassUnavailable;
+    // The scene texture can be allocated larger than the frame (grow-only resize headroom); the
+    // viewport maps NDC onto the frame-sized top-left region so vertex math stays alloc-agnostic.
+    // Exactly the attachment when alloc == frame — the steady state — where this is a no-op.
+    pass.setViewport(0, 0, @floatFromInt(frame_width), @floatFromInt(frame_height), 0, 1);
+    return pass;
 }
 
 fn beginScenePassLoad(
     encoder: *wgpu.CommandEncoder,
     scene_view: *wgpu.TextureView,
+    frame_width: u32,
+    frame_height: u32,
 ) !*wgpu.RenderPassEncoder {
     const attachment = wgpu.ColorAttachment{
         .view = scene_view,
@@ -1410,7 +1579,10 @@ fn beginScenePassLoad(
         .color_attachment_count = 1,
         .color_attachments = @ptrCast(&attachment),
     };
-    return encoder.beginRenderPass(&pass_descriptor) orelse error.WgpuRenderPassUnavailable;
+    const pass = encoder.beginRenderPass(&pass_descriptor) orelse return error.WgpuRenderPassUnavailable;
+    // Same frame-region viewport as beginScenePassClear — see there.
+    pass.setViewport(0, 0, @floatFromInt(frame_width), @floatFromInt(frame_height), 0, 1);
+    return pass;
 }
 
 fn copySceneToBackdrop(
@@ -1681,6 +1853,8 @@ fn appendPaintOps(
     paint_list: zg.PaintList,
     frame_width: f32,
     frame_height: f32,
+    backdrop_width: f32,
+    backdrop_height: f32,
     scale_factor: f32,
 ) !void {
     // Scissor rect (intersection of the whole stack) + the active rounded-clip slot offset.
@@ -1815,6 +1989,8 @@ fn appendPaintOps(
                     se.params,
                     frame_width,
                     frame_height,
+                    backdrop_width,
+                    backdrop_height,
                 );
                 const added = frame.shader_effect_vertices.items.len - start_len;
                 try appendOrMergeShaderEffectOp(allocator, frame, .{
@@ -2201,21 +2377,78 @@ fn appendOrMergeShaderEffectOp(allocator: std.mem.Allocator, frame: *FramePaint,
     if (batch.vertex_count == 0) return;
     try frame.ops.append(allocator, .{ .shader_effect = batch });
 }
-/// Create (or size-track) the persistent scene texture + blit bind group. On a size change it also
-/// releases the backdrop trio and nulls it: scene and backdrop extents must stay in sync
-/// (copySceneToBackdrop is a full-texture copy), and the backdrop re-creates lazily at the new size
-/// the next time a frame actually contains a backdrop-sampling op (see ensureBackdropTexture).
+const SceneAlloc = struct { w: u32, h: u32 };
+
+/// Headroom granularity while a resize drag grows the window: allocation jumps to the next step
+/// boundary, so a drag reallocates once per step instead of once per frame.
+const scene_alloc_step: u32 = 256;
+
+/// Frames the size must hold still before the pair snaps back to the exact size. About a second —
+/// late enough that a paused drag doesn't thrash, early enough that the oversized margin (whose
+/// stale texels glass/blur taps can graze at the window's right/bottom edge) is a mid-drag
+/// transient rather than a steady state.
+const scene_settle_frames: u32 = 60;
+
+fn roundUpStep(v: u32) u32 {
+    return (v + scene_alloc_step - 1) / scene_alloc_step * scene_alloc_step;
+}
+
+/// Grow-only sizing policy for the scene/backdrop pair — see the field comments on GpuUi. Called
+/// once per frame BEFORE buildFrameOps (shader-effect UVs normalize over the alloc extents, so the
+/// ops must be built against the dims the textures will actually have), and ensureSceneTexture then
+/// materializes exactly what this returned. Ticks the settle counter, so once per frame only.
+fn planSceneAlloc(gpu_ui: *GpuUi, frame_width: u32, frame_height: u32) SceneAlloc {
+    // No texture yet (first frame, or a direct-mode window that never allocates one): exact size.
+    if (gpu_ui.scene_texture == null)
+        return .{ .w = frame_width, .h = frame_height };
+
+    if (frame_width != gpu_ui.scene_frame_width or frame_height != gpu_ui.scene_frame_height) {
+        gpu_ui.scene_stable_frames = 0;
+        // Still fits → keep the allocation, the viewport confines rendering to the frame region.
+        // Outgrew it → step up with headroom, never shrinking a dimension mid-drag (the settle
+        // pass trues both up once the drag ends).
+        if (frame_width <= gpu_ui.scene_alloc_width and frame_height <= gpu_ui.scene_alloc_height)
+            return .{ .w = gpu_ui.scene_alloc_width, .h = gpu_ui.scene_alloc_height };
+        return .{
+            .w = @max(roundUpStep(frame_width), gpu_ui.scene_alloc_width),
+            .h = @max(roundUpStep(frame_height), gpu_ui.scene_alloc_height),
+        };
+    }
+
+    // Stable size, exact allocation: the steady state.
+    if (gpu_ui.scene_alloc_width == frame_width and gpu_ui.scene_alloc_height == frame_height)
+        return .{ .w = frame_width, .h = frame_height };
+
+    // Stable size, oversized allocation: count down to the settle realloc.
+    gpu_ui.scene_stable_frames += 1;
+    if (gpu_ui.scene_stable_frames >= scene_settle_frames)
+        return .{ .w = frame_width, .h = frame_height };
+    return .{ .w = gpu_ui.scene_alloc_width, .h = gpu_ui.scene_alloc_height };
+}
+
+/// Create (or size-track) the persistent scene texture + blit bind group at the planned allocation.
+/// A frame-dims change within the same allocation rebuilds nothing — the viewport confines the next
+/// frame to the new sub-region. An allocation change releases the backdrop trio too: scene and
+/// backdrop allocations must stay in sync (the backdrop re-creates lazily at the new dims the next
+/// time a frame contains a backdrop-sampling op — see ensureBackdropTexture), and marks the scene's
+/// contents lost so partial repaint skips one frame.
 fn ensureSceneTexture(
     gpu_ui: *GpuUi,
     device: *wgpu.Device,
     frame_width: u32,
     frame_height: u32,
+    alloc: SceneAlloc,
 ) !void {
-    if (gpu_ui.scene_frame_width == frame_width and
-        gpu_ui.scene_frame_height == frame_height and
+    if (gpu_ui.scene_alloc_width == alloc.w and
+        gpu_ui.scene_alloc_height == alloc.h and
         gpu_ui.scene_texture != null and
         gpu_ui.scene_texture_view != null and
-        gpu_ui.blit_bind_group != null) return;
+        gpu_ui.blit_bind_group != null)
+    {
+        gpu_ui.scene_frame_width = frame_width;
+        gpu_ui.scene_frame_height = frame_height;
+        return;
+    }
 
     if (gpu_ui.blit_bind_group) |bg| bg.release();
     gpu_ui.blit_bind_group = null;
@@ -2234,7 +2467,7 @@ fn ensureSceneTexture(
         .label = wgpu.StringView.fromSlice("zigote scene texture"),
         .usage = wgpu.TextureUsages.render_attachment | wgpu.TextureUsages.copy_src | wgpu.TextureUsages.copy_dst | wgpu.TextureUsages.texture_binding,
         .dimension = .@"2d",
-        .size = .{ .width = frame_width, .height = frame_height, .depth_or_array_layers = 1 },
+        .size = .{ .width = alloc.w, .height = alloc.h, .depth_or_array_layers = 1 },
         .format = gpu_ui.surface_format,
         .mip_level_count = 1,
         .sample_count = 1,
@@ -2251,6 +2484,10 @@ fn ensureSceneTexture(
     gpu_ui.blit_bind_group = blit_bg;
     gpu_ui.scene_frame_width = frame_width;
     gpu_ui.scene_frame_height = frame_height;
+    gpu_ui.scene_alloc_width = alloc.w;
+    gpu_ui.scene_alloc_height = alloc.h;
+    gpu_ui.scene_stable_frames = 0;
+    gpu_ui.scene_contents_lost = true;
 }
 
 /// Lazily create the backdrop texture sampled by Liquid Glass / custom shader-effect ops. Callers
@@ -2260,18 +2497,19 @@ fn ensureSceneTexture(
 fn ensureBackdropTexture(
     gpu_ui: *GpuUi,
     device: *wgpu.Device,
-    frame_width: u32,
-    frame_height: u32,
 ) !void {
     if (gpu_ui.backdrop_texture != null and
         gpu_ui.backdrop_texture_view != null and
         gpu_ui.backdrop_bind_group != null) return;
 
+    // Sized to the scene ALLOCATION, not the frame: copySceneToBackdrop copies the frame-sized
+    // region, and glass shaders map fragment position → texel through textureDimensions, which
+    // only stays correct while both textures share their extents.
     const backdrop_tex = device.createTexture(&.{
         .label = wgpu.StringView.fromSlice("zigote backdrop texture"),
         .usage = wgpu.TextureUsages.texture_binding | wgpu.TextureUsages.copy_dst,
         .dimension = .@"2d",
-        .size = .{ .width = frame_width, .height = frame_height, .depth_or_array_layers = 1 },
+        .size = .{ .width = gpu_ui.scene_alloc_width, .height = gpu_ui.scene_alloc_height, .depth_or_array_layers = 1 },
         .format = gpu_ui.surface_format,
         .mip_level_count = 1,
         .sample_count = 1,
@@ -2336,28 +2574,30 @@ fn ensureRtSceneTexture(
 
 const blit_quad_size = @sizeOf(ImageVertex) * 4;
 
-/// Fullscreen quad in NDC (UV top-left=(0,0) bottom-right=(1,1)), corners TL,TR,BL,BR to match the
-/// shared quad index pattern. It is a compile-time constant — independent of frame size (the
-/// scissor handles that) — so upload it once into the persistent buffer and reuse it. `need_upload`
-/// is true exactly when ensureVertexBuffer will (re)create the buffer, so the constant is written
-/// on first use / after a device-recreation and skipped after.
-fn ensureBlitQuad(device: *wgpu.Device, queue: *wgpu.Queue, gpu_ui: *GpuUi) !*wgpu.Buffer {
+/// Fullscreen quad in NDC (UV top-left=(0,0) bottom-right=(u1,v1)), corners TL,TR,BL,BR to match
+/// the shared quad index pattern. u1/v1 = frame/alloc extents of the source texture — (1,1) except
+/// while the scene texture carries grow-only resize headroom — so the quad is rewritten only when
+/// that ratio (or the buffer itself) changes and stays a cached constant in the steady state.
+fn ensureBlitQuad(device: *wgpu.Device, queue: *wgpu.Queue, gpu_ui: *GpuUi, u_max: f32, v_max: f32) !*wgpu.Buffer {
     const need_upload = gpu_ui.blit_vertex_buffer == null or gpu_ui.blit_vertex_buffer_size < blit_quad_size;
     const vbuf = try ensureVertexBuffer(device, &gpu_ui.blit_vertex_buffer, &gpu_ui.blit_vertex_buffer_size, "zigote blit vertices", blit_quad_size);
-    if (need_upload) {
+    if (need_upload or gpu_ui.blit_quad_u1 != u_max or gpu_ui.blit_quad_v1 != v_max) {
         const verts = [_]ImageVertex{
             .{ .position = .{ -1.0, 1.0 }, .uv = .{ 0.0, 0.0 }, .color = .{ 255, 255, 255, 255 } },
-            .{ .position = .{ 1.0, 1.0 }, .uv = .{ 1.0, 0.0 }, .color = .{ 255, 255, 255, 255 } },
-            .{ .position = .{ -1.0, -1.0 }, .uv = .{ 0.0, 1.0 }, .color = .{ 255, 255, 255, 255 } },
-            .{ .position = .{ 1.0, -1.0 }, .uv = .{ 1.0, 1.0 }, .color = .{ 255, 255, 255, 255 } },
+            .{ .position = .{ 1.0, 1.0 }, .uv = .{ u_max, 0.0 }, .color = .{ 255, 255, 255, 255 } },
+            .{ .position = .{ -1.0, -1.0 }, .uv = .{ 0.0, v_max }, .color = .{ 255, 255, 255, 255 } },
+            .{ .position = .{ 1.0, -1.0 }, .uv = .{ u_max, v_max }, .color = .{ 255, 255, 255, 255 } },
         };
         queue.writeBuffer(vbuf, 0, std.mem.sliceAsBytes(&verts).ptr, blit_quad_size);
+        gpu_ui.blit_quad_u1 = u_max;
+        gpu_ui.blit_quad_v1 = v_max;
     }
     return vbuf;
 }
 
 /// Draw the fullscreen blit quad through the image pipeline with `blit_bg` as the source texture.
-/// Shared by the swapchain blit and the renderToTexture blit.
+/// Shared by the swapchain blit and the renderToTexture blit. `u1`/`v1` map the quad onto the
+/// frame-sized region of the source (1,1 for an exact-size source — see ensureBlitQuad).
 fn drawBlit(
     device: *wgpu.Device,
     queue: *wgpu.Queue,
@@ -2366,8 +2606,10 @@ fn drawBlit(
     blit_bg: *wgpu.BindGroup,
     frame_width: u32,
     frame_height: u32,
+    u_max: f32,
+    v_max: f32,
 ) !void {
-    const vbuf = try ensureBlitQuad(device, queue, gpu_ui);
+    const vbuf = try ensureBlitQuad(device, queue, gpu_ui, u_max, v_max);
     try ensureQuadIndexBuffer(device, queue, gpu_ui, 1);
     const index_buffer = gpu_ui.quad_index_buffer orelse return;
     // The image pipeline's layout includes the rounded-clip group; bind the disabled slot 0.
@@ -2391,7 +2633,11 @@ fn blitSceneToSwapchain(
     frame_height: u32,
 ) !void {
     const blit_bg = gpu_ui.blit_bind_group orelse return;
-    try drawBlit(device, queue, pass, gpu_ui, blit_bg, frame_width, frame_height);
+    // The scene texture may be oversized (grow-only resize headroom): sample only its frame region.
+    // Fragment centres land exactly on texel centres either way, so no epsilon is needed.
+    const u_max = @as(f32, @floatFromInt(frame_width)) / @as(f32, @floatFromInt(gpu_ui.scene_alloc_width));
+    const v_max = @as(f32, @floatFromInt(frame_height)) / @as(f32, @floatFromInt(gpu_ui.scene_alloc_height));
+    try drawBlit(device, queue, pass, gpu_ui, blit_bg, frame_width, frame_height, u_max, v_max);
 }
 
 fn appendShaderEffect(
@@ -2401,6 +2647,8 @@ fn appendShaderEffect(
     params: [8]f32,
     frame_width: f32,
     frame_height: f32,
+    backdrop_width: f32,
+    backdrop_height: f32,
 ) !void {
     if (bounds.width <= 0 or bounds.height <= 0) return;
 
@@ -2409,10 +2657,12 @@ fn appendShaderEffect(
     const x1 = (bounds.x + bounds.width) / frame_width * 2.0 - 1.0;
     const y1 = 1.0 - (bounds.y + bounds.height) / frame_height * 2.0;
 
-    const uv0_x = bounds.x / frame_width;
-    const uv0_y = bounds.y / frame_height;
-    const uv1_x = (bounds.x + bounds.width) / frame_width;
-    const uv1_y = (bounds.y + bounds.height) / frame_height;
+    // UVs normalize over the backdrop TEXTURE's extents, which can exceed the frame while the
+    // scene carries grow-only resize headroom (the content sits 1:1 in its top-left region).
+    const uv0_x = bounds.x / backdrop_width;
+    const uv0_y = bounds.y / backdrop_height;
+    const uv1_x = (bounds.x + bounds.width) / backdrop_width;
+    const uv1_y = (bounds.y + bounds.height) / backdrop_height;
 
     const pa = [4]f32{ params[0], params[1], params[2], params[3] };
     const pb = [4]f32{ params[4], params[5], params[6], params[7] };
@@ -3199,6 +3449,9 @@ pub fn renderFrameOverlayWithBaseTexture(
     var frame = FramePaint{};
     defer frame.deinit(scratch_allocator);
 
+    // Planned BEFORE buildFrameOps — see renderFrame.
+    const alloc = planSceneAlloc(gpu_ui, frame_width, frame_height);
+
     try buildFrameOps(
         device,
         queue,
@@ -3209,14 +3462,16 @@ pub fn renderFrameOverlayWithBaseTexture(
         null,
         @floatFromInt(frame_width),
         @floatFromInt(frame_height),
+        @floatFromInt(alloc.w),
+        @floatFromInt(alloc.h),
         scale_factor,
     );
 
     gpu_ui.text.uploadAtlasIfDirty(queue);
     gpu_ui.text.uploadColorAtlasIfDirty(queue);
 
-    try ensureSceneTexture(gpu_ui, device, frame_width, frame_height);
-    if (frameHasBackdropOp(&frame)) try ensureBackdropTexture(gpu_ui, device, frame_width, frame_height);
+    try ensureSceneTexture(gpu_ui, device, frame_width, frame_height, alloc);
+    if (frameHasBackdropOp(&frame)) try ensureBackdropTexture(gpu_ui, device);
     const scene_view = gpu_ui.scene_texture_view orelse return error.WgpuTextureViewUnavailable;
     const scene_tex = gpu_ui.scene_texture orelse return error.WgpuTextureUnavailable;
     const backdrop_tex = gpu_ui.backdrop_texture;
@@ -3282,6 +3537,9 @@ pub fn renderFrameOverlay(
     var frame = FramePaint{};
     defer frame.deinit(scratch_allocator);
 
+    // Planned BEFORE buildFrameOps — see renderFrame.
+    const alloc = planSceneAlloc(gpu_ui, frame_width, frame_height);
+
     try buildFrameOps(
         device,
         queue,
@@ -3292,6 +3550,8 @@ pub fn renderFrameOverlay(
         null,
         @floatFromInt(frame_width),
         @floatFromInt(frame_height),
+        @floatFromInt(alloc.w),
+        @floatFromInt(alloc.h),
         scale_factor,
     );
 
@@ -3302,8 +3562,8 @@ pub fn renderFrameOverlay(
     // backdrop because this API receives only a TextureView. We still use the
     // offscreen scene path so transparent UI composites correctly. Glass samples
     // previously drawn UI in this overlay pass, not the caller's 3D scene.
-    try ensureSceneTexture(gpu_ui, device, frame_width, frame_height);
-    if (frameHasBackdropOp(&frame)) try ensureBackdropTexture(gpu_ui, device, frame_width, frame_height);
+    try ensureSceneTexture(gpu_ui, device, frame_width, frame_height, alloc);
+    if (frameHasBackdropOp(&frame)) try ensureBackdropTexture(gpu_ui, device);
     const scene_view = gpu_ui.scene_texture_view orelse return error.WgpuTextureViewUnavailable;
     const scene_tex = gpu_ui.scene_texture orelse return error.WgpuTextureUnavailable;
     const backdrop_tex = gpu_ui.backdrop_texture;
@@ -3364,7 +3624,7 @@ pub fn renderToTexture(
     var frame = FramePaint{};
     defer frame.deinit(scratch_allocator);
 
-    try buildFrameOps(device, queue, scratch_allocator, &frame, gpu_ui, paint_list, null, @floatFromInt(width), @floatFromInt(height), scale_factor);
+    try buildFrameOps(device, queue, scratch_allocator, &frame, gpu_ui, paint_list, null, @floatFromInt(width), @floatFromInt(height), @floatFromInt(width), @floatFromInt(height), scale_factor);
 
     gpu_ui.text.uploadAtlasIfDirty(queue);
     gpu_ui.text.uploadColorAtlasIfDirty(queue);
@@ -3435,7 +3695,7 @@ pub fn renderToTexture(
             .color_attachments = @ptrCast(&attachment),
         }) orelse return error.RtBlitPassFailed;
         defer pass.release();
-        try drawBlit(device, queue, pass, gpu_ui, blit_bg, width, height);
+        try drawBlit(device, queue, pass, gpu_ui, blit_bg, width, height, 1.0, 1.0);
         pass.end();
     }
 

@@ -150,6 +150,9 @@ pub const Text = struct {
     word_spacing: f32 = 0,
     text_baseline: ?text_mod.TextBaseline = null,
     overflow: ?text_mod.TextOverflow = null,
+    /// Gaussian-ish blur radius in text units (CSS text-shadow semantics, radius ≈ 2σ).
+    /// 0 = sharp. Used for shadow passes; blurred glyphs bake into the atlas per blur bucket.
+    blur: f32 = 0,
 };
 
 pub const Image = struct {

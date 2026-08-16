@@ -54,7 +54,14 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   // ── Tunables ────────────────────────────────────────────────────────────────
   let IOR          = 1.5;    // index of refraction (1 = none, glass ≈ 1.5)
   let BEND         = 6.0;    // refraction reach: higher = content pulled further through the lens
-  let FROST        = 0.45;   // frosted-blur radius as a fraction of thickness (0 = clear lens)
+  let FROST_PX     = 4.0;    // frosted-blur radius through the middle of the pane, in pixels
+  let FROST_THICK  = 2.1;    // added radius per unit of slab thickness — the material's weight.
+                             // Most of the frost rides on this rather than on FROST_PX because
+                             // thickness arrives scaled by display density and a bare pixel count
+                             // does not: a HiDPI screen would otherwise frost a narrower band of
+                             // the same layout.
+  let FROST_RIM    = 1.8;    // how much wider the blur opens where the bevel lenses
+  let FROST_TAPS   = 20;     // spiral taps around the refracted point (+1 for the centre)
   let FRINGE       = 0.06;   // always-on prismatic dispersion at the rim (pinch adds to this)
   let SPEC_POWER   = 26.0;   // specular tightness (higher = smaller, sharper highlight)
   let SPEC_GAIN    = 0.85;   // specular brightness
@@ -89,16 +96,41 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   let disp = refr.xy * refr_len * inv_dims;
   let uvR = screen_uv + disp;
 
-  // ── Frosted refraction: a tiny Poisson disk around the refracted point. The radius opens up at
-  //    the rim, so the centre reads clear and the curved edge reads as ground glass (Apple's look).
-  //    Centre is double-weighted; 5 taps total. ──────────────────────────────────────────────────
-  let frost = (thickness * FROST) * (0.5 + edge) * inv_dims;
-  let c0 = textureSample(backdrop, backdrop_sampler, uvR).rgb;
-  let f1 = textureSample(backdrop, backdrop_sampler, uvR + vec2<f32>( 0.36,  0.85) * frost).rgb;
-  let f2 = textureSample(backdrop, backdrop_sampler, uvR + vec2<f32>(-0.80,  0.39) * frost).rgb;
-  let f3 = textureSample(backdrop, backdrop_sampler, uvR + vec2<f32>(-0.41, -0.86) * frost).rgb;
-  let f4 = textureSample(backdrop, backdrop_sampler, uvR + vec2<f32>( 0.86, -0.34) * frost).rgb;
-  let frosted = (c0 * 2.0 + f1 + f2 + f3 + f4) * (1.0 / 6.0);
+  // ── Frosted refraction: a gaussian blur of the backdrop, gathered in one pass around the
+  //    refracted point. This is the difference between glass and a translucent rectangle — Apple's
+  //    material blurs what is behind it far enough that text under the pane becomes a wash, and the
+  //    lensing at the rim is a bevel effect ON TOP of that, not the whole of it. The radius that
+  //    was here was a fraction of the slab thickness alone, which came out at about a pixel through
+  //    the middle of a pane: five taps of an almost-sharp backdrop, i.e. no frost at all.
+  //
+  //    The taps are a golden-angle spiral with area-uniform radii (r = √u, so the disk is evenly
+  //    covered rather than crowded at the centre) and gaussian weights in r² — 21 samples of that
+  //    reconstruct a σ ≈ radius/2 gaussian closely enough that no ghosting of hard edges survives.
+  //    A separable two-pass blur would be cheaper per pixel, but it needs a pass and a target of
+  //    its own; a pane is a small part of the frame, so gathering is the cheaper trade here.
+  //
+  //    textureSampleLevel, not textureSample: implicit-derivative sampling inside a loop is not
+  //    allowed in WGSL, and the mip is irrelevant when the backdrop is a full-resolution capture.
+  //    The spiral is rotated per pixel by interleaved gradient noise. Without it every pixel
+  //    shares one tap pattern, and at the radii a thick pane reaches (dozens of pixels) 21 shared
+  //    taps alias into smeary streaks that track the backdrop's edges — the classic sparse-kernel
+  //    clumping. Rotating the whole spiral by a screen-position hash decorrelates neighbours, so
+  //    the same 21 taps read as smooth frost with imperceptible fine grain. The angle depends on
+  //    nothing that moves, so the pattern is stable frame to frame — no shimmer.
+  let frost = (FROST_PX + thickness * FROST_THICK) * (1.0 + FROST_RIM * edge);
+  let ign = fract(52.9829189 * fract(dot(in.position.xy, vec2<f32>(0.06711056, 0.00583715))));
+  let spin = ign * 6.2831853;
+  var acc = textureSampleLevel(backdrop, backdrop_sampler, uvR, 0.0).rgb;
+  var w_sum = 1.0;
+  for (var i = 0; i < FROST_TAPS; i++) {
+    let u = (f32(i) + 0.5) / f32(FROST_TAPS);
+    let angle = f32(i) * 2.39996323 + spin;      // golden angle — no spokes at any tap count
+    let offset = vec2<f32>(cos(angle), sin(angle)) * (sqrt(u) * frost) * inv_dims;
+    let w = exp(-2.0 * u);                       // gaussian in r²: σ = frost / 2
+    acc += textureSampleLevel(backdrop, backdrop_sampler, uvR + offset, 0.0).rgb * w;
+    w_sum += w;
+  }
+  let frosted = acc / w_sum;
 
   // ── Chromatic dispersion: pull R/B apart along the refraction vector, ramped by `edge` so the
   //    prismatic fringe lives only on the rim. `pinch` lets a caller exaggerate it. ───────────────
