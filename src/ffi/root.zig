@@ -4756,6 +4756,73 @@ export fn zigote_window_set_title(handle: u64, window_handle: u64, title: [*c]co
     win.window.setTitle(title_slice) catch {};
 }
 
+/// Native parent handle of a window, for embedding platform child views (webviews, native
+/// controls) OVER the engine's surface — the overlay path: the host positions the child against
+/// widget layout each frame, and the child always draws above engine content.
+///
+/// out_kind: 0 = unavailable, 1 = Win32 (ptr1 = HWND), 2 = macOS (ptr1 = NSWindow*),
+/// 3 = X11 (ptr1 = Display*, ptr2 = Window), 4 = Wayland (ptr1 = wl_display*,
+/// ptr2 = wl_surface*), 5 = Android (ptr1 = ANativeWindow*), 6 = iOS (ptr1 = UIWindow*).
+///
+/// Wayland is reported for completeness only: a foreign toolkit's view cannot be parented into
+/// another client's wl_surface, so embedding on Linux needs the X11 driver (SDL_VIDEO_DRIVER=x11,
+/// which is XWayland on a Wayland desktop). Android attachment likewise goes through
+/// SDLActivity.getLayout() on the Java side rather than the ANativeWindow.
+/// window_handle 0 = the main window.
+export fn zigote_window_native_parent(handle: u64, window_handle: u64, out_kind: *u32, out_ptr1: *u64, out_ptr2: *u64) void {
+    out_kind.* = 0;
+    out_ptr1.* = 0;
+    out_ptr2.* = 0;
+    const state = stateFromHandle(handle) orelse return;
+    const window = if (window_handle == 0)
+        state.window
+    else if (windowFromHandle(state, window_handle)) |win|
+        win.window
+    else
+        return;
+    const props = sdl3.c.SDL_GetWindowProperties(window.value);
+
+    switch (@import("builtin").os.tag) {
+        .windows => {
+            const hwnd = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WIN32_HWND_POINTER, null) orelse return;
+            out_kind.* = 1;
+            out_ptr1.* = @intFromPtr(hwnd);
+        },
+        .macos => {
+            const nswindow = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, null) orelse return;
+            out_kind.* = 2;
+            out_ptr1.* = @intFromPtr(nswindow);
+        },
+        .ios => {
+            const uiwindow = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, null) orelse return;
+            out_kind.* = 6;
+            out_ptr1.* = @intFromPtr(uiwindow);
+        },
+        .linux => {
+            if (comptime @import("builtin").abi.isAndroid()) {
+                const a_window = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, null) orelse return;
+                out_kind.* = 5;
+                out_ptr1.* = @intFromPtr(a_window);
+                return;
+            }
+            // Same driver detection order as createNativeSurface: whichever SDL is actually on.
+            if (sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, null)) |wl_display| {
+                const wl_surface = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, null) orelse return;
+                out_kind.* = 4;
+                out_ptr1.* = @intFromPtr(wl_display);
+                out_ptr2.* = @intFromPtr(wl_surface);
+                return;
+            }
+            const x_display = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_X11_DISPLAY_POINTER, null) orelse return;
+            const x_window = sdl3.c.SDL_GetNumberProperty(props, sdl3.c.SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+            out_kind.* = 3;
+            out_ptr1.* = @intFromPtr(x_display);
+            out_ptr2.* = @intCast(x_window);
+        },
+        else => {},
+    }
+}
+
 /// Store a secondary window's paint commands for its next zigote_window_render.
 export fn zigote_window_submit_paint(
     handle: u64,
