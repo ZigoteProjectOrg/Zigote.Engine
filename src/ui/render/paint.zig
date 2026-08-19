@@ -78,6 +78,13 @@ pub const ShaderEffect = struct {
     bounds: geometry.Rect,
     shader_id: u32,
     params: [8]f32 = [_]f32{0} ** 8,
+    /// Optional app-owned texture handle bound at @group(1) — a LUT, a mask, a gradient ramp.
+    /// The pixels ride along (resolved from the image registry, exactly like Image) so the GPU
+    /// cache entry can be created on first use even though the texture is never drawn as an image.
+    image_key: ?u64 = null,
+    image_width: u32 = 0,
+    image_height: u32 = 0,
+    image_pixels: []const u8 = &.{},
 };
 
 pub const LiquidGlass = struct {

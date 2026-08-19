@@ -55,6 +55,14 @@ pub const ShaderEffectVertex = extern struct {
     params_b: [4]f32, // user params 4-7
 };
 
+/// A registered custom shader effect. wants_image is decided at registration — the WGSL declares
+/// @group(1) or it does not — and gates both the pipeline layout and the draw-time requirement
+/// that a batch actually carries an image bind group.
+pub const CustomShader = struct {
+    pipeline: *wgpu.RenderPipeline,
+    wants_image: bool,
+};
+
 pub const CachedImage = struct {
     texture: *wgpu.Texture,
     texture_view: *wgpu.TextureView,
@@ -149,7 +157,7 @@ pub const GpuUi = struct {
     // UV extent currently written in the blit quad buffer (frame/alloc; 1,1 in steady state).
     blit_quad_u1: f32 = 1.0,
     blit_quad_v1: f32 = 1.0,
-    custom_shader_pipelines: std.AutoHashMap(u32, *wgpu.RenderPipeline) = undefined,
+    custom_shader_pipelines: std.AutoHashMap(u32, CustomShader) = undefined,
     shader_effect_vertex_buffer: ?*wgpu.Buffer = null,
     shader_effect_vertex_buffer_size: usize = 0,
     // Shared quad index pattern for the text/image pipelines (both are pure quads) — see
@@ -551,7 +559,7 @@ pub const GpuUi = struct {
             .allocator = allocator,
             .image_cache = std.AutoHashMap(u64, CachedImage).init(allocator),
             .scratch = std.heap.ArenaAllocator.init(allocator),
-            .custom_shader_pipelines = std.AutoHashMap(u32, *wgpu.RenderPipeline).init(allocator),
+            .custom_shader_pipelines = std.AutoHashMap(u32, CustomShader).init(allocator),
         };
     }
 
@@ -619,9 +627,18 @@ pub const GpuUi = struct {
     }
 
     pub fn registerShader(self: *GpuUi, device: *wgpu.Device, id: u32, wgsl: []const u8) !void {
-        const pipeline = try createCustomShaderPipeline(device, self.backdrop_bgl, self.surface_format, wgsl);
-        const old = try self.custom_shader_pipelines.fetchPut(id, pipeline);
-        if (old) |kv| kv.value.release();
+        // The WGSL itself is the declaration: a shader that samples an app texture says
+        // @group(1), and the pipeline layout must match what the module declares.
+        const wants_image = std.mem.indexOf(u8, wgsl, "@group(1)") != null;
+        const pipeline = try createCustomShaderPipeline(
+            device,
+            self.backdrop_bgl,
+            if (wants_image) self.text.bindGroupLayout() else null,
+            self.surface_format,
+            wgsl,
+        );
+        const old = try self.custom_shader_pipelines.fetchPut(id, .{ .pipeline = pipeline, .wants_image = wants_image });
+        if (old) |kv| kv.value.pipeline.release();
     }
 
     pub fn deinit(self: *GpuUi) void {
@@ -638,7 +655,7 @@ pub const GpuUi = struct {
         if (self.clip_bind_group) |bg| bg.release();
         releaseBuffer(self.clip_buffer);
         var shader_it = self.custom_shader_pipelines.valueIterator();
-        while (shader_it.next()) |pipeline| pipeline.*.release();
+        while (shader_it.next()) |shader| shader.pipeline.release();
         self.custom_shader_pipelines.deinit();
         if (self.blit_bind_group) |bg| bg.release();
         if (self.backdrop_bind_group) |bg| bg.release();
@@ -727,6 +744,8 @@ pub const ShaderEffectBatch = struct {
     vertex_offset: u32,
     vertex_count: u32,
     clip_rect: ?zg.Rect,
+    /// Bound at @group(1) when the shader was registered wanting one (see CustomShader).
+    image_bind_group: ?*wgpu.BindGroup = null,
     // Carried for uniformity but NOT applied: custom shader-effect pipelines have a fixed,
     // user-facing bind-group contract (g0 = backdrop), so a rounded clip degrades to the
     // bounding-rect scissor here. Same fallback for liquid glass (its ShapeBatch offset is
@@ -1730,12 +1749,16 @@ fn drawShaderEffectOp(
 ) !void {
     if (batch.vertex_count == 0) return;
     const buffer = uploaded.shader_effect orelse return;
-    const pipeline = gpu_ui.custom_shader_pipelines.get(batch.shader_id) orelse return;
+    const shader = gpu_ui.custom_shader_pipelines.get(batch.shader_id) orelse return;
+    // A pipeline whose layout declares @group(1) cannot legally draw without it bound — a
+    // command that failed to resolve its texture is skipped, not drawn broken.
+    if (shader.wants_image and batch.image_bind_group == null) return;
     // Unreachable by construction — see drawLiquidGlassOp.
     const backdrop_bg = backdrop_bind_group orelse return;
     if (!applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height)) return;
-    pass.setPipeline(pipeline);
+    pass.setPipeline(shader.pipeline);
     pass.setBindGroup(0, backdrop_bg, 0, null);
+    if (shader.wants_image) pass.setBindGroup(1, batch.image_bind_group.?, 0, null);
     pass.setVertexBuffer(0, buffer, 0, uploaded.shader_effect_bytes_len);
     pass.draw(batch.vertex_count, 1, batch.vertex_offset, 0);
 }
@@ -1975,7 +1998,24 @@ fn appendPaintOps(
                 });
             },
 
-            .shader_effect => |se| {
+            .shader_effect => |se| shader_effect: {
+                // Resolve the optional @group(1) texture through the same cache the image path
+                // uses — createImageBatch caches an app-owned key as pinned, so a texture only
+                // ever referenced by shader effects (a LUT) still gets its GPU entry built here
+                // on first use. A key that cannot be materialized skips the op: drawing it would
+                // require a bind group that does not exist.
+                var image_bg: ?*wgpu.BindGroup = null;
+                if (se.image_key) |key| {
+                    const resolved = createImageBatch(device, queue, allocator, .{
+                        .bounds = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+                        .width = se.image_width,
+                        .height = se.image_height,
+                        .pixels = se.image_pixels,
+                        .cache_key = key,
+                    }, gpu_ui, null, 0) catch break :shader_effect;
+                    image_bg = resolved.bind_group;
+                }
+
                 const start_len = frame.shader_effect_vertices.items.len;
                 try appendShaderEffect(
                     allocator,
@@ -1999,6 +2039,7 @@ fn appendPaintOps(
                     .vertex_count = @intCast(added),
                     .clip_rect = current_clip,
                     .clip_offset = current_clip_offset,
+                    .image_bind_group = image_bg,
                 });
             },
 
@@ -2680,6 +2721,7 @@ fn appendShaderEffect(
 fn createCustomShaderPipeline(
     device: *wgpu.Device,
     backdrop_bgl: *wgpu.BindGroupLayout,
+    image_bgl: ?*wgpu.BindGroupLayout,
     format: wgpu.TextureFormat,
     wgsl: []const u8,
 ) !*wgpu.RenderPipeline {
@@ -2703,10 +2745,16 @@ fn createCustomShaderPipeline(
         .attributes = &attributes,
     };
 
+    var bgls = [2]*wgpu.BindGroupLayout{ backdrop_bgl, backdrop_bgl };
+    var bgl_count: usize = 1;
+    if (image_bgl) |bgl| {
+        bgls[1] = bgl;
+        bgl_count = 2;
+    }
     const pipeline_layout = device.createPipelineLayout(&.{
         .label = wgpu.StringView.fromSlice("zigote custom shader layout"),
-        .bind_group_layout_count = 1,
-        .bind_group_layouts = @ptrCast(&backdrop_bgl),
+        .bind_group_layout_count = bgl_count,
+        .bind_group_layouts = &bgls,
     }) orelse return error.WgpuPipelineUnavailable;
     defer pipeline_layout.release();
 

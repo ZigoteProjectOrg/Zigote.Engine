@@ -6,10 +6,12 @@
 //! two halves need a way to talk that does not mean growing a new FFI export per feature. This is
 //! that way: a name, a UTF-8 payload, and two directions.
 //!
-//! Deliberately not a serialization format. The payload is bytes; what they mean is between the
-//! two ends of a channel, and in practice is a short string or a small JSON object. A codec here
-//! would have to be implemented once per language on the native side, which is exactly the cost
-//! this is meant to avoid.
+//! Deliberately not a serialization format. The payload is bytes — carried with an explicit
+//! length, so binary data (an image, an audio clip) crosses as-is with no base64 detour; what the
+//! bytes mean is between the two ends of a channel, and in practice is a short string or a small
+//! JSON object. A codec here would have to be implemented once per language on the native side,
+//! which is exactly the cost this is meant to avoid. Payloads are NOT guaranteed NUL-terminated:
+//! a handler honors `payload_len`, never `strlen`.
 //!
 //! **Replies never allocate across the boundary.** A handler writes into a buffer the caller owns
 //! and returns the length, C-style. The alternative — returning a pointer — obliges every caller
@@ -21,18 +23,24 @@
 
 const std = @import("std");
 
-/// A native channel implementation. Reads `payload`, writes at most `reply_cap` bytes of reply into
-/// `reply`, and returns the reply length — or a negative value for "failed". Returning a length
-/// greater than `reply_cap` means the reply was truncated; the caller can retry with a bigger buffer.
+/// A native channel implementation. Reads `payload[0..payload_len]`, writes at most `reply_cap`
+/// bytes of reply into `reply`, and returns the reply length — or a negative value for "failed".
+/// Returning a length greater than `reply_cap` means the reply was truncated; the caller can retry
+/// with a bigger buffer.
 pub const Handler = *const fn (
     payload: [*c]const u8,
+    payload_len: usize,
     reply: [*c]u8,
     reply_cap: usize,
 ) callconv(.c) i32;
 
 /// Called on the managed side when native code sends on a channel. One receiver for all channels:
 /// the host already has a name-keyed dispatch table, and a second one here would only duplicate it.
-pub const Receiver = *const fn (name: [*c]const u8, payload: [*c]const u8) callconv(.c) void;
+pub const Receiver = *const fn (
+    name: [*c]const u8,
+    payload: [*c]const u8,
+    payload_len: usize,
+) callconv(.c) void;
 
 /// No allocator, so the registry is fixed. Thirty-two channels is far past what an app uses (a
 /// media session, notifications, permissions, share, lifecycle — five or six), and the cost of
@@ -93,7 +101,7 @@ fn find(name: []const u8) ?*Entry {
 /// Replacing rather than rejecting a duplicate is deliberate: on Android the process outlives the
 /// activity, so a relaunch re-registers every channel, and refusing the second registration would
 /// leave the channel pointing at a handler belonging to a dead instance.
-export fn zigote_channel_register(name: [*c]const u8, handler: *const fn (payload: [*c]const u8, reply: [*c]u8, reply_cap: usize) callconv(.c) i32) bool {
+export fn zigote_channel_register(name: [*c]const u8, handler: *const fn (payload: [*c]const u8, payload_len: usize, reply: [*c]u8, reply_cap: usize) callconv(.c) i32) bool {
     const key = span(name);
     if (key.len == 0 or key.len > max_name_len) return false;
 
@@ -138,6 +146,7 @@ export fn zigote_channel_unregister(name: [*c]const u8) void {
 export fn zigote_channel_invoke(
     name: [*c]const u8,
     payload: [*c]const u8,
+    payload_len: usize,
     reply: [*c]u8,
     reply_cap: usize,
 ) i32 {
@@ -147,7 +156,7 @@ export fn zigote_channel_invoke(
         const entry = find(span(name)) orelse return -1;
         break :blk entry.handler;
     };
-    return handler(payload, reply, reply_cap);
+    return handler(payload, payload_len, reply, reply_cap);
 }
 
 /// Whether a channel has a native implementation. Lets the host answer "can I do this here?"
@@ -160,7 +169,7 @@ export fn zigote_channel_has(name: [*c]const u8) bool {
 
 /// Install the managed receiver. Passing null detaches it, which is what shutdown does so a late
 /// send from a platform thread cannot reach a torn-down runtime.
-export fn zigote_channel_set_receiver(cb: ?*const fn (name: [*c]const u8, payload: [*c]const u8) callconv(.c) void) void {
+export fn zigote_channel_set_receiver(cb: ?*const fn (name: [*c]const u8, payload: [*c]const u8, payload_len: usize) callconv(.c) void) void {
     lock.lock();
     defer lock.unlock();
     receiver = cb;
@@ -171,25 +180,24 @@ export fn zigote_channel_set_receiver(cb: ?*const fn (name: [*c]const u8, payloa
 /// tell "nobody listening" from "delivered" and drop the work instead of queueing it forever.
 ///
 /// Callable from any thread. This is the entry point behind the Java/Kotlin, Swift and C++ sides.
-export fn zigote_channel_send(name: [*c]const u8, payload: [*c]const u8) bool {
+export fn zigote_channel_send(name: [*c]const u8, payload: [*c]const u8, payload_len: usize) bool {
     const cb = blk: {
         lock.lock();
         defer lock.unlock();
         break :blk receiver orelse return false;
     };
-    cb(name, payload orelse "");
+    cb(name, payload orelse "", if (payload == null) 0 else payload_len);
     return true;
 }
 
 test "register, invoke, replace and unregister" {
     const H = struct {
-        fn echo(payload: [*c]const u8, reply: [*c]u8, reply_cap: usize) callconv(.c) i32 {
-            const in = span(payload);
-            if (in.len > reply_cap) return @intCast(in.len);
-            @memcpy(reply[0..in.len], in);
-            return @intCast(in.len);
+        fn echo(payload: [*c]const u8, payload_len: usize, reply: [*c]u8, reply_cap: usize) callconv(.c) i32 {
+            if (payload_len > reply_cap) return @intCast(payload_len);
+            @memcpy(reply[0..payload_len], payload[0..payload_len]);
+            return @intCast(payload_len);
         }
-        fn constant(_: [*c]const u8, reply: [*c]u8, reply_cap: usize) callconv(.c) i32 {
+        fn constant(_: [*c]const u8, _: usize, reply: [*c]u8, reply_cap: usize) callconv(.c) i32 {
             if (reply_cap < 2) return 2;
             @memcpy(reply[0..2], "ok");
             return 2;
@@ -200,17 +208,22 @@ test "register, invoke, replace and unregister" {
     var buf: [32]u8 = undefined;
 
     // Unknown channel is distinguishable from a handler that replied with nothing.
-    try std.testing.expectEqual(@as(i32, -1), zigote_channel_invoke("nope", "x", &buf, buf.len));
+    try std.testing.expectEqual(@as(i32, -1), zigote_channel_invoke("nope", "x", 1, &buf, buf.len));
     try std.testing.expect(!zigote_channel_has("media"));
 
     try std.testing.expect(zigote_channel_register("media", H.echo));
     try std.testing.expect(zigote_channel_has("media"));
-    try std.testing.expectEqual(@as(i32, 5), zigote_channel_invoke("media", "hello", &buf, buf.len));
+    try std.testing.expectEqual(@as(i32, 5), zigote_channel_invoke("media", "hello", 5, &buf, buf.len));
     try std.testing.expectEqualStrings("hello", buf[0..5]);
+
+    // The length is authoritative, not any NUL — embedded zero bytes pass through intact.
+    const binary = [_]u8{ 1, 0, 2, 0, 3 };
+    try std.testing.expectEqual(@as(i32, 5), zigote_channel_invoke("media", &binary, binary.len, &buf, buf.len));
+    try std.testing.expectEqualSlices(u8, &binary, buf[0..5]);
 
     // Re-registering replaces, so an app relaunch cannot leave a dead handler installed.
     try std.testing.expect(zigote_channel_register("media", H.constant));
-    try std.testing.expectEqual(@as(i32, 2), zigote_channel_invoke("media", "hello", &buf, buf.len));
+    try std.testing.expectEqual(@as(i32, 2), zigote_channel_invoke("media", "hello", 5, &buf, buf.len));
     try std.testing.expectEqualStrings("ok", buf[0..2]);
 
     zigote_channel_unregister("media");
@@ -219,7 +232,7 @@ test "register, invoke, replace and unregister" {
 
 test "a reply larger than the buffer reports the length it needed" {
     const H = struct {
-        fn big(_: [*c]const u8, reply: [*c]u8, reply_cap: usize) callconv(.c) i32 {
+        fn big(_: [*c]const u8, _: usize, reply: [*c]u8, reply_cap: usize) callconv(.c) i32 {
             const text = "0123456789";
             if (reply_cap < text.len) return @intCast(text.len);
             @memcpy(reply[0..text.len], text);
@@ -229,25 +242,28 @@ test "a reply larger than the buffer reports the length it needed" {
     entry_count = 0;
     try std.testing.expect(zigote_channel_register("big", H.big));
     var small: [4]u8 = undefined;
-    try std.testing.expectEqual(@as(i32, 10), zigote_channel_invoke("big", "", &small, small.len));
+    try std.testing.expectEqual(@as(i32, 10), zigote_channel_invoke("big", "", 0, &small, small.len));
 }
 
 test "send reaches the receiver and reports when there is none" {
     const R = struct {
         var last_name: [32]u8 = @splat(0);
+        var last_len: usize = 0;
         var hits: usize = 0;
-        fn recv(name: [*c]const u8, _: [*c]const u8) callconv(.c) void {
+        fn recv(name: [*c]const u8, _: [*c]const u8, payload_len: usize) callconv(.c) void {
             const n = span(name);
             @memcpy(last_name[0..n.len], n);
+            last_len = payload_len;
             hits += 1;
         }
     };
     zigote_channel_set_receiver(null);
-    try std.testing.expect(!zigote_channel_send("transport", "next"));
+    try std.testing.expect(!zigote_channel_send("transport", "next", 4));
 
     zigote_channel_set_receiver(R.recv);
-    try std.testing.expect(zigote_channel_send("transport", "next"));
+    try std.testing.expect(zigote_channel_send("transport", "next", 4));
     try std.testing.expectEqual(@as(usize, 1), R.hits);
+    try std.testing.expectEqual(@as(usize, 4), R.last_len);
     try std.testing.expectEqualStrings("transport", R.last_name[0..9]);
     zigote_channel_set_receiver(null);
 }

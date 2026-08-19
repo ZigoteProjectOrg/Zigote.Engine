@@ -2830,6 +2830,25 @@ fn fillPaintList(
             },
             CMD_SHADER_EFFECT => {
                 const shader_id: u32 = @bitCast(cmd.radius);
+                // Optional @group(1) texture: same registry resolve as CMD_IMAGE, so the
+                // renderer can materialize the GPU entry even for a texture never drawn as an
+                // image (a LUT, a mask). Same locking rationale as there.
+                var image_key: ?u64 = null;
+                var image_pixels: []const u8 = &.{};
+                var image_w: u32 = 0;
+                var image_h: u32 = 0;
+                if (cmd.has_cache_key != 0) {
+                    const key = (@as(u64, cmd.cache_key_hi) << 32) | @as(u64, cmd.cache_key_lo);
+                    image_key = key;
+                    state.image_lock.lock();
+                    const found = state.image_registry.get(key);
+                    state.image_lock.unlock();
+                    if (found) |img| {
+                        image_pixels = img.pixels;
+                        image_w = img.width;
+                        image_h = img.height;
+                    }
+                }
                 try current.append(alloc, .{ .shader_effect = .{
                     .bounds = .{ .x = cmd.rect_x, .y = cmd.rect_y, .width = cmd.rect_w, .height = cmd.rect_h },
                     .shader_id = shader_id,
@@ -2837,6 +2856,10 @@ fn fillPaintList(
                         cmd.color_r,      cmd.color_g,    cmd.color_b,    cmd.color_a,
                         cmd.border_width, cmd.baseline_x, cmd.baseline_y, cmd.font_size,
                     },
+                    .image_key = image_key,
+                    .image_width = image_w,
+                    .image_height = image_h,
+                    .image_pixels = image_pixels,
                 } });
             },
             CMD_TEXT_LAYOUT => {
@@ -6566,6 +6589,94 @@ export fn zigote_render_texture_destroy(handle: u64, rt_handle: u64) void {
 export fn zigote_render_texture_cache_key(handle: u64, rt_handle: u64) u64 {
     _ = handle;
     return rt_handle; // cache_key == rt_handle by design
+}
+
+/// Read a render texture back as tightly-packed RGBA8, top-down, sRGB-encoded bytes — the closing
+/// end of a GPU image pipeline: paint sources and shader passes into the RT, render the frame, then
+/// pull the processed pixels out for encoding or export. Synchronous (blocks on the GPU copy), so it
+/// is a capture-time call, not a per-frame one. `out` must hold width*height*4 bytes.
+export fn zigote_render_texture_read_rgba(
+    handle: u64,
+    rt_handle: u64,
+    out_ptr: [*c]u8,
+    out_len: usize,
+) bool {
+    const state = stateFromHandle(handle) orelse return false;
+    const rt = state.render_textures.getPtr(rt_handle) orelse return false;
+    if (out_ptr == null) return false;
+
+    const w = rt.width;
+    const h = rt.height;
+    const needed = @as(usize, w) * @as(usize, h) * 4;
+    if (out_len < needed) return false;
+
+    const fmt = state.wgpu_config.format;
+    const is_bgra = (fmt == .bgra8_unorm or fmt == .bgra8_unorm_srgb);
+
+    // Same readback shape as captureTextureBmp: 256-aligned row stride, mapAsync + poll.
+    const unpadded: u32 = w * 4;
+    const padded: u32 = (unpadded + 255) & ~@as(u32, 255);
+    const buf_size: u64 = @as(u64, padded) * @as(u64, h);
+
+    const rb = state.device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("rt readback"),
+        .usage = wgpu.BufferUsages.map_read | wgpu.BufferUsages.copy_dst,
+        .size = buf_size,
+    }) orelse return false;
+    defer rb.release();
+
+    const encoder = state.device.createCommandEncoder(&.{}) orelse return false;
+    encoder.copyTextureToBuffer(
+        &.{ .texture = rt.texture, .mip_level = 0, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = .all },
+        &.{ .buffer = rb, .layout = .{ .offset = 0, .bytes_per_row = padded, .rows_per_image = h } },
+        &.{ .width = w, .height = h, .depth_or_array_layers = 1 },
+    );
+    const cmd = encoder.finish(&.{}) orelse {
+        encoder.release();
+        return false;
+    };
+    encoder.release();
+    state.queue.submit(&.{cmd});
+    cmd.release();
+
+    const MapCtx = struct { done: bool = false, ok: bool = false };
+    var mc = MapCtx{};
+    const cb = struct {
+        fn f(status: wgpu.MapAsyncStatus, _: wgpu.StringView, ud1: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+            const c: *MapCtx = @ptrCast(@alignCast(ud1.?));
+            c.done = true;
+            c.ok = (status == .success);
+        }
+    }.f;
+    _ = rb.mapAsync(wgpu.MapModes.read, 0, @intCast(buf_size), .{ .callback = cb, .userdata1 = &mc });
+    var guard: u32 = 0;
+    while (!mc.done and guard < 500000) : (guard += 1) {
+        _ = state.device.poll(true, null);
+    }
+    if (!mc.ok) return false;
+    const mapped = rb.getConstMappedRange(0, @intCast(buf_size)) orelse return false;
+    defer rb.unmap();
+    const src: [*]const u8 = @ptrCast(mapped);
+
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        const src_row = src + @as(usize, y) * padded;
+        const dst_row = out_ptr + @as(usize, y) * unpadded;
+        if (is_bgra) {
+            var x: u32 = 0;
+            while (x < w) : (x += 1) {
+                const s = src_row + @as(usize, x) * 4;
+                const d = dst_row + @as(usize, x) * 4;
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
+        } else {
+            @memcpy(dst_row[0..unpadded], src_row[0..unpadded]);
+        }
+    }
+    return true;
 }
 
 /// Convenience: begin + render + end in one call for simple use-cases.
