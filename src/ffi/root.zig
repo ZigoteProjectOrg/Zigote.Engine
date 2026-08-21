@@ -554,6 +554,20 @@ pub const LoadedImage = struct {
     /// empty slice therefore means "resident on the GPU", not "broken". Width/height stay valid
     /// either way, which is all the paint path needs after the first upload.
     pixels: []const u8,
+    /// Rows [dirty_y0, dirty_y1) handed over by zigote_update_texture_rgba{,_rows} and not yet
+    /// pushed to the GPU. Empty range = nothing pending.
+    dirty_y0: u32 = 0,
+    dirty_y1: u32 = 0,
+    /// Bytes per row of `pixels`; 0 = tightly packed (`width * 4`). Lets a producer with a padded
+    /// surface upload from its own memory instead of repacking every row.
+    stride: u32 = 0,
+    /// `pixels` are BGRA rather than RGBA — the texture is created in the matching format and the
+    /// sampler does the swap, so no CPU conversion pass exists at all.
+    bgra: bool = false,
+    /// Keep the CPU copy alive past its upload. Set by a partial update: patching rows into a
+    /// buffer that was just freed would mean reallocating and re-copying the whole frame, which
+    /// is exactly the cost the partial path exists to avoid.
+    retain: bool = false,
 };
 
 /// Upper bound on sub-rectangle partial-repaint damage regions per frame. Must match
@@ -610,6 +624,10 @@ const EngineState = struct {
     font_name_buf: [256]u8,
     font_name_len: usize,
     image_registry: std.AutoHashMap(u64, LoadedImage),
+    // Lazily-created shared Io backend for the single-file load paths — creating (and tearing
+    // down) a fresh Io.Threaded around every individual texture/file read was pure churn on the
+    // app-startup critical path. UI-thread use only.
+    io_threaded: ?std.Io.Threaded = null,
     /// One counter for every handle that can name a GPU texture — decoded images *and* render
     /// textures, because both end up as keys in the one image cache. See `nextGpuHandle`.
     next_gpu_handle: u64,
@@ -784,11 +802,23 @@ var live_engine: std.atomic.Value(u64) = .init(0);
 var resize_torture: ?bool = null;
 var resize_torture_tick: u32 = 0;
 
+// Cached env probes for the per-frame present path — getenv is a linear environ scan and both
+// logGpuMem and tryAutoCapture ran it every frame with the vars unset (same pattern as
+// resize_torture above).
+var gpu_mem_log_enabled: ?bool = null;
+var shot_enabled: ?bool = null;
+
 /// Cast an opaque C# handle back to an EngineState pointer.
 /// Returns null if the handle is 0, stale, or the engine is shutting down.
 inline fn stateFromHandle(handle: u64) ?*EngineState {
     if (handle == 0 or live_engine.load(.acquire) != handle) return null;
     return @ptrFromInt(handle);
+}
+
+/// Shared Io backend for single-file loads, created on first use (see EngineState.io_threaded).
+fn engineIo(state: *EngineState) std.Io {
+    if (state.io_threaded == null) state.io_threaded = std.Io.Threaded.init(state.allocator, .{});
+    return state.io_threaded.?.io();
 }
 
 /// Resolve a secondary-window handle, validating it against the live-window table so C# can never
@@ -1486,6 +1516,16 @@ export fn zigote_warp_mouse_in_window(handle: u64, x: f32, y: f32) void {
 /// Used by the C# frame loop to sleep instead of spinning when the UI is idle.
 export fn zigote_wait_events(timeout_ms: u32) void {
     _ = sdl3.events.waitTimeout(@intCast(timeout_ms));
+}
+
+/// Wake a thread blocked in zigote_wait_events immediately. Thread-safe (SDL_PushEvent is), and
+/// the pushed SDL_EVENT_USER is ignored by the poll conversion — its only job is ending the wait.
+/// Lets a worker-thread completion (App.Post) cut the idle wait short instead of riding out the
+/// frame-budget timeout.
+export fn zigote_wake_event_loop() void {
+    var ev: sdl3.c.SDL_Event = std.mem.zeroes(sdl3.c.SDL_Event);
+    ev.type = sdl3.c.SDL_EVENT_USER;
+    _ = sdl3.c.SDL_PushEvent(&ev);
 }
 
 /// The host callback zigote_run_app runs as the app's real main (single-shot; the process
@@ -2238,6 +2278,10 @@ export fn zigote_audio_stop_all(handle: u64) void {
 /// Age + reap fire-and-forget one-shots. Call once per frame from the host loop.
 export fn zigote_audio_update(handle: u64, dt: f32) void {
     const state = stateFromHandle(handle) orelse return;
+    // Null-check before the lock: this runs every frame of every app, and an app that never
+    // opened audio should not pay a spinlock acquire per frame. `audio` is only ever set once
+    // (lazy open on the UI thread) so the unlocked read can at worst miss one frame.
+    if (state.audio == null) return;
     state.audio_lock.lock();
     defer state.audio_lock.unlock();
     if (state.audio) |a| audio_ffi.update(a, dt);
@@ -2757,6 +2801,8 @@ fn fillPaintList(
                 var pixels: []const u8 = &.{};
                 var w = cmd.img_pixel_w;
                 var h = cmd.img_pixel_h;
+                var stride: u32 = 0;
+                var bgra = false;
 
                 const render3d_magic: u64 = 0x3D3D3D3D3D3D3D3D;
 
@@ -2777,6 +2823,8 @@ fn fillPaintList(
                         pixels = cached_img.pixels;
                         w = cached_img.width;
                         h = cached_img.height;
+                        stride = cached_img.stride;
+                        bgra = cached_img.bgra;
                     } else if (key == render3d_magic) {
                         // 3D offscreen texture — lives in gpu_ui.image_cache, not
                         // image_registry. Pass through with empty pixels; the wgpu
@@ -2796,6 +2844,8 @@ fn fillPaintList(
                     .width = w,
                     .height = h,
                     .pixels = pixels,
+                    .stride = stride,
+                    .bgra = bgra,
                     .cache_key = cache_key,
                     .u0 = cmd.radius,
                     .v0 = cmd.border_width,
@@ -3385,9 +3435,7 @@ export fn zigote_sprites_texture_create_file(handle: u64, path_c: [*c]const u8, 
     const g = ensure3d(state) orelse return 0;
     const path = std.mem.span(path_c);
 
-    var io_state = std.Io.Threaded.init(state.allocator, .{});
-    defer io_state.deinit();
-    const io = io_state.io();
+    const io = engineIo(state);
 
     const file_data = std.Io.Dir.cwd().readFileAlloc(io, path, state.allocator, .limited(1024 * 1024 * 64)) catch return 0;
     defer state.allocator.free(file_data);
@@ -3614,9 +3662,7 @@ export fn zigote_scene_set_mesh_texture_file(handle: u64, node_handle: u64, path
 
     const path = std.mem.span(path_c);
 
-    var io_state = std.Io.Threaded.init(state.allocator, .{});
-    defer io_state.deinit();
-    const io = io_state.io();
+    const io = engineIo(state);
 
     const file_data = std.Io.Dir.cwd().readFileAlloc(io, path, state.allocator, .limited(1024 * 1024 * 256)) catch |err| {
         std.log.err("zigote: base-color texture read failed for '{s}': {}", .{ path, err });
@@ -3670,9 +3716,7 @@ export fn zigote_scene_set_mesh_mr_texture_file(handle: u64, node_handle: u64, p
 
     const path = std.mem.span(path_c);
 
-    var io_state = std.Io.Threaded.init(state.allocator, .{});
-    defer io_state.deinit();
-    const io = io_state.io();
+    const io = engineIo(state);
 
     const file_data = std.Io.Dir.cwd().readFileAlloc(io, path, state.allocator, .limited(1024 * 1024 * 64)) catch return;
     defer state.allocator.free(file_data);
@@ -3715,9 +3759,7 @@ export fn zigote_scene_set_mesh_normal_texture_file(handle: u64, node_handle: u6
 
     const path = std.mem.span(path_c);
 
-    var io_state = std.Io.Threaded.init(state.allocator, .{});
-    defer io_state.deinit();
-    const io = io_state.io();
+    const io = engineIo(state);
 
     const file_data = std.Io.Dir.cwd().readFileAlloc(io, path, state.allocator, .limited(1024 * 1024 * 64)) catch return;
     defer state.allocator.free(file_data);
@@ -3759,9 +3801,7 @@ export fn zigote_scene_set_mesh_emissive_texture_file(handle: u64, node_handle: 
 
     const path = std.mem.span(path_c);
 
-    var io_state = std.Io.Threaded.init(state.allocator, .{});
-    defer io_state.deinit();
-    const io = io_state.io();
+    const io = engineIo(state);
 
     const file_data = std.Io.Dir.cwd().readFileAlloc(io, path, state.allocator, .limited(1024 * 1024 * 64)) catch return;
     defer state.allocator.free(file_data);
@@ -4329,9 +4369,7 @@ fn captureTextureBmp(state: *EngineState, tex: *wgpu.Texture, path: []const u8) 
     }
     rb.unmap();
 
-    var io_state = std.Io.Threaded.init(state.allocator, .{});
-    defer io_state.deinit();
-    const io = io_state.io();
+    const io = engineIo(state);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out }) catch return false;
     return true;
 }
@@ -4380,7 +4418,9 @@ export fn zigote_debug_gpu_allocated_bytes(handle: u64) u64 {
 /// Set ZIGOTE_GPU_MEM=1 to log the Metal device allocation + the renderer's own target breakdown
 /// every 120 frames. Pure diagnostics; no effect when the env var is unset.
 fn logGpuMem(state: *EngineState) void {
-    if (std.c.getenv("ZIGOTE_GPU_MEM") == null) return;
+    if (gpu_mem_log_enabled == null)
+        gpu_mem_log_enabled = std.c.getenv("ZIGOTE_GPU_MEM") != null;
+    if (gpu_mem_log_enabled == false) return;
     if (state.frame_index % 120 != 0) return;
     const mb: f64 = 1024.0 * 1024.0;
     const total = MetalMem.allocatedBytes();
@@ -4429,6 +4469,8 @@ fn logGpuMem(state: *EngineState) void {
 
 fn tryAutoCapture(state: *EngineState) void {
     if (g_shot_done) return;
+    if (shot_enabled == null) shot_enabled = std.c.getenv("ZIGOTE_SHOT") != null;
+    if (shot_enabled == false) return;
     const path_c = std.c.getenv("ZIGOTE_SHOT") orelse return;
     const path = std.mem.span(path_c);
     var target: u32 = 120;
@@ -4962,6 +5004,8 @@ export fn zigote_shutdown(handle: u64) void {
     // stateFromHandle. Anyone already past the gate is drained by taking image_lock below.
     live_engine.store(0, .release);
 
+    if (state.io_threaded) |*io_t| io_t.deinit();
+
     // Secondary windows first — they borrow the shared device/queue released below.
     {
         var win_it = state.windows.valueIterator();
@@ -5083,6 +5127,11 @@ fn nextGpuHandle(state: *EngineState) u64 {
 /// Take ownership of a decoded RGBA buffer and hand back the handle the paint stream refers to.
 /// Frees `bytes` and returns 0 if the registry cannot grow, so callers never leak on failure.
 fn registerImage(state: *EngineState, w: u32, h: u32, bytes: []u8) u64 {
+    return registerImageEx(state, w, h, bytes, 0, false);
+}
+
+/// registerImage for a producer whose rows are padded, BGRA, or both.
+fn registerImageEx(state: *EngineState, w: u32, h: u32, bytes: []u8, stride: u32, bgra: bool) u64 {
     state.image_lock.lock();
     defer state.image_lock.unlock();
 
@@ -5100,6 +5149,8 @@ fn registerImage(state: *EngineState, w: u32, h: u32, bytes: []u8) u64 {
         .width = w,
         .height = h,
         .pixels = bytes,
+        .stride = stride,
+        .bgra = bgra,
     }) catch {
         state.allocator.free(bytes);
         return 0;
@@ -5173,6 +5224,12 @@ fn drainImageReleases(state: *EngineState) void {
     // Detach the pending list under the lock before iterating: zigote_release_texture appends from
     // worker threads (widget disposers), and an append mid-iteration reallocates under our feet.
     state.image_lock.lock();
+    // Steady-state fast path: nothing released this frame — don't toOwnedSlice an empty list
+    // (which frees + re-grows its backing allocation around every burst).
+    if (state.pending_image_releases.items.len == 0) {
+        state.image_lock.unlock();
+        return;
+    }
     const keys = state.pending_image_releases.toOwnedSlice(state.allocator) catch {
         state.image_lock.unlock();
         return; // OOM: keep the list intact, retry next frame
@@ -5199,9 +5256,7 @@ export fn zigote_load_texture(handle: u64, path_c: [*c]const u8, out_w: *u32, ou
     if (path_c == null) return 0;
     const path = std.mem.span(path_c);
 
-    var io_state = std.Io.Threaded.init(state.allocator, .{});
-    defer io_state.deinit();
-    const io = io_state.io();
+    const io = engineIo(state);
 
     const file_data = std.Io.Dir.cwd().readFileAlloc(io, path, state.allocator, .limited(1024 * 1024 * 64)) catch return 0;
     defer state.allocator.free(file_data);
@@ -5223,9 +5278,7 @@ export fn zigote_load_texture_mask(handle: u64, path_c: [*c]const u8, out_w: *u3
     if (path_c == null) return 0;
     const path = std.mem.span(path_c);
 
-    var io_state = std.Io.Threaded.init(state.allocator, .{});
-    defer io_state.deinit();
-    const io = io_state.io();
+    const io = engineIo(state);
 
     const file_data = std.Io.Dir.cwd().readFileAlloc(io, path, state.allocator, .limited(1024 * 1024 * 64)) catch return 0;
     defer state.allocator.free(file_data);
@@ -5336,6 +5389,59 @@ fn downsampleRgba(allocator: std.mem.Allocator, src: []const u8, w: u32, h: u32,
 /// One source pixel as RGBA8, straight out of whatever the decoder produced. Covers the formats
 /// photographic content actually arrives in; anything exotic returns null and the caller falls back
 /// to converting the whole image first.
+/// Read one pixel from a CONCRETE payload slice — comptime-typed, so the format branch resolves
+/// at compile time (see the inline switch in downsampleFromPixels).
+inline fn sampleTyped(p: anytype, i: usize) [4]u32 {
+    const E = @TypeOf(p[0]);
+    if (@hasField(E, "a")) return .{ p[i].r, p[i].g, p[i].b, p[i].a };
+    if (@hasField(E, "alpha")) return .{ p[i].value, p[i].value, p[i].value, p[i].alpha };
+    if (@hasField(E, "value")) return .{ p[i].value, p[i].value, p[i].value, 255 };
+    return .{ p[i].r, p[i].g, p[i].b, 255 };
+}
+
+/// The box-filter double loop of downsampleFromPixels, monomorphized per pixel format.
+fn boxDownsample(p: anytype, dst: []u8, w: u32, h: u32, dw: u32, dh: u32, bx: f32, by: f32) void {
+    var dy: u32 = 0;
+    while (dy < dh) : (dy += 1) {
+        const sy0: u32 = @intFromFloat(@as(f32, @floatFromInt(dy)) * by);
+        var sy1: u32 = @intFromFloat(@as(f32, @floatFromInt(dy + 1)) * by);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > h) sy1 = h;
+        var dx: u32 = 0;
+        while (dx < dw) : (dx += 1) {
+            const sx0: u32 = @intFromFloat(@as(f32, @floatFromInt(dx)) * bx);
+            var sx1: u32 = @intFromFloat(@as(f32, @floatFromInt(dx + 1)) * bx);
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx1 > w) sx1 = w;
+
+            var r: u32 = 0;
+            var g: u32 = 0;
+            var b: u32 = 0;
+            var a: u32 = 0;
+            var yy: u32 = sy0;
+            while (yy < sy1) : (yy += 1) {
+                const row = @as(usize, yy) * @as(usize, w);
+                var xx: u32 = sx0;
+                while (xx < sx1) : (xx += 1) {
+                    const px = sampleTyped(p, row + @as(usize, xx));
+                    r += px[0];
+                    g += px[1];
+                    b += px[2];
+                    a += px[3];
+                }
+            }
+
+            var n: u32 = (sy1 - sy0) * (sx1 - sx0);
+            if (n == 0) n = 1;
+            const di = (@as(usize, dy) * @as(usize, dw) + @as(usize, dx)) * 4;
+            dst[di] = @intCast(r / n);
+            dst[di + 1] = @intCast(g / n);
+            dst[di + 2] = @intCast(b / n);
+            dst[di + 3] = @intCast(a / n);
+        }
+    }
+}
+
 inline fn samplePixel(pixels: *const zigimg.color.PixelStorage, i: usize) ?[4]u32 {
     return switch (pixels.*) {
         .rgba32 => |p| .{ p[i].r, p[i].g, p[i].b, p[i].a },
@@ -5374,44 +5480,21 @@ fn downsampleFromPixels(allocator: std.mem.Allocator, pixels: *const zigimg.colo
     const bx = fw / @as(f32, @floatFromInt(dw));
     const by = fh / @as(f32, @floatFromInt(dh));
 
-    var dy: u32 = 0;
-    while (dy < dh) : (dy += 1) {
-        const sy0: u32 = @intFromFloat(@as(f32, @floatFromInt(dy)) * by);
-        var sy1: u32 = @intFromFloat(@as(f32, @floatFromInt(dy + 1)) * by);
-        if (sy1 <= sy0) sy1 = sy0 + 1;
-        if (sy1 > h) sy1 = h;
-        var dx: u32 = 0;
-        while (dx < dw) : (dx += 1) {
-            const sx0: u32 = @intFromFloat(@as(f32, @floatFromInt(dx)) * bx);
-            var sx1: u32 = @intFromFloat(@as(f32, @floatFromInt(dx + 1)) * bx);
-            if (sx1 <= sx0) sx1 = sx0 + 1;
-            if (sx1 > w) sx1 = w;
-
-            var r: u32 = 0;
-            var g: u32 = 0;
-            var b: u32 = 0;
-            var a: u32 = 0;
-            var n: u32 = 0;
-            var yy: u32 = sy0;
-            while (yy < sy1) : (yy += 1) {
-                const row = @as(usize, yy) * @as(usize, w);
-                var xx: u32 = sx0;
-                while (xx < sx1) : (xx += 1) {
-                    const px = samplePixel(pixels, row + @as(usize, xx)) orelse continue;
-                    r += px[0];
-                    g += px[1];
-                    b += px[2];
-                    a += px[3];
-                    n += 1;
-                }
-            }
-            if (n == 0) n = 1;
-            const di = (@as(usize, dy) * @as(usize, dw) + @as(usize, dx)) * 4;
-            dst[di] = @intCast(r / n);
-            dst[di + 1] = @intCast(g / n);
-            dst[di + 2] = @intCast(b / n);
-            dst[di + 3] = @intCast(a / n);
-        }
+    // Dispatch the union tag ONCE and run a monomorphized loop per format: re-switching inside
+    // samplePixel for every source pixel of a full-size image (millions for a large JPEG) was the
+    // dominant cost, and the branchy optional defeated vectorization of the accumulate.
+    switch (pixels.*) {
+        inline .rgba32, .rgb24, .bgra32, .bgr24, .grayscale8, .grayscale8Alpha => |p| boxDownsample(
+            p,
+            dst,
+            w,
+            h,
+            dw,
+            dh,
+            bx,
+            by,
+        ),
+        else => unreachable, // the samplePixel(pixels, 0) probe above filtered unknown formats
     }
 
     return ScaledImage{ .pixels = dst, .width = dw, .height = dh };
@@ -5574,14 +5657,33 @@ export fn zigote_load_texture_from_rgba(
     width: u32,
     height: u32,
 ) u64 {
+    return zigote_load_texture_from_pixels(handle, pixels_ptr, pixels_len, width, height, 0, false);
+}
+
+/// zigote_load_texture_from_rgba for a producer that owns its layout: `stride` is its bytes per row
+/// (0 = tightly packed) and `bgra` says the bytes are B,G,R,A. Both are free — the stride goes
+/// straight into the GPU copy and the channel order into the texture format — which is what lets a
+/// Cairo/GTK surface (padded rows, BGRA) upload with no conversion pass and no repacking at all.
+export fn zigote_load_texture_from_pixels(
+    handle: u64,
+    pixels_ptr: [*c]const u8,
+    pixels_len: usize,
+    width: u32,
+    height: u32,
+    stride: u32,
+    bgra: bool,
+) u64 {
     const state = stateFromHandle(handle) orelse return 0;
     if (pixels_ptr == null or width == 0 or height == 0) return 0;
 
-    const expected_len = @as(usize, width) * @as(usize, height) * 4;
+    const row_bytes = @as(usize, width) * 4;
+    const row_stride = if (stride != 0) @as(usize, stride) else row_bytes;
+    if (row_stride < row_bytes) return 0;
+    const expected_len = row_stride * @as(usize, height);
     if (pixels_len < expected_len) return 0;
 
     const copy = state.allocator.dupe(u8, pixels_ptr[0..expected_len]) catch return 0;
-    return registerImage(state, width, height, copy);
+    return registerImageEx(state, width, height, copy, stride, bgra);
 }
 
 /// Rewrite an existing texture's RGBA8 pixels, keeping the handle. For a source of frames — a video,
@@ -5603,10 +5705,50 @@ export fn zigote_update_texture_rgba(
     width: u32,
     height: u32,
 ) bool {
+    return zigote_update_texture_rgba_rows(handle, image_handle, pixels_ptr, pixels_len, width, height, 0, height);
+}
+
+/// zigote_update_texture_rgba for a producer that knows its damage: `pixels` is still the whole
+/// frame, but only rows [y0, y1) are copied and only those rows reach the GPU. An embedded web
+/// page blinking a caret then costs a few kilobytes of upload instead of the whole surface.
+///
+/// The CPU-side copy is kept alive between partial updates (a full-frame update still drops it),
+/// so the caller must keep handing over a buffer whose untouched rows are still valid — which is
+/// the natural shape for anything double-buffering a surface.
+export fn zigote_update_texture_rgba_rows(
+    handle: u64,
+    image_handle: u64,
+    pixels_ptr: [*c]const u8,
+    pixels_len: usize,
+    width: u32,
+    height: u32,
+    y0: u32,
+    y1: u32,
+) bool {
+    return zigote_update_texture_rows(handle, image_handle, pixels_ptr, pixels_len, width, height, 0, y0, y1);
+}
+
+/// zigote_update_texture_rgba_rows for a producer with its own row stride (0 = tightly packed).
+/// The channel order is fixed at creation by zigote_load_texture_from_pixels — an update is a byte
+/// copy and does not care.
+export fn zigote_update_texture_rows(
+    handle: u64,
+    image_handle: u64,
+    pixels_ptr: [*c]const u8,
+    pixels_len: usize,
+    width: u32,
+    height: u32,
+    stride: u32,
+    y0: u32,
+    y1: u32,
+) bool {
     const state = stateFromHandle(handle) orelse return false;
     if (image_handle == 0 or pixels_ptr == null or width == 0 or height == 0) return false;
 
-    const expected_len = @as(usize, width) * @as(usize, height) * 4;
+    const row_bytes = @as(usize, width) * 4;
+    const row_stride = if (stride != 0) @as(usize, stride) else row_bytes;
+    if (row_stride < row_bytes) return false;
+    const expected_len = row_stride * @as(usize, height);
     if (pixels_len < expected_len) return false;
 
     state.image_lock.lock();
@@ -5616,16 +5758,43 @@ export fn zigote_update_texture_rgba(
 
     const entry = state.image_registry.getPtr(image_handle) orelse return false;
     if (entry.width != width or entry.height != height) return false;
+    // A different row layout than the handle was created with would land the copy at the wrong
+    // offsets; the caller must make a new handle instead.
+    const entry_stride = if (entry.stride != 0) @as(usize, entry.stride) else row_bytes;
+    if (entry_stride != row_stride) return false;
+
+    var top = @min(y0, height);
+    var bottom = @min(y1, height);
+    if (bottom <= top) return true;
 
     // The CPU copy is dropped once an image reaches the GPU (drainImageUploads), so the steady
     // state for a video is: allocate one buffer on the first update, then memcpy into it forever.
+    // With no buffer to patch there is nothing to preserve, so take the whole frame.
     if (entry.pixels.len != expected_len) {
         const fresh = state.allocator.alloc(u8, expected_len) catch return false;
         if (entry.pixels.len > 0) state.allocator.free(entry.pixels);
         entry.pixels = fresh;
+        top = 0;
+        bottom = height;
     }
 
-    @memcpy(@constCast(entry.pixels[0..expected_len]), pixels_ptr[0..expected_len]);
+    const offset = @as(usize, top) * row_stride;
+    const len = @as(usize, bottom - top) * row_stride;
+    @memcpy(@constCast(entry.pixels[offset..][0..len]), pixels_ptr[offset..][0..len]);
+
+    // Union with whatever is already queued for this handle: several updates can land between two
+    // frames and only the last one gets to name the rows the GPU is missing.
+    if (entry.dirty_y1 > entry.dirty_y0) {
+        entry.dirty_y0 = @min(entry.dirty_y0, top);
+        entry.dirty_y1 = @max(entry.dirty_y1, bottom);
+    } else {
+        entry.dirty_y0 = top;
+        entry.dirty_y1 = bottom;
+    }
+    // Keep the CPU mirror across the upload, always. Freeing it (drainImageUpdates) makes the very
+    // next update reallocate the whole frame and copy all of it — so a scroll used to cost an 8 MB
+    // malloc + free per frame, and the caret blink after it a full-frame upload instead of 24 rows.
+    entry.retain = true;
 
     // One entry per handle per frame: a producer faster than the display would otherwise grow the
     // list without bound, and only the last write is visible anyway.
@@ -5654,13 +5823,24 @@ fn drainImageUpdates(state: *EngineState) void {
         const pixels = if (entry) |e| e.pixels else &.{};
         const width = if (entry) |e| e.width else 0;
         const height = if (entry) |e| e.height else 0;
+        const stride = if (entry) |e| e.stride else 0;
+        const y0 = if (entry) |e| e.dirty_y0 else 0;
+        const y1 = if (entry) |e| e.dirty_y1 else 0;
+        const retain = if (entry) |e| e.retain else false;
+        if (entry) |e| {
+            e.dirty_y0 = 0;
+            e.dirty_y1 = 0;
+        }
         state.image_lock.unlock();
 
-        if (pixels.len == 0) continue;
+        if (pixels.len == 0 or y1 <= y0) continue;
 
         // A miss means the image has never been painted, so no texture exists yet; leaving the
         // pixels attached lets the ordinary first-upload path pick them up.
-        if (state.gpu_ui.updateCachedImage(state.queue, key, pixels, width, height)) {
+        if (state.gpu_ui.updateCachedImage(state.queue, key, pixels, width, height, stride, y0, y1)) {
+            // A partial updater patches rows into this buffer next frame — dropping it would cost
+            // a reallocation and a full re-copy for every damaged caret.
+            if (retain) continue;
             // Uploaded: drop the CPU copy exactly like drainImageUploads does, so a paused video
             // does not hold a second full-resolution buffer. The next update reallocates it.
             state.image_lock.lock();
@@ -6193,7 +6373,12 @@ fn passRtPrepass(ctx: *PassContext) anyerror!void {
             std.log.err("zigote: RT render failed: {}", .{err});
             continue;
         };
-        // Register / update the RT texture in image_cache so CMD_IMAGE finds it
+        // Register / update the RT texture in image_cache so CMD_IMAGE finds it. Skip when the
+        // entry already points at this view — recreating an identical bind group per frame per RT
+        // was pure allocator/validation churn (the view itself never changes between resizes).
+        if (state.gpu_ui.image_cache.get(rt.cache_key)) |existing| {
+            if (existing.texture_view == rt.view) continue;
+        }
         const bgl = state.gpu_ui.text.bindGroupLayout();
         if (state.gpu_ui.image_cache.fetchRemove(rt.cache_key)) |old| old.value.bind_group.release();
         if (state.device.createBindGroup(&.{
@@ -6276,7 +6461,11 @@ fn passBlur(ctx: *PassContext) anyerror!void {
             defer blur_cmd.release();
             state.queue.submit(&.{blur_cmd});
 
-            // Register blurred texture in image_cache so CMD_IMAGE shows blurred result
+            // Register blurred texture in image_cache so CMD_IMAGE shows blurred result. Skip when
+            // the entry already points at the blur view — same churn fix as RTPrePass above.
+            if (state.gpu_ui.image_cache.get(rt.cache_key)) |existing| {
+                if (existing.texture_view == blur_view) continue;
+            }
             const bgl = state.gpu_ui.text.bindGroupLayout();
             if (state.gpu_ui.image_cache.fetchRemove(rt.cache_key)) |old| old.value.bind_group.release();
             if (state.device.createBindGroup(&.{
@@ -6746,35 +6935,19 @@ export fn zigote_render_texture_read_rgba(
     return true;
 }
 
-/// Convenience: begin + render + end in one call for simple use-cases.
-/// Equivalent to zigote_begin_frame + zigote_render_frame_v2 + zigote_end_frame.
+/// Collapsed frame API: zigote_frame_begin + (submit calls) + zigote_frame_end is the four-call
+/// begin/submit/render/end sequence with two fewer FFI transitions per frame. Pure delegation —
+/// this pair had drifted (it skipped the damage reset and the image-lifecycle drains), which is
+/// why the UI path couldn't use it.
 export fn zigote_frame_begin(handle: u64, scene_w: u32, scene_h: u32, scale: f32, delta_time: f32) void {
-    const state = stateFromHandle(handle) orelse return;
-    state.pending_scene_w = scene_w;
-    state.pending_scene_h = scene_h;
-    state.pending_scale = if (scale > 0) scale else 1.0;
-    state.pending_dt = delta_time;
-    state.transient_pool.resetFrame();
+    zigote_begin_frame(handle, scene_w, scene_h, scale, delta_time);
 }
 
-/// Execute the render graph and present; then clear per-frame state.
-/// Replaces the three-call sequence zigote_render_frame_v2 + zigote_end_frame.
+/// Execute the render graph and present; then clear per-frame state (see zigote_frame_begin).
 export fn zigote_frame_end(handle: u64) ZgResult {
-    const state = stateFromHandle(handle) orelse return .err;
-    renderFrameV2Impl(state) catch |err| {
-        std.log.err("zigote_frame_end render failed: {}", .{err});
-        return .err;
-    };
-    state.pending_scene_w = 0;
-    state.pending_scene_h = 0;
-    state.paint_list.clearRetainingCapacity(state.allocator);
-    state.overlay_paint_list.clearRetainingCapacity(state.allocator);
-    var rt_it = state.render_textures.valueIterator();
-    while (rt_it.next()) |rt| {
-        rt.pending_paint.clearRetainingCapacity(state.allocator);
-    }
-    state.blur_requests.clearRetainingCapacity();
-    return .ok;
+    const result = zigote_render_frame_v2(handle);
+    zigote_end_frame(handle);
+    return result;
 }
 
 /// Update render settings.

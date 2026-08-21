@@ -410,8 +410,12 @@ fn onDecoderRead(
     bytes_read.* = take;
 
     // Once a backend is chosen nothing seeks backwards again, so consumed bytes can go. Held
-    // until then because container detection rewinds to zero between attempts.
-    if (self.decoder != null and self.read_pos > probe_bytes) {
+    // until then because container detection rewinds to zero between attempts. Compact only when
+    // the consumed prefix outweighs the remainder — shifting the whole tail down on EVERY read
+    // was O(n²) over the stream's life; amortized it is now O(n).
+    if (self.decoder != null and self.read_pos > probe_bytes and
+        self.read_pos > self.encoded.items.len / 2)
+    {
         const remaining = self.encoded.items.len - self.read_pos;
         std.mem.copyForwards(u8, self.encoded.items[0..remaining], self.encoded.items[self.read_pos..]);
         self.encoded.shrinkRetainingCapacity(remaining);

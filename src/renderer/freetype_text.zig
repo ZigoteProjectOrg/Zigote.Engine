@@ -250,8 +250,17 @@ pub const FreeTypeTextRenderer = struct {
 
     // Content-addressed shaped-run cache: text re-drawn every frame (e.g. an editor rendering
     // continuously) is shaped by HarfBuzz once, then re-emitted from cached glyphs. Keyed by
-    // (text, font_family, pixel_size); cleared when a face is (re)registered.
+    // (text, font_family, pixel_size); cleared when a face is (re)registered. Two generations
+    // (same scheme as C#'s TextMeasure): at capacity the current generation demotes instead of
+    // clearing wholesale, so every visible run doesn't re-shape on one spike frame.
     shaped_run_cache: std.AutoHashMap(u64, ShapedRun),
+    shaped_run_prev: std.AutoHashMap(u64, ShapedRun),
+
+    // One-entry memo of the last family name's Wyhash: routeFor hashed the family string per
+    // CODEPOINT and glyphKey per GLYPH, every frame — a run's family is one stable slice, so
+    // pointer identity almost always hits.
+    family_hash_key: []const u8 = &.{},
+    family_hash_val: u64 = 0,
 
     // ── Color emoji atlas (RGBA 1024×1024) ────────────────────────────────────
     // Fully lazy: the 4 MB CPU buffer and the GPU texture/view/bind-group are only created when
@@ -259,6 +268,10 @@ pub const FreeTypeTextRenderer = struct {
     // nothing, so apps that never render emoji never pay for the atlas (per window).
     color_atlas_pixels: ?[]u8,
     color_atlas_dirty: bool,
+    // Dirty ROW range [y0, y1) for the next color-atlas upload: rows are contiguous in memory, so
+    // a partial writeTexture needs only a row span — one new emoji uploads its rows, not 4 MB.
+    color_atlas_dirty_y0: u32 = 0,
+    color_atlas_dirty_y1: u32 = 0,
     color_pen_x: u32,
     color_pen_y: u32,
     color_row_h: u32,
@@ -330,6 +343,7 @@ pub const FreeTypeTextRenderer = struct {
         self.layout_cache = std.AutoHashMap(u64, TextLayoutEntry).init(allocator);
         self.next_layout_handle = 1;
         self.shaped_run_cache = std.AutoHashMap(u64, ShapedRun).init(allocator);
+        self.shaped_run_prev = std.AutoHashMap(u64, ShapedRun).init(allocator);
 
         self.color_atlas_pixels = null;
         self.color_gpu = null;
@@ -533,6 +547,9 @@ pub const FreeTypeTextRenderer = struct {
         var run_it = self.shaped_run_cache.valueIterator();
         while (run_it.next()) |run| self.allocator.free(run.glyphs);
         self.shaped_run_cache.deinit();
+        var prev_run_it = self.shaped_run_prev.valueIterator();
+        while (prev_run_it.next()) |run| self.allocator.free(run.glyphs);
+        self.shaped_run_prev.deinit();
     }
 
     pub fn bindGroupLayout(self: *const FreeTypeTextRenderer) *wgpu.BindGroupLayout {
@@ -749,8 +766,11 @@ pub const FreeTypeTextRenderer = struct {
         if (cp < 0x0100 and std.mem.eql(u8, primary, self.default_font_family))
             return .{ .family = primary, .emoji = false };
 
+        // Fixed-size hash over (cp, memoized family hash) — hashing the family STRING here ran
+        // once per codepoint per frame.
+        const fh = self.familyHash(primary);
         var hasher = std.hash.Wyhash.init(cp);
-        hasher.update(primary);
+        hasher.update(std.mem.asBytes(&fh));
         const key = hasher.final();
 
         const slot: i8 = if (self.route_cache.get(key)) |cached| cached else blk: {
@@ -832,27 +852,37 @@ pub const FreeTypeTextRenderer = struct {
         if (!self.color_atlas_dirty) return;
         const gpu = self.color_gpu orelse return;
         const pixels = self.color_atlas_pixels orelse return;
-        queue.writeTexture(
-            &.{
-                .texture = gpu.texture,
-                .mip_level = 0,
-                .origin = .{ .x = 0, .y = 0, .z = 0 },
-                .aspect = .all,
-            },
-            pixels.ptr,
-            pixels.len,
-            &.{
-                .offset = 0,
-                .bytes_per_row = ColorAtlas.width * 4,
-                .rows_per_image = ColorAtlas.height,
-            },
-            &.{
-                .width = ColorAtlas.width,
-                .height = ColorAtlas.height,
-                .depth_or_array_layers = 1,
-            },
-        );
+        // Upload only the dirty row span — the atlas is 4 MB and one newly-baked emoji used to
+        // re-upload the whole thing.
+        const y0 = @min(self.color_atlas_dirty_y0, ColorAtlas.height);
+        const y1 = @min(@max(self.color_atlas_dirty_y1, y0), ColorAtlas.height);
+        const rows = y1 - y0;
+        if (rows > 0) {
+            const row_bytes: usize = ColorAtlas.width * 4;
+            queue.writeTexture(
+                &.{
+                    .texture = gpu.texture,
+                    .mip_level = 0,
+                    .origin = .{ .x = 0, .y = y0, .z = 0 },
+                    .aspect = .all,
+                },
+                pixels.ptr + @as(usize, y0) * row_bytes,
+                @as(usize, rows) * row_bytes,
+                &.{
+                    .offset = 0,
+                    .bytes_per_row = ColorAtlas.width * 4,
+                    .rows_per_image = rows,
+                },
+                &.{
+                    .width = ColorAtlas.width,
+                    .height = rows,
+                    .depth_or_array_layers = 1,
+                },
+            );
+        }
         self.color_atlas_dirty = false;
+        self.color_atlas_dirty_y0 = 0;
+        self.color_atlas_dirty_y1 = 0;
     }
 
     pub fn appendText(
@@ -952,6 +982,38 @@ pub const FreeTypeTextRenderer = struct {
         var it = self.shaped_run_cache.valueIterator();
         while (it.next()) |run| self.allocator.free(run.glyphs);
         self.shaped_run_cache.clearRetainingCapacity();
+        var prev_it = self.shaped_run_prev.valueIterator();
+        while (prev_it.next()) |run| self.allocator.free(run.glyphs);
+        self.shaped_run_prev.clearRetainingCapacity();
+    }
+
+    /// Two-generation shaped-run lookup: returns a cached run (promoting a previous-generation
+    /// hit), or null after making room for the caller's insert — at capacity the current
+    /// generation demotes and the old one is dropped, so a spike frame never re-shapes every
+    /// visible run at once (the old wholesale clear did).
+    fn shapedRunLookup(self: *FreeTypeTextRenderer, key: u64) !?*ShapedRun {
+        if (self.shaped_run_cache.getPtr(key)) |run| return run;
+        if (self.shaped_run_prev.fetchRemove(key)) |kv| {
+            try self.shaped_run_cache.put(key, kv.value);
+            return self.shaped_run_cache.getPtr(key).?;
+        }
+        if (self.shaped_run_cache.count() >= 8192) {
+            var prev_it = self.shaped_run_prev.valueIterator();
+            while (prev_it.next()) |run| self.allocator.free(run.glyphs);
+            self.shaped_run_prev.clearRetainingCapacity();
+            std.mem.swap(std.AutoHashMap(u64, ShapedRun), &self.shaped_run_cache, &self.shaped_run_prev);
+        }
+        return null;
+    }
+
+    /// Wyhash of a family name, memoized on slice identity (see family_hash_key).
+    fn familyHash(self: *FreeTypeTextRenderer, family: []const u8) u64 {
+        if (self.family_hash_key.ptr == family.ptr and self.family_hash_key.len == family.len)
+            return self.family_hash_val;
+        const h = std.hash.Wyhash.hash(0, family);
+        self.family_hash_key = family;
+        self.family_hash_val = h;
+        return h;
     }
 
     /// Shape `text` once and cache glyph IDs and positions. Atlas UVs deliberately do not live here:
@@ -981,10 +1043,7 @@ pub const FreeTypeTextRenderer = struct {
         hasher.update(text);
         const key = hasher.final();
 
-        if (self.shaped_run_cache.getPtr(key)) |run| return run;
-
-        // Bound the cache; a wholesale clear is fine — entries rebuild lazily when next drawn.
-        if (self.shaped_run_cache.count() >= 8192) self.clearShapedRunCache();
+        if (try self.shapedRunLookup(key)) |run| return run;
 
         if (ft.FT_Set_Pixel_Sizes(face, 0, @intCast(pixel_size)) != 0)
             return error.FreeTypeSetPixelSizeFailed;
@@ -1115,6 +1174,9 @@ pub const FreeTypeTextRenderer = struct {
         const face = self.resolveFace(font_family) orelse return error.FreeTypeFontNotFound;
         const spaced = letter_spacing != 0;
         const run = try self.getShapedRun(face, text, font_family, pixel_size, style, spaced);
+        // One reservation for the run's worst case (4 verts/glyph) — this loop re-emits every
+        // frame, and per-glyph appendSlice paid a capacity check (and possible realloc) per glyph.
+        try vertices.ensureUnusedCapacity(allocator, run.glyphs.len * 4);
         for (run.glyphs, 0..) |shaped, i| {
             const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, pixel_size, style, blur);
             if (glyph.width > 0 and glyph.height > 0) {
@@ -1915,7 +1977,7 @@ pub const FreeTypeTextRenderer = struct {
         // Blur is quantized to quarter-pixel buckets so shadow passes bake once per radius.
         const synth = synthFor(face, style, size);
         const blur_q: u16 = if (blur > 0) @intFromFloat(@min(@round(blur * 4.0), 4096.0)) else 0;
-        const key = glyphKey(font_family, glyph_index, size, synth, blur_q);
+        const key = glyphKey(self.familyHash(font_family), glyph_index, size, synth, blur_q);
 
         if (self.glyphs.get(key)) |glyph| {
             return glyph;
@@ -2299,10 +2361,7 @@ pub const FreeTypeTextRenderer = struct {
         hasher.update(text);
         const key = hasher.final();
 
-        if (self.shaped_run_cache.getPtr(key)) |run| return run;
-
-        // Bound the cache; a wholesale clear is fine — entries rebuild lazily when next drawn.
-        if (self.shaped_run_cache.count() >= 8192) self.clearShapedRunCache();
+        if (try self.shapedRunLookup(key)) |run| return run;
 
         const sel = try emojiSelectSize(face, pixel_size);
 
@@ -2365,7 +2424,7 @@ pub const FreeTypeTextRenderer = struct {
         want_px: u16,
     ) ?EmojiRaster {
         const sel = emojiSelectSize(face, want_px) catch return null;
-        const key = glyphKey(emoji_family, glyph_index, sel.actual_px, .{}, 0);
+        const key = glyphKey(self.familyHash(emoji_family), glyph_index, sel.actual_px, .{}, 0);
 
         if (self.color_glyphs.get(key)) |glyph| {
             return .{ .glyph = glyph, .scale = sel.scale };
@@ -2425,6 +2484,8 @@ pub const FreeTypeTextRenderer = struct {
         if (self.color_atlas_pixels) |pixels| {
             @memset(pixels, 0);
             self.color_atlas_dirty = true;
+            self.color_atlas_dirty_y0 = 0;
+            self.color_atlas_dirty_y1 = ColorAtlas.height; // full re-upload after a reset
         }
         self.color_pen_x = 1;
         self.color_pen_y = 1;
@@ -2546,6 +2607,16 @@ pub const FreeTypeTextRenderer = struct {
         }
 
         self.color_atlas_dirty = true;
+        // Widen the dirty row span to cover this glyph.
+        const gy0: u32 = dst_y;
+        const gy1: u32 = @min(dst_y + @as(u32, @intCast(height)), ColorAtlas.height);
+        if (self.color_atlas_dirty_y1 == 0) {
+            self.color_atlas_dirty_y0 = gy0;
+            self.color_atlas_dirty_y1 = gy1;
+        } else {
+            self.color_atlas_dirty_y0 = @min(self.color_atlas_dirty_y0, gy0);
+            self.color_atlas_dirty_y1 = @max(self.color_atlas_dirty_y1, gy1);
+        }
     }
 };
 
@@ -2639,9 +2710,10 @@ fn boxBlurCols(src: []const u8, dst: []u8, w: u32, h: u32, r: u32) void {
     }
 }
 
-fn glyphKey(font_family: []const u8, glyph_index: u32, size: u16, synth: Synth, blur_q: u16) u64 {
-    var hasher = std.hash.Wyhash.init(0);
-    hasher.update(font_family);
+// `family_hash` is the memoized FreeTypeTextRenderer.familyHash of the family name — hashing the
+// string itself here ran once per glyph per frame.
+fn glyphKey(family_hash: u64, glyph_index: u32, size: u16, synth: Synth, blur_q: u16) u64 {
+    var hasher = std.hash.Wyhash.init(family_hash);
     hasher.update(std.mem.asBytes(&size));
     hasher.update(std.mem.asBytes(&glyph_index));
     if (!synth.none()) {

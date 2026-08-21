@@ -85,6 +85,9 @@ pub const CachedImage = struct {
     borrowed: bool = false,
 };
 
+/// Device-pixel rect (scoped backdrop capture — see backdropCopyRegion).
+pub const PixelRect = struct { x: u32, y: u32, w: u32, h: u32 };
+
 pub const GpuUi = struct {
     shape_shader: *wgpu.ShaderModule,
     shape_pipeline_layout: *wgpu.PipelineLayout,
@@ -574,6 +577,9 @@ pub const GpuUi = struct {
     /// submits that follow it, so a caller draining at the top of a frame sees the new pixels in
     /// that same frame. Returns false when the key has no texture yet — the caller should leave the
     /// CPU copy in place and let the normal first-upload path take it.
+    /// `pixels` is always the whole image; only rows [y0, y1) are uploaded, so a producer that
+    /// knows its damage (a webview blinking a caret, a partially-updated surface) pays for the
+    /// rows it changed instead of the whole texture. y0 = 0, y1 = height is the full-frame case.
     pub fn updateCachedImage(
         self: *GpuUi,
         queue: *wgpu.Queue,
@@ -581,34 +587,51 @@ pub const GpuUi = struct {
         pixels: []const u8,
         width: u32,
         height: u32,
+        stride: u32,
+        y0: u32,
+        y1: u32,
     ) bool {
         const cached = self.image_cache.get(key) orelse return false;
         if (width == 0 or height == 0) return false;
 
-        const src_stride = @as(usize, width) * 4;
+        // The producer's own row stride, which is what makes the no-staging path reachable for a
+        // padded surface: Cairo pads to 32 bytes, wgpu wants 256, and a 1280-px webview is already
+        // both — so its rows go straight from the producer's memory to the GPU.
+        const src_stride = if (stride != 0) @as(usize, stride) else @as(usize, width) * 4;
+        if (src_stride < @as(usize, width) * 4) return false;
         if (pixels.len < src_stride * @as(usize, height)) return false;
+
+        const top = @min(y0, height);
+        const bottom = @min(y1, height);
+        if (bottom <= top) return true; // nothing damaged — the texture already holds these rows
+        const rows: u32 = bottom - top;
+        const band = pixels[@as(usize, top) * src_stride ..][0 .. @as(usize, rows) * src_stride];
 
         // wgpu wants rows aligned to 256 bytes; a frame whose width already satisfies that (every
         // multiple of 64 px — 1280, 1920, 3840) uploads straight from the caller's buffer with no
         // staging copy at all.
         const bytes_per_row = std.mem.alignForward(usize, src_stride, 256);
         if (bytes_per_row == src_stride) {
-            writeImageRows(queue, cached.texture, pixels, bytes_per_row, width, height);
+            writeImageRows(queue, cached.texture, band, bytes_per_row, width, rows, top);
             return true;
         }
 
-        const staging = self.allocator.alloc(u8, bytes_per_row * @as(usize, height)) catch return false;
+        // Not aligned: repack into a staging buffer whose rows are. `src_stride` may carry the
+        // producer's padding, so copy width*4 out of each row and leave the rest zeroed.
+        const row_bytes = @as(usize, width) * 4;
+
+        const staging = self.allocator.alloc(u8, bytes_per_row * @as(usize, rows)) catch return false;
         defer self.allocator.free(staging);
-        @memset(staging, 0);
         var row: usize = 0;
-        while (row < height) : (row += 1) {
+        while (row < rows) : (row += 1) {
             const src_start = row * src_stride;
-            @memcpy(
-                staging[row * bytes_per_row ..][0..src_stride],
-                pixels[src_start..][0..src_stride],
-            );
+            const dst = staging[row * bytes_per_row ..][0..bytes_per_row];
+            @memcpy(dst[0..row_bytes], band[src_start..][0..row_bytes]);
+            // Zero only the padding tail — the old full-buffer @memset cleared bytes the row
+            // copies above immediately overwrote.
+            @memset(dst[row_bytes..], 0);
         }
-        writeImageRows(queue, cached.texture, staging, bytes_per_row, width, height);
+        writeImageRows(queue, cached.texture, staging, bytes_per_row, width, rows, top);
         return true;
     }
 
@@ -973,6 +996,13 @@ pub fn renderFrame(
 
     // Blit scene_texture -> swapchain. Skipped in direct mode — the ops were rendered straight into the
     // swapchain view above, so there is nothing to copy.
+    //
+    // Always a full clear + full-surface quad, deliberately: a damage-scissored blit with
+    // loadOp=load was tried and REVERTED — WebGPU exposes no swapchain buffer age, the surface
+    // rotates an unknown (platform-dependent, sometimes lazily recreated) set of images, and any
+    // fixed "union the last N frames' damage" window mis-guesses N on some stack (observed on
+    // Wayland/Mesa as stale/black regions outside the union). Do not reintroduce without a real
+    // buffer-age API. Bandwidth savings live in the scene pass's damage scissor instead.
     if (!direct) {
         const attachment = wgpu.ColorAttachment{
             .view = view,
@@ -1245,14 +1275,23 @@ fn replayFramePaint(
     // texture copy plus a render-pass break per op, which is what made a row of glass capsules
     // drop frames during live resizes.
     var backdrop_fresh = false;
-    for (frame.ops.items) |*op| {
+    for (frame.ops.items, 0..) |*op, op_idx| {
         if (drawOpNeedsBackdrop(op.*)) {
             if (!backdrop_fresh) {
                 const bt = backdrop_tex orelse return error.WgpuBackdropUnavailable;
                 const st = scene_tex orelse return error.WgpuTextureUnavailable;
                 pass.end();
                 pass.release();
-                copySceneToBackdrop(encoder, st, bt, frame_width, frame_height);
+                // Every op draws in order on this path, so the consecutive-run region is exact.
+                const region = backdropCopyRegion(
+                    frame,
+                    op_idx,
+                    @floatFromInt(frame_width),
+                    @floatFromInt(frame_height),
+                    frame_width,
+                    frame_height,
+                );
+                copySceneToBackdrop(encoder, st, bt, frame_width, frame_height, region);
                 pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
                 backdrop_fresh = true;
             }
@@ -1300,13 +1339,21 @@ fn replayFramePaintLoad(
 
     // Same consecutive-op capture sharing as replayFramePaint — see the comment there.
     var backdrop_fresh = false;
-    for (frame.ops.items) |*op| {
+    for (frame.ops.items, 0..) |*op, op_idx| {
         if (drawOpNeedsBackdrop(op.*)) {
             if (!backdrop_fresh) {
                 const bt = backdrop_tex orelse return error.WgpuBackdropUnavailable;
                 pass.end();
                 pass.release();
-                copySceneToBackdrop(encoder, scene_tex, bt, frame_width, frame_height);
+                const region = backdropCopyRegion(
+                    frame,
+                    op_idx,
+                    @floatFromInt(frame_width),
+                    @floatFromInt(frame_height),
+                    frame_width,
+                    frame_height,
+                );
+                copySceneToBackdrop(encoder, scene_tex, bt, frame_width, frame_height, region);
                 pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
                 backdrop_fresh = true;
             }
@@ -1480,6 +1527,17 @@ fn replayFramePaintDamage(
     // outset covers the truncated row and the AA fringe both; being a single region, there is no
     // neighbouring sweep to double-blend with, and applyScissor's shrink-clamp keeps a negative
     // origin from shifting the box.
+    // The sweep below is O(rects × ops) of AABB tests. Past a budget, one union region repaints
+    // fewer total pixels than the CPU walk costs — collapse exactly like the glass path does
+    // (one region cannot overlap itself, so nothing double-blends).
+    if (merged == null and damage.len > 1 and
+        damage.len * frame.ops.items.len > 32 * 1024)
+    {
+        var acc = damage[0];
+        for (damage[1..]) |region| acc = damageUnion(acc, region);
+        merged = acc;
+    }
+
     if (merged) |*m| {
         m.x -= 1;
         m.y -= 1;
@@ -1498,7 +1556,14 @@ fn replayFramePaintDamage(
     // ops; any other op drawn (in any region) stales it.
     var backdrop_fresh = false;
 
-    const debug_replay = std.c.getenv("ZIGOTE_DEBUG_REPLAY") != null;
+    // Cached: getenv is a linear environ scan and this runs on every partial-repaint frame.
+    const debug_replay = blk: {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached == null) S.cached = std.c.getenv("ZIGOTE_DEBUG_REPLAY") != null;
+        break :blk S.cached.?;
+    };
     for (sweep) |region| {
         var drawn: u32 = 0;
         var culled: u32 = 0;
@@ -1518,7 +1583,10 @@ fn replayFramePaintDamage(
                     const st = scene_tex orelse return error.WgpuTextureUnavailable;
                     pass.end();
                     pass.release();
-                    copySceneToBackdrop(encoder, st, bt, frame_width, frame_height);
+                    // Full capture on purpose: this path CULLS ops, and a culled op does not
+                    // stale the capture — so the op-order run scan backdropCopyRegion does is
+                    // not sound here (the reuse run can span past a culled non-backdrop op).
+                    copySceneToBackdrop(encoder, st, bt, frame_width, frame_height, null);
                     pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
                     backdrop_fresh = true;
                 }
@@ -1610,12 +1678,76 @@ fn copySceneToBackdrop(
     backdrop_tex: *wgpu.Texture,
     frame_width: u32,
     frame_height: u32,
+    region: ?PixelRect,
 ) void {
+    // Scoped capture: a 120×40 glass chip on a 4K surface does not need a 33 MB full-frame copy.
+    // The region (same origin in both textures) must cover every backdrop tap of the ops it
+    // serves — see backdropCopyRegion for the reach bound; null = whole frame.
+    const r = region orelse PixelRect{ .x = 0, .y = 0, .w = frame_width, .h = frame_height };
+    if (r.w == 0 or r.h == 0) return;
     encoder.copyTextureToTexture(
-        &.{ .texture = scene_tex, .mip_level = 0, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = .all },
-        &.{ .texture = backdrop_tex, .mip_level = 0, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = .all },
-        &.{ .width = frame_width, .height = frame_height, .depth_or_array_layers = 1 },
+        &.{ .texture = scene_tex, .mip_level = 0, .origin = .{ .x = r.x, .y = r.y, .z = 0 }, .aspect = .all },
+        &.{ .texture = backdrop_tex, .mip_level = 0, .origin = .{ .x = r.x, .y = r.y, .z = 0 }, .aspect = .all },
+        &.{ .width = r.w, .height = r.h, .depth_or_array_layers = 1 },
     );
+}
+
+/// Region a backdrop capture must cover for the consecutive backdrop-op run starting at
+/// `ops[start]` — the run's device AABBs inflated by the glass shader's maximum sampling reach
+/// (liquid_glass_shader_source.wgsl: |disp| ≤ (h + t·BEND)/0.25 with h ≤ t ⇒ 28·t; frost
+/// ≤ (4 + 2.1·t)·(1 + FROST_RIM); +16 px of AA/fringe slack). Null = copy the whole frame: a
+/// custom shader effect samples the backdrop arbitrarily, the bounds are unknown, or the union
+/// is nearly the frame anyway. ONLY sound on paths that draw every op in order — a path that
+/// culls ops must pass null (a culled op does not stale the capture, so the reuse run can span
+/// past this op-order scan).
+fn backdropCopyRegion(
+    frame: *const FramePaint,
+    start: usize,
+    fw: f32,
+    fh: f32,
+    frame_width: u32,
+    frame_height: u32,
+) ?PixelRect {
+    var acc: ?zg.Rect = null;
+    var i = start;
+    while (i < frame.ops.items.len) : (i += 1) {
+        const op = &frame.ops.items[i];
+        if (!drawOpNeedsBackdrop(op.*)) break;
+        const b = switch (op.*) {
+            .liquid_glass => |batch| batch,
+            else => return null, // shader_effect: arbitrary sampling — full capture
+        };
+        const verts = frame.liquid_glass_vertices.items[b.vertex_offset..][0..b.vertex_count];
+        const aabb = vertexRangeAabb(LiquidGlassVertex, verts, fw, fh) orelse return null;
+        var t_max: f32 = 1.0;
+        for (verts) |v| t_max = @max(t_max, v.thickness);
+        const reach = 28.0 * t_max + ((4.0 + 2.1 * t_max) * 2.8) + 16.0;
+        const r = zg.Rect{
+            .x = aabb.x - reach,
+            .y = aabb.y - reach,
+            .width = aabb.width + 2.0 * reach,
+            .height = aabb.height + 2.0 * reach,
+        };
+        acc = if (acc) |a| damageUnion(a, r) else r;
+    }
+
+    const a = acc orelse return null;
+    const fx0 = @max(0.0, a.x);
+    const fy0 = @max(0.0, a.y);
+    const fx1 = @min(@as(f32, @floatFromInt(frame_width)), a.x + a.width);
+    const fy1 = @min(@as(f32, @floatFromInt(frame_height)), a.y + a.height);
+    if (fx1 <= fx0 or fy1 <= fy0) return null;
+    var px = PixelRect{
+        .x = @intFromFloat(@floor(fx0)),
+        .y = @intFromFloat(@floor(fy0)),
+        .w = @intFromFloat(@ceil(fx1 - fx0)),
+        .h = @intFromFloat(@ceil(fy1 - fy0)),
+    };
+    px.w = @min(px.w, frame_width - px.x);
+    px.h = @min(px.h, frame_height - px.y);
+    // Nearly the whole frame: the full copy is simpler and the saving is noise.
+    if (@as(u64, px.w) * px.h * 10 >= @as(u64, frame_width) * frame_height * 9) return null;
+    return px;
 }
 
 fn drawOpNeedsBackdrop(op: DrawOp) bool {
@@ -2881,9 +3013,11 @@ fn createImageTexture(
 ) !*wgpu.Texture {
     if (image.width == 0 or image.height == 0) return error.WgpuImageTextureUnavailable;
 
-    const required_len = std.math.mul(usize, @as(usize, image.width), @as(usize, image.height)) catch
+    const row_bytes = std.math.mul(usize, @as(usize, image.width), 4) catch
         return error.WgpuImageTextureUnavailable;
-    const required_rgba_len = std.math.mul(usize, required_len, 4) catch
+    const src_stride = if (image.stride != 0) @as(usize, image.stride) else row_bytes;
+    if (src_stride < row_bytes) return error.WgpuImageTextureUnavailable;
+    const required_rgba_len = std.math.mul(usize, src_stride, @as(usize, image.height)) catch
         return error.WgpuImageTextureUnavailable;
     if (image.pixels.len < required_rgba_len) return error.WgpuImageTextureUnavailable;
 
@@ -2896,22 +3030,53 @@ fn createImageTexture(
             .height = image.height,
             .depth_or_array_layers = 1,
         },
-        .format = .rgba8_unorm_srgb,
+        // The producer's channel order, resolved by the sampler instead of by the CPU. A source
+        // that is already BGRA (every Cairo/GTK surface, most video decoders) then needs no
+        // conversion pass at all.
+        .format = if (image.bgra) .bgra8_unorm_srgb else .rgba8_unorm_srgb,
         .mip_level_count = 1,
         .sample_count = 1,
     }) orelse return error.WgpuImageTextureUnavailable;
 
-    const bytes_per_row = std.mem.alignForward(usize, @as(usize, image.width) * 4, 256);
+    const bytes_per_row = std.mem.alignForward(usize, src_stride, 256);
+
+    // Already 256-aligned (any width that's a multiple of 64 px): upload straight from the decoded
+    // pixels — no staging alloc, no zero-fill, no per-row copy.
+    if (bytes_per_row == src_stride) {
+        queue.writeTexture(
+            &.{
+                .texture = texture,
+                .mip_level = 0,
+                .origin = .{ .x = 0, .y = 0, .z = 0 },
+                .aspect = .all,
+            },
+            image.pixels.ptr,
+            required_rgba_len,
+            &.{
+                .offset = 0,
+                .bytes_per_row = @intCast(bytes_per_row),
+                .rows_per_image = image.height,
+            },
+            &.{
+                .width = image.width,
+                .height = image.height,
+                .depth_or_array_layers = 1,
+            },
+        );
+        return texture;
+    }
+
     const upload = try allocator.alloc(u8, bytes_per_row * @as(usize, image.height));
     defer allocator.free(upload);
-    @memset(upload, 0);
 
-    const src_stride = @as(usize, image.width) * 4;
     var row: usize = 0;
     while (row < image.height) : (row += 1) {
         const src_start = row * src_stride;
         const dst_start = row * bytes_per_row;
-        @memcpy(upload[dst_start .. dst_start + src_stride], image.pixels[src_start .. src_start + src_stride]);
+        @memcpy(upload[dst_start .. dst_start + row_bytes], image.pixels[src_start .. src_start + row_bytes]);
+        // Zero only the padding tail — the old full @memset cleared the whole buffer and the
+        // copies above overwrote most of it again.
+        @memset(upload[dst_start + row_bytes .. dst_start + bytes_per_row], 0);
     }
 
     queue.writeTexture(
@@ -2947,12 +3112,13 @@ fn writeImageRows(
     bytes_per_row: usize,
     width: u32,
     height: u32,
+    y0: u32,
 ) void {
     queue.writeTexture(
         &.{
             .texture = texture,
             .mip_level = 0,
-            .origin = .{ .x = 0, .y = 0, .z = 0 },
+            .origin = .{ .x = 0, .y = y0, .z = 0 },
             .aspect = .all,
         },
         rows.ptr,

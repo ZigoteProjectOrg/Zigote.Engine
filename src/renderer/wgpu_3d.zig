@@ -2991,17 +2991,31 @@ pub const Gpu3d = struct {
         height: u32,
         pixels: []const u8,
     ) !void {
-        const bytes_per_row = std.mem.alignForward(usize, @as(usize, width) * 4, 256);
+        const src_stride = @as(usize, width) * 4;
+        const bytes_per_row = std.mem.alignForward(usize, src_stride, 256);
+
+        // Row stride already 256-aligned: upload straight from the source, no staging copy.
+        // With a full mip chain this otherwise allocates + zero-fills once per level.
+        if (bytes_per_row == src_stride) {
+            queue.writeTexture(
+                &.{ .texture = texture, .mip_level = level, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = .all },
+                pixels.ptr,
+                src_stride * @as(usize, height),
+                &.{ .offset = 0, .bytes_per_row = @intCast(bytes_per_row), .rows_per_image = height },
+                &.{ .width = width, .height = height, .depth_or_array_layers = 1 },
+            );
+            return;
+        }
+
         const upload = try self.allocator.alloc(u8, bytes_per_row * @as(usize, height));
         defer self.allocator.free(upload);
-        @memset(upload, 0);
 
-        const src_stride = @as(usize, width) * 4;
         var row: usize = 0;
         while (row < height) : (row += 1) {
             const src_start = row * src_stride;
             const dst_start = row * bytes_per_row;
             @memcpy(upload[dst_start .. dst_start + src_stride], pixels[src_start .. src_start + src_stride]);
+            @memset(upload[dst_start + src_stride .. dst_start + bytes_per_row], 0);
         }
 
         queue.writeTexture(

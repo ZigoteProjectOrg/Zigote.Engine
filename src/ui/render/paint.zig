@@ -167,6 +167,13 @@ pub const Image = struct {
     width: u32,
     height: u32,
     pixels: []const u8,
+    /// Bytes per row of `pixels`, 0 meaning tightly packed (`width * 4`). A producer that owns a
+    /// padded surface — a Cairo image surface, a video frame, a mapped GPU buffer — hands its own
+    /// stride here instead of repacking every row.
+    stride: u32 = 0,
+    /// `pixels` are B,G,R,A per texel rather than R,G,B,A. Free: the texture is created in the
+    /// matching wgpu format and the sampler resolves the order, so nothing downstream changes.
+    bgra: bool = false,
     cache_key: ?u64 = null,
     u0: f32 = 0.0,
     v0: f32 = 0.0,

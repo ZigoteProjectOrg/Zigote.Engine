@@ -25,13 +25,22 @@ const h_wgsl =
     \\    if (id.x >= p.width || id.y >= p.height) { return; }
     \\    let sigma  = max(p.sigma, 0.001);
     \\    let radius = i32(ceil(3.0 * sigma));
-    \\    var color  = vec4<f32>(0.0);
-    \\    var w_sum  = 0.0;
-    \\    for (var i = -radius; i <= radius; i++) {
-    \\        let sx = clamp(i32(id.x) + i, 0, i32(p.width) - 1);
-    \\        let w  = exp(-f32(i * i) / (2.0 * sigma * sigma));
-    \\        color += textureLoad(src, vec2<i32>(sx, i32(id.y)), 0) * w;
-    \\        w_sum += w;
+    \\    // Incremental Gaussian (GPU Gems 3 §40): w_i = w_{i-1} * r^(2i-1), r = exp(-1/(2σ²)) —
+    \\    // two multiplies per tap instead of an exp(), identical weights.
+    \\    let r  = exp(-1.0 / (2.0 * sigma * sigma));
+    \\    let r2 = r * r;
+    \\    var color = textureLoad(src, vec2<i32>(id.xy), 0);
+    \\    var w_sum = 1.0;
+    \\    var w     = 1.0;
+    \\    var ratio = r;
+    \\    for (var i = 1; i <= radius; i++) {
+    \\        w = w * ratio;
+    \\        ratio = ratio * r2;
+    \\        let xl = clamp(i32(id.x) - i, 0, i32(p.width) - 1);
+    \\        let xr = clamp(i32(id.x) + i, 0, i32(p.width) - 1);
+    \\        color += (textureLoad(src, vec2<i32>(xl, i32(id.y)), 0)
+    \\                + textureLoad(src, vec2<i32>(xr, i32(id.y)), 0)) * w;
+    \\        w_sum += 2.0 * w;
     \\    }
     \\    textureStore(dst, vec2<i32>(id.xy), color / w_sum);
     \\}
@@ -49,13 +58,21 @@ const v_wgsl =
     \\    if (id.x >= p.width || id.y >= p.height) { return; }
     \\    let sigma  = max(p.sigma, 0.001);
     \\    let radius = i32(ceil(3.0 * sigma));
-    \\    var color  = vec4<f32>(0.0);
-    \\    var w_sum  = 0.0;
-    \\    for (var i = -radius; i <= radius; i++) {
-    \\        let sy = clamp(i32(id.y) + i, 0, i32(p.height) - 1);
-    \\        let w  = exp(-f32(i * i) / (2.0 * sigma * sigma));
-    \\        color += textureLoad(src, vec2<i32>(i32(id.x), sy), 0) * w;
-    \\        w_sum += w;
+    \\    // Same incremental-weight recurrence as the horizontal pass.
+    \\    let r  = exp(-1.0 / (2.0 * sigma * sigma));
+    \\    let r2 = r * r;
+    \\    var color = textureLoad(src, vec2<i32>(id.xy), 0);
+    \\    var w_sum = 1.0;
+    \\    var w     = 1.0;
+    \\    var ratio = r;
+    \\    for (var i = 1; i <= radius; i++) {
+    \\        w = w * ratio;
+    \\        ratio = ratio * r2;
+    \\        let yt = clamp(i32(id.y) - i, 0, i32(p.height) - 1);
+    \\        let yb = clamp(i32(id.y) + i, 0, i32(p.height) - 1);
+    \\        color += (textureLoad(src, vec2<i32>(i32(id.x), yt), 0)
+    \\                + textureLoad(src, vec2<i32>(i32(id.x), yb), 0)) * w;
+    \\        w_sum += 2.0 * w;
     \\    }
     \\    textureStore(dst, vec2<i32>(id.xy), color / w_sum);
     \\}
