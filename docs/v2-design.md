@@ -473,11 +473,21 @@ series rather than piecemeal.
 | Done | Notes |
 |---|---|
 | P11 bloom level 0 | The chain was allocated full-res with level 0 marked "allocated, unused" — ~16 MB of rgba16float at 1080p, ~¾ of the bloom allocation, on every 3D app. Chain now starts half-res; golden capture byte-identical, which is the proof the level was dead. |
+| P12 (partial) — `Gpu3d.init` | 1417 → 1011 lines. The post-processing chain (sampler, 7 layouts, 8 pipelines, 7 buffers) is now `createPostResources`, the one block that reads nothing else init builds. |
 
-Not done: P9 (packed model uniforms) depends on the scene-authority change in §2.3. P12 (splitting
-`Gpu3d.init`) is mechanical but large. P5's remaining items (staged shadow-slice and post-param
-uploads) are ~20 small `writeBuffer` calls per frame — real but negligible against a frame, and not
-worth the churn ahead of the splits.
+**Splitting stopped there deliberately.** The next candidates — environment IBL, shadow cascade,
+point shadow, sky — share bind-group layouts, the depth-stencil state and the vertex layout with the
+mesh pipelines above them: 11 inbound locals for one block. Threading those through a parameter
+struct would make `init` harder to read, not easier. Split where there is a seam; don't manufacture
+one. The remaining size is inherent coupling, and `@setEvalBranchQuota` stays for it.
+
+Also found: `Gpu3d.init` has **no `errdefer` anywhere**, so a failure part-way through leaks
+everything created before it. Bounded — `ensure3d` latches `gpu_3d_failed`, so it happens at most
+once per process — and now documented at the seam. Worth fixing deliberately, not as a side effect.
+
+Not done: P9 (packed model uniforms) depends on the scene-authority change in §2.3. P5's remaining
+items (staged shadow-slice and post-param uploads) are ~20 small `writeBuffer` calls per frame —
+measurable only as noise against the numbers in §10.
 
 ### Phase 5 — complete
 
@@ -523,10 +533,29 @@ redesign of §2.1/§2.2/§2.3, which were sold largely on P1/P3/P7/P10.
   coordinated break across ~290 exports and the whole C# call surface, and its strongest
   justification (silent ABI drift) is now closed by the manifest test in §9.
 
-Before any of it, the engine needs a **rendering benchmark**. There is none — `Zigote.SmokeTest`
-reports a frame time for a fixed scene, and the four `*.Benchmark` projects cover Bloc, ECS, HTTP
-and Reactive. Every §3 number above was reasoned from code, not measured, which is exactly how §3
-came to overstate three of its own items.
+### The benchmark, and what it says
+
+`ZIGOTE_SMOKE_PAINT=<rects>` (added to `Zigote.SmokeTest`) builds a synthetic paint list each frame,
+submits and renders it, and reports the median split three ways. The engine had no rendering
+benchmark before — which is exactly how §3 came to overstate three of its own items.
+
+It disables vsync, which turned out to dominate everything else: **with vsync on, 500 rects and 8000
+rects both measure 6.99 ms/frame**, because the present blocks and the number is the display, not
+the engine. Anyone tuning against that figure would have been chasing noise.
+
+Uncapped (RADV / Radeon 780M), linear at ~0.38 µs/command:
+
+| commands | total | C# list build | native transcode | native render |
+|---:|---:|---:|---:|---:|
+| 2 000 | 1.03 ms | 0.21 | 0.11 | 0.72 |
+| 8 000 | 3.20 ms | 0.78 | 0.39 | 2.03 |
+| 20 000 | 7.53 ms | 1.99 | 1.08 | 4.46 |
+
+A heavy 2 000-command UI frame costs **~1.0 ms, of which ~0.8 ms is native** — under 5 % of a 60 Hz
+budget. `fillPaintList`'s transcode, which P7 proposes deleting the intermediate representation to
+remove, is **14 %** of that, so P7's ceiling is roughly 0.1 ms on such a frame. P4's instanced rects
+target part of the render column. Neither justifies an ABI break; both are worth doing on their own
+merits, and can now be measured rather than argued.
 
 ### Not yet started
 
