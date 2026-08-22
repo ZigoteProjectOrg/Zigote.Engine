@@ -1,6 +1,6 @@
 # Zigote.Engine V2 — refactoring, optimization and modularization design
 
-Status: **proposal** · Date: 2026-08-22 · Scope: `Zigote.Engine` (Zig) + its C# binding seam
+Status: **in progress — Phase 0 complete** · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
 (`Zigote.Generators`, `Zigote.Core/Native`, `build/Zigote.Native.targets`).
 
 V2 **breaks ABI and source compatibility**. The C# side is rebuilt against it in the same change
@@ -403,3 +403,60 @@ benchmark asserting P/Invoke count per frame (≤ 4 on a static UI frame, ≤ 5 
 - `RenderGraph` does not topologically order anything; execution is registration order
   (`render_graph.zig:9-10`).
 - `zigote_mactray_*` has no non-macOS definition.
+
+---
+
+## 9. Implementation log
+
+### Phase 0 — complete
+
+Landed, each step gated by: `zig build test`, `zig build check-gpu`, an `nm` diff of the exported
+symbol list, a C# solution build, and a **byte-exact** 3D golden capture (`ZIGOTE_SHOT` +
+`tools/bmpdiff.py`) against the pre-refactor engine. The capture stayed byte-identical throughout —
+across a rewritten pass system, a deleted backend vtable, ten restructured shaders and three
+rewritten texture-upload paths.
+
+| Done | Notes |
+|---|---|
+| `RenderGraph` → `renderer/frame.zig` | Comptime pass array; `FrameContext` trimmed to fields anything reads; `run()` reports failures so the skip path is testable |
+| `GpuBackend` vtable, `Upscaler`, `RayTracer`, `vulkan`/`d3d12`, `wgpu_backend.zig` | Deleted; retired backend ids still decode to `.wgpu`, with a test |
+| ecs.zig `pub fn` + `export fn` pairs | 110 functions → 55; exported signatures byte-identical |
+| Three hand-rolled spinlocks | One `core/sync.zig`, with a real contention test |
+| Geometry alias chain | Six files to reach one `Rect` → the definition plus module roots |
+| `renderer/root.zig` completeness | Seven modules were missing, so their tests never ran; a test now reads the directory back and fails if one is missing |
+| Shader prelude | 8 duplicate fullscreen VS + 3 `rounded_clip_coverage` + 2 `srgb_decode` → `shaders/common_*.wgsl` |
+| **`zig build check-gpu`** (new) | Compiles all 23 shaders headlessly; asserts the texture row-pitch contract |
+| `build.zig` | One `all_modules`; one `vendoredStaticLib` |
+| 9 uncalled exports | Removed; 295 → 286 |
+| **Texture staging** (not in the original plan) | See below |
+| Engine docs | `architecture.md`, `rendering.md`, `ffi-reference.md`, `building.md`, `README.md` rewritten to match |
+
+**Unplanned win — the texture staging.** Three upload paths repacked any image whose row pitch was
+not a multiple of 256 into an aligned staging buffer: an allocation, a per-row `memcpy` and a
+`memset` per upload, for every width not a multiple of 64 px (down a mip chain, most levels). That
+alignment rule governs buffer↔texture *copies*, not `queue.writeTexture`. The codebase already
+disagreed with itself — the glyph atlas and sprite paths have always written unaligned rows
+directly on every shipping backend. Confirmed empirically rather than from the spec (write at a
+400-byte pitch, read back through `copyTextureToBuffer`, compare: 0 errors, 0 mismatches of 4000),
+and that probe is now a permanent part of `check-gpu`. `createImageTexture` allocates nothing.
+
+### Corrections to this document, found by checking before deleting
+
+1. **`ProjectionKind` is not dead** (§2.4). `Camera` is live (`ffi/root.zig`, `wgpu_3d.zig` read it
+   every frame) and `ProjectionKind` is its field type. `RigidBody` *was* dead and is gone.
+2. **`libraries/zphysics/src/zphysics.zig` is not dead** (§2.4). It is never `@import`ed by the
+   engine, but it is the root module of zphysics's own `build.zig`, which we consume as a path
+   dependency. Deleting it breaks the build.
+3. **`zmath` is not a four-call-site wrapper** (§2.3, open question 4). It backs the SIMD 4×4
+   inverse (`inverseDet`) as well as `mul`/`transpose`. Hand-rolling a 4×4 inverse to shed a
+   vendored dependency is a bad trade; it stays. Dropping `zpool` still stands — it backs one
+   `Pool()` instantiation that `HandleTable` replaces in Phase 1.
+4. **The vendored-tree pruning is deferred.** The genuinely unreferenced trees
+   (`libraries/zflecs/src`, `zmesh`'s cgltf/par_shapes) are not compiled, so removing them saves
+   disk and nothing else, while making re-vendoring from upstream harder. Low value, non-zero cost.
+
+### Not yet started
+
+Phases 1–5. The `gpu/pipeline.zig` builder and the large-file splits (`wgpu_3d.zig`, the 1417-line
+`Gpu3d.init`) remain from Phase 0's §4 layout; they are mechanical but large, and are best done
+alongside Phase 1 rather than as a separate pass over the same files.

@@ -1,11 +1,12 @@
 # FFI / ABI reference
 
-Zigote.Engine exposes a flat C ABI: **230 `zigote_*` functions**, all `callconv(.c)`, defined across
-`src/ffi/` — **162** in [`ffi/root.zig`](../src/ffi/root.zig) (which also holds the audio and physics
-wrappers), **55** in [`ffi/ecs.zig`](../src/ffi/ecs.zig), **6** in
-[`ffi/dialogs.zig`](../src/ffi/dialogs.zig) and **7** in [`ffi/chrome.zig`](../src/ffi/chrome.zig).
-The C# frontend consumes them via
-`[LibraryImport]` P/Invoke; the bindings are **generated** from these `export fn`s — don't hand-write
+Zigote.Engine exposes a flat C ABI: **286 exported `zigote_*` functions** (the count `nm` reports
+from the built library), all `callconv(.c)`, defined across `src/ffi/` — **204** in
+[`ffi/root.zig`](../src/ffi/root.zig) (which also holds the audio and physics wrappers), **49** in
+[`ffi/ecs.zig`](../src/ffi/ecs.zig), **11** in [`ffi/chrome.zig`](../src/ffi/chrome.zig), **10** in
+`ffi/desktop_shims_stub.zig` (non-macOS only), **6** each in
+[`ffi/dialogs.zig`](../src/ffi/dialogs.zig) and `ffi/channel.zig`.
+The C# frontend consumes them via `[DllImport]` P/Invoke; the bindings are **generated** from these `export fn`s — don't hand-write
 them, regenerate.
 
 `ffi/root.zig` is the authoritative export list. This document is a map, not a replacement for it.
@@ -41,7 +42,7 @@ is a fixed compile-time guard). Features gate on this, never on a backend-name c
 | Offset | Field | Type | Meaning |
 |-------:|-------|------|---------|
 | 0 | `active_backend` | u32 | `BackendId` in use (`auto` may fall back to wgpu) |
-| 4 | `upscalers` | u32 | bitset of `UpscalerKind` (0 = none) |
+| 4 | `upscalers` | u32 | always 0 (wgpu exposes no vendor upscaler) |
 | 8 | `raytracing` | u8 | hardware RT available |
 | 9 | `raytracing_from_render` | u8 | RT usable from fragment shaders, not only compute |
 | 10 | `pad` | [2]u8 | pad to 12 |

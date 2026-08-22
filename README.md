@@ -21,7 +21,7 @@ The native **Zig + wgpu rendering backend** for [Zigote](../README.md). This rep
 
 - **Rendering (pure wgpu-native)** — a forward+ EEVEE-style path: shadows → sky → geometry + MRT
   G-buffer → SSAO/GTAO + contact → SSR → bloom → AgX tonemap → TAA → UI → composite, over a
-  backend-agnostic `RenderGraph`. Plus a batched 2D UI paint path, native sprite and particle passes,
+  fixed per-frame pass list. Plus a batched 2D UI paint path, native sprite and particle passes,
   and glass refraction. wgpu is the *sole* backend; on macOS it renders through Metal under the hood.
 - **Text** — FreeType glyph atlas + HarfBuzz shaping, with a shaped-quad cache keyed by
   `(text, family, size)`.
@@ -31,8 +31,9 @@ The native **Zig + wgpu rendering backend** for [Zigote](../README.md). This rep
   (glTF/FBX/OBJ/… → `.zmesh` caches + a JSON manifest), and spatial/surround audio (`zaudio`/miniaudio).
 - **Math & scene primitives** — Vec/Mat/Quat/Ray, Color/Rect/Size, and a legacy scene/resource scaffold.
 
-Everything is exposed as `zigote_*` C functions (**217 exports** today — 162 in
-[`src/ffi/root.zig`](src/ffi/root.zig), 55 in [`src/ffi/ecs.zig`](src/ffi/ecs.zig)). The C# P/Invoke
+Everything is exposed as `zigote_*` C functions (**286 exports** today — 204 in
+[`src/ffi/root.zig`](src/ffi/root.zig), 49 in [`src/ffi/ecs.zig`](src/ffi/ecs.zig), the rest in
+chrome/dialogs/channel and the non-macOS shims). The C# P/Invoke
 layer is **generated** from these `export fn`s — don't hand-write bindings; regenerate. See the
 [FFI/ABI reference](docs/ffi-reference.md) for the full map.
 
@@ -81,19 +82,22 @@ transitively — needed by wgpu's own Metal backend, not a separate native-Metal
 ```text
 src/
   root.zig                 internal aggregate module
-  core/math/               shared geometry (Color, Rect, Size)
+  core/                    shared geometry (Color, Rect, Size) + SpinLock
   ui/                      headless text measurement + C ABI paint command structs
   engine/                  3D foundation: math (Vec/Mat/Quat/Ray), scene, resources
-  render/                  backend-agnostic RenderGraph, frame context, resources
   renderer/
     wgpu.zig               2D UI renderer + paint-command tessellation
     wgpu_3d.zig            3D forward+ renderer
     wgpu_sprites.zig       native batched 2D sprite pass
     wgpu_particles.zig     native billboard particle pass
     freetype_text.zig      FreeType/HarfBuzz glyph atlas + shaping
-    backend.zig            GpuBackend vtable / BackendId (wgpu; vulkan/d3d12 seams reserved)
+    backend.zig            BackendId + Caps (wgpu is the only backend)
+    frame.zig              the ordered per-frame pass list, FrameContext, FrameStats
+    transient.zig          transient per-frame texture pool
+    shader_prelude.zig     shared WGSL fragments, comptime-prepended
     uniforms.zig           GPU UBO/param structs (offset-pinned via comptime asserts)
-    shaders/               WGSL shader sources (canonical; naga-validated at runtime)
+    shaders/               WGSL sources + common_*.wgsl prelude fragments
+                           (validated by `zig build check-gpu`)
   ffi/
     root.zig               the C ABI export layer (all zigote_* functions)
     assimp_loader.zig      Assimp import → .zmesh + JSON manifest

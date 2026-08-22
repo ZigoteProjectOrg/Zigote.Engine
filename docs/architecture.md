@@ -38,22 +38,20 @@ src/
   root.zig                 internal aggregate module (re-exports the sub-modules)
 
   core/                    engine-neutral primitives
-    math/                  Color, Rect, Size
+    geometry.zig           Color, Rect, Size, Offset, Constraints, EdgeInsets
+    sync.zig               SpinLock
 
   ui/                      headless UI support (no GPU)
     text.zig               text measurement + text styles
     geometry.zig           2D geometry helpers
     render/paint.zig       (C ABI paint command structs live in ffi/root.zig today)
 
-  engine/                  3D foundation (mostly legacy scaffold; the live scene lives in C#)
+  engine/                  3D foundation. NOT legacy: `World` is the live mesh/material/transform
+                           store the 3D renderer walks every frame. C# drives tree editing; Zig
+                           owns the storage and traversal.
     math/                  Vec2/3/4, Mat4, Quat, Ray
     scene/                 World, SceneNode, components
     resources/             Mesh, Material, zmesh_format (the .zmesh binary parser)
-
-  render/                  backend-agnostic frame orchestration
-    render_graph.zig       RenderGraph: passes with reads/writes, topological execution
-    frame_context.zig      per-frame context passed to passes
-    render_resource.zig    transient resource pool + handles
 
   renderer/                the wgpu implementation
     wgpu.zig               2D UI renderer + paint-command tessellation
@@ -62,14 +60,17 @@ src/
     wgpu_sprites.zig       native batched 2D sprite pass
     wgpu_particles.zig     native billboard particle pass
     wgpu_blur.zig          separable blur helper
-    wgpu_backend.zig       WgpuBackend: device/queue/surface lifecycle
     wgpu_ui_shaders.zig    UI shader-module construction
     wgpu_ui_util.zig       UI tessellation helpers
     freetype_text.zig      FreeType glyph atlas + HarfBuzz shaping + shaped-quad cache
     mesh_cache.zig         GPU mesh buffer cache
-    backend.zig            GpuBackend vtable, BackendId, Caps, Upscaler/RayTracer seams
+    backend.zig            BackendId + Caps (wgpu is the only backend; the vtable is gone)
+    frame.zig              the ordered per-frame pass list, FrameContext, FrameStats
+    transient.zig          transient (per-frame) texture pool
+    shader_prelude.zig     WGSL fragments comptime-prepended to shader sources
     uniforms.zig           GPU UBO/param structs (offsets pinned by comptime asserts)
-    shaders/               21 WGSL shader sources (canonical; naga-validated at runtime)
+    shaders/               WGSL sources + common_*.wgsl prelude fragments
+                           (validated by `zig build check-gpu`)
 
   ffi/                     the C ABI export layer — everything C# calls
     root.zig               ~163 zigote_* exports: lifecycle, window, paint, scene, render, sprites…
@@ -90,7 +91,7 @@ compiles `ffi/root.zig` into the shared library. See [building.md](building.md).
 ## Module dependency direction
 
 ```
-ffi/*  ──►  renderer/*  ──►  render/*  ──►  engine/* ─┐
+ffi/*  ──►  renderer/*  ──►  engine/* ────────────────┐
   │            │                                      ├──►  core/*
   └────────────┴──────────────►  ui/*  ───────────────┘
 ```

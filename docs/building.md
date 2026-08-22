@@ -1,15 +1,22 @@
 # Building
 
-Requires **Zig 0.16+** (matching the toolchain the parent solution pins). Two build steps:
+Requires **Zig 0.16+** (matching the toolchain the parent solution pins). Three build steps:
 
 ```bash
 zig build shared-lib     # build libzigote.dylib / zigote.dll / libzigote.so
-zig build test           # run the module tests (math, scene, resources)
+zig build test           # run the module tests (math, scene, resources, renderer, ffi)
+zig build check-gpu      # compile every WGSL shader headlessly; check the texture row-pitch contract
 ```
 
-> **Validate with `zig build shared-lib`, not plain `zig build`.** WGSL shaders are only checked at
-> runtime by wgpu-native's embedded naga — a broken shader compiles fine and fails on the first frame.
-> A bare `zig build` in Debug can also mask errors behind a stale cache; prefer the explicit step.
+> **Validate with `zig build shared-lib`, not plain `zig build`** — a bare `zig build` in Debug can
+> mask errors behind a stale cache.
+>
+> **A green build says nothing about the shaders.** WGSL is compiled by wgpu-native's embedded naga
+> at *runtime*, so a broken shader builds perfectly and fails on the first frame that draws it — that
+> is how a shader file once drifted out of sync with its live inline copy unnoticed. `zig build
+> check-gpu` creates a real device with no window and compiles all of them, reporting naga's own
+> diagnostics with file and line. It needs an adapter (a GPU, or a software rasteriser such as
+> lavapipe) and skips with a notice where there is none, so it is safe to run anywhere.
 
 You normally never run this by hand. `Zigote.Core.csproj` runs `zig build` as a pre-build step and
 copies the resulting library into its output directory. **Native (Zig/shader) changes require a full

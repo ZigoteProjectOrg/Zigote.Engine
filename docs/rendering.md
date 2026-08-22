@@ -13,24 +13,33 @@ There are three cooperating render layers:
 
 ## Backend selection
 
-`renderer/backend.zig` defines the abstraction *seam*: a `GpuBackend` vtable, a `BackendId`
-(`auto` / `wgpu` / `vulkan` / `d3d12` — `.metal` was removed), a `Caps` struct, and reserved
-`Upscaler` / `RayTracer` sub-interfaces. **Only wgpu is implemented today** — `auto`, `vulkan`, and
-`d3d12` all resolve to `.wgpu`. The seam exists so a future native backend can slot in; features gate
-on `Caps`, never on backend-name checks.
+`renderer/backend.zig` holds a `BackendId` (`auto` / `wgpu`) and a `Caps` struct. **wgpu is the
+backend.** The former `GpuBackend` vtable, the `Upscaler`/`RayTracer` reserved sub-interfaces and
+the `vulkan`/`d3d12` enum arms were removed: nothing implemented them, and the hot path called
+`surface.getCurrentTexture` / `surface.present` directly rather than dispatching through the vtable.
+Retired backend ids still decode to `.wgpu`, so an older host that sends one keeps working.
+
+If a native Vulkan/D3D12 renderer is ever wanted it arrives as a second `renderer_*/` directory
+selected at **build time**, not as a runtime vtable. Features gate on `Caps`, never on
+backend-name checks.
 
 Selecting a backend re-creates the device, so it is an init-time choice. The instance is created with
 per-OS backends (`macOS → Metal`; `Windows → DX12|Vulkan`; else `Vulkan|GL`) rather than the
 all-backends default, so adapter creation never probes a GPU stack the engine won't use.
 
-## The RenderGraph
+## The frame pass list
 
-`render/render_graph.zig` is a small backend-agnostic pass scheduler. A `Pass` declares its
-`pass_type`, its `reads` and `writes` resource handles, and an `execute` callback; `RenderGraph`
-topologically orders passes by their dependencies and runs them. `setEnabled(pass_type, on)` toggles a
-whole class of pass. This is what `zigote_render_frame_v2` drives. The immediate-mode
-`zigote_render_3d` entry point drives the same underlying pipeline directly for the editor's
-change-gated viewport.
+`renderer/frame.zig` runs the frame's passes in order and collects per-frame statistics. It is a
+comptime array of `{name, execute}` — the list is fixed, so it is not built at init or allocated.
+
+This replaced a `RenderGraph` that carried `reads`/`writes` declarations, a pass-lifetime solver, a
+validator and an enable-toggle. None of it did anything: execution was registration order,
+`computeLifetimes` had no non-test caller, `validate()`'s result was discarded at its one call site,
+`setEnabled` had no callers, and 4 of 7 pass categories and 4 of 9 resource kinds were never
+referenced. Nothing inserted a barrier, aliased a resource, reordered or culled.
+
+A pass that fails is recorded and skipped rather than aborting the frame, so one broken pass cannot
+black-screen the editor; `zigote_render_frame_v2` logs what failed.
 
 ## The 3D pipeline (forward+, EEVEE-style)
 
@@ -158,8 +167,11 @@ applied at creation time. A failed init latches (`gpu_3d_failed`) and the app ke
 
 ## Validating a render change
 
-- Build with `zig build shared-lib`, **not** plain `zig build` — WGSL is only checked at runtime by
-  wgpu-native's embedded naga, so a broken shader compiles fine and fails on the first frame.
+- Run **`zig build check-gpu`** — it compiles every shader through naga on a real headless device
+  and reports the diagnostic with file and line. WGSL is otherwise only checked at *runtime*, so a
+  broken shader builds perfectly and fails on the first frame that draws it. The same step asserts
+  the unaligned-`writeTexture` row-pitch contract the image upload paths depend on.
+- Build with `zig build shared-lib`, not plain `zig build`, so the library actually links.
 - Native/shader changes need a **full process restart** — they apply at load, not via C# hot reload.
 - The parent solution's `ZIGOTE_SHOT=/path/out.bmp` env var dumps the tonemapped 3D viewport to a
   24-bit BMP deterministically at a fixed frame; `tools/bmpdiff.py` gives a byte-exact before/after
