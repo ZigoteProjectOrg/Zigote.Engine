@@ -25,7 +25,7 @@ const wire_types = [_]type{
     abi.ZgSize,
     abi.ZgAbiInfo,
     abi.ZgRendererCaps,
-    abi.ZgResult,
+    abi.ZgStatus,
     abi.ZgTextureLoadItem,
     abi.ZgRenderSettings3D,
     abi.ZgEngineStats,
@@ -92,6 +92,9 @@ test "every type declared in abi.zig is in the manifest" {
         if (@TypeOf(T) != type) continue;
         const info = @typeInfo(T);
         if (info != .@"struct" and info != .@"enum") continue;
+        // ZgResult is a retained alias for ZgStatus — the same type under a second name. It must
+        // not be counted or emitted twice.
+        if (comptime std.mem.eql(u8, d.name, "ZgResult")) continue;
         counted += 1;
 
         const listed = inline for (wire_types) |W| {

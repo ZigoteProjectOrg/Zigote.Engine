@@ -15,6 +15,7 @@
 //! never reads the request storage, and the main thread never frees it while a dialog is pending.
 
 const std = @import("std");
+const ZgStatus = @import("zigote_abi").ZgStatus;
 const builtin = @import("builtin");
 const sdl3 = @import("sdl3");
 
@@ -234,10 +235,11 @@ export fn zigote_file_dialog_result() [*c]const u8 {
 
 /// Release a completed request (result buffer + option storage) and return to idle. No-op while
 /// a dialog is still pending — the native dialog owns the storage until then. Main thread only.
-export fn zigote_file_dialog_consume() void {
-    if (status.load(.acquire) == .pending) return;
+export fn zigote_file_dialog_consume() ZgStatus {
+    if (status.load(.acquire) == .pending) return .ok;
     clear();
     status.store(.idle, .release);
+    return .ok;
 }
 
 fn buildProps(

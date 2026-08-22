@@ -21,13 +21,15 @@
 //! prevent. See docs/v2-design.md §5.2.
 
 const std = @import("std");
+const ZgStatus = @import("zigote_abi").ZgStatus;
 
 export fn zigote_macmenu_set_handler(cb: ?*const fn (i32) callconv(.c) void) void {
     _ = cb;
 }
 
-export fn zigote_macmenu_reset(app_name: [*c]const u8) void {
+export fn zigote_macmenu_reset(app_name: [*c]const u8) ZgStatus {
     _ = app_name;
+    return .ok;
 }
 
 export fn zigote_macmenu_add_menu(title: [*c]const u8) ?*anyopaque {
@@ -50,7 +52,7 @@ export fn zigote_macmenu_add_item(
     enabled: c_int,
     sf_symbol: [*c]const u8,
     checked_state: c_int,
-) void {
+) ZgStatus {
     _ = parent_menu;
     _ = title;
     _ = tag;
@@ -59,19 +61,26 @@ export fn zigote_macmenu_add_item(
     _ = enabled;
     _ = sf_symbol;
     _ = checked_state;
+    return .ok;
 }
 
-export fn zigote_macmenu_add_separator(parent_menu: ?*anyopaque) void {
+export fn zigote_macmenu_add_separator(parent_menu: ?*anyopaque) ZgStatus {
     _ = parent_menu;
+    return .ok;
 }
 
-export fn zigote_macmenu_commit() void {}
+export fn zigote_macmenu_commit() ZgStatus {
+    return .ok;
+}
 
-export fn zigote_macmenu_show_standard_about() void {}
+export fn zigote_macmenu_show_standard_about() ZgStatus {
+    return .ok;
+}
 
-export fn zigote_macmenu_set_menu_role(menu_ptr: ?*anyopaque, role: i32) void {
+export fn zigote_macmenu_set_menu_role(menu_ptr: ?*anyopaque, role: i32) ZgStatus {
     _ = menu_ptr;
     _ = role;
+    return .ok;
 }
 
 /// 0 = the OS did not take the drag (the app should run its own in-app drag).
@@ -87,16 +96,21 @@ export fn zigote_mactray_set_handler(cb: ?*const fn (i32) callconv(.c) void) voi
     _ = cb;
 }
 
-export fn zigote_mactray_show(tooltip: [*c]const u8) void {
+export fn zigote_mactray_show(tooltip: [*c]const u8) ZgStatus {
     _ = tooltip;
+    return .ok;
 }
 
-export fn zigote_mactray_set_tooltip(tooltip: [*c]const u8) void {
+export fn zigote_mactray_set_tooltip(tooltip: [*c]const u8) ZgStatus {
     _ = tooltip;
+    return .ok;
 }
 
-export fn zigote_mactray_set_menu(spec: [*c]const u8) void {
+export fn zigote_mactray_set_menu(spec: [*c]const u8) ZgStatus {
     _ = spec;
+    return .ok;
 }
 
-export fn zigote_mactray_hide() void {}
+export fn zigote_mactray_hide() ZgStatus {
+    return .ok;
+}

@@ -9,6 +9,7 @@
 //! are main-thread only. Design record: docs/file-dialogs.md (windowed dialogs section).
 
 const std = @import("std");
+const ZgStatus = @import("zigote_abi").ZgStatus;
 const builtin = @import("builtin");
 const sdl3 = @import("sdl3");
 
@@ -23,16 +24,17 @@ extern fn zigote_macwin_set_dock_visible(visible: i32) void;
 /// styleMask bit on fullscreen/zoom round-trips, silently reverting a unified titlebar to
 /// system chrome — the app calls this on window-resize events (cheap: a probe, and a no-op
 /// while fullscreen or when the chrome is intact).
-export fn zigote_window_chrome_sync(window_id: u32) void {
+export fn zigote_window_chrome_sync(window_id: u32) ZgStatus {
     if (is_macos) {
-        const entry = entryFor(window_id, false) orelse return;
-        if (entry.style != STYLE_MAC_UNIFIED) return;
-        const win = sdlWindow(window_id) orelse return;
-        if (sdl3.c.SDL_GetWindowFlags(win) & sdl3.c.SDL_WINDOW_FULLSCREEN != 0) return;
-        const ns = nsWindowOf(win) orelse return;
-        if (zigote_macwin_get_unified(ns) == 1) return;
+        const entry = entryFor(window_id, false) orelse return .ok;
+        if (entry.style != STYLE_MAC_UNIFIED) return .ok;
+        const win = sdlWindow(window_id) orelse return .ok;
+        if (sdl3.c.SDL_GetWindowFlags(win) & sdl3.c.SDL_WINDOW_FULLSCREEN != 0) return .ok;
+        const ns = nsWindowOf(win) orelse return .ok;
+        if (zigote_macwin_get_unified(ns) == 1) return .ok;
         _ = zigote_window_chrome_set(window_id, STYLE_MAC_UNIFIED);
     }
+    return .ok;
 }
 
 /// Diagnostic: report the actually-applied chrome for a window. -3 = not macOS, -2 = unknown
@@ -167,32 +169,35 @@ export fn zigote_window_chrome_drag_rects(
     window_id: u32,
     rects: [*c]const f32,
     count: u32,
-) void {
-    const entry = entryFor(window_id, true) orelse return;
+) ZgStatus {
+    const entry = entryFor(window_id, true) orelse return .ok;
     const n = @min(count, max_rects);
     entry.rect_count = n;
     if (n > 0 and rects != null) {
         for (0..n * 4) |i| entry.rects[i] = rects[i];
     }
+    return .ok;
 }
 
 /// Set the CSD frame's corner radius (logical px). Where the platform rounds the window itself —
 /// macOS — this takes effect immediately on a window already in CSD; elsewhere it is remembered
 /// for nothing, since the app clips its own corners. Call it whenever the app's radius changes;
 /// applying a chrome style re-reads it.
-export fn zigote_window_chrome_set_corner_radius(window_id: u32, radius: f32) void {
-    const entry = entryFor(window_id, true) orelse return;
+export fn zigote_window_chrome_set_corner_radius(window_id: u32, radius: f32) ZgStatus {
+    const entry = entryFor(window_id, true) orelse return .ok;
     entry.corner_radius = radius;
     if (is_macos and entry.style == STYLE_BORDERLESS_CSD) {
-        const win = sdlWindow(window_id) orelse return;
+        const win = sdlWindow(window_id) orelse return .ok;
         zigote_macwin_set_csd(nsWindowOf(win), 1, radius);
     }
+    return .ok;
 }
 
 /// Minimize (CSD button action).
-export fn zigote_window_chrome_minimize(window_id: u32) void {
-    const win = sdlWindow(window_id) orelse return;
+export fn zigote_window_chrome_minimize(window_id: u32) ZgStatus {
+    const win = sdlWindow(window_id) orelse return .ok;
     _ = sdl3.c.SDL_MinimizeWindow(win);
+    return .ok;
 }
 
 /// Maximized or fullscreen — CSD hosts draw square corners in these states.
@@ -215,18 +220,20 @@ export fn zigote_window_is_transparent(window_id: u32) bool {
 /// Application-wide rather than per-window, because the activation policy is: it is what makes a
 /// process a foreground app at all. A previewed app hides its own window and is watched inside the
 /// IDE, so the Dock tile it keeps is for a window nobody can bring back.
-export fn zigote_app_set_dock_visible(visible: bool) void {
+export fn zigote_app_set_dock_visible(visible: bool) ZgStatus {
     if (is_macos) zigote_macwin_set_dock_visible(@intFromBool(visible));
+    return .ok;
 }
 
 /// Maximize, or restore when already maximized (CSD button action).
-export fn zigote_window_chrome_toggle_maximize(window_id: u32) void {
-    const win = sdlWindow(window_id) orelse return;
+export fn zigote_window_chrome_toggle_maximize(window_id: u32) ZgStatus {
+    const win = sdlWindow(window_id) orelse return .ok;
     const flags = sdl3.c.SDL_GetWindowFlags(win);
     if (flags & sdl3.c.SDL_WINDOW_MAXIMIZED != 0)
         _ = sdl3.c.SDL_RestoreWindow(win)
     else
         _ = sdl3.c.SDL_MaximizeWindow(win);
+    return .ok;
 }
 
 const edge = 8; // CSD resize border, logical px

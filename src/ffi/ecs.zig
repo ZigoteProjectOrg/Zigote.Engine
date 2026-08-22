@@ -13,6 +13,7 @@
 /// Naming note: a Zig parameter named for a C# keyword breaks the binding generator, so the
 /// exported names differ from the obvious ones in two places (`evt`, `baseEntity`).
 const std = @import("std");
+const ZgStatus = @import("zigote_abi").ZgStatus;
 
 pub const flecs = @cImport({
     @cInclude("flecs.h");
@@ -89,31 +90,36 @@ export fn zigote_ecs_world_create() u64 {
     return h;
 }
 
-export fn zigote_ecs_world_destroy(world: u64) void {
+export fn zigote_ecs_world_destroy(world: u64) ZgStatus {
     // Drop the handle first, so a second destroy of the same handle finds nothing and returns
     // rather than calling ecs_fini twice.
-    const w = untrack(*flecs.ecs_world_t, &worlds, world) orelse return;
+    const w = untrack(*flecs.ecs_world_t, &worlds, world) orelse return .invalid_handle;
     _ = flecs.ecs_fini(w);
+    return .ok;
 }
 
 export fn zigote_ecs_progress(world: u64, dt: f32) u8 {
     return if (flecs.ecs_progress((worldFromHandle(world) orelse return 0), dt)) 1 else 0;
 }
 
-export fn zigote_ecs_set_threads(world: u64, threads: i32) void {
-    flecs.ecs_set_threads((worldFromHandle(world) orelse return), threads);
+export fn zigote_ecs_set_threads(world: u64, threads: i32) ZgStatus {
+    flecs.ecs_set_threads((worldFromHandle(world) orelse return .invalid_handle), threads);
+    return .ok;
 }
 
-export fn zigote_ecs_set_target_fps(world: u64, fps: f32) void {
-    flecs.ecs_set_target_fps((worldFromHandle(world) orelse return), fps);
+export fn zigote_ecs_set_target_fps(world: u64, fps: f32) ZgStatus {
+    flecs.ecs_set_target_fps((worldFromHandle(world) orelse return .invalid_handle), fps);
+    return .ok;
 }
 
-export fn zigote_ecs_defer_begin(world: u64) void {
-    _ = flecs.ecs_defer_begin((worldFromHandle(world) orelse return));
+export fn zigote_ecs_defer_begin(world: u64) ZgStatus {
+    _ = flecs.ecs_defer_begin((worldFromHandle(world) orelse return .invalid_handle));
+    return .ok;
 }
 
-export fn zigote_ecs_defer_end(world: u64) void {
-    _ = flecs.ecs_defer_end((worldFromHandle(world) orelse return));
+export fn zigote_ecs_defer_end(world: u64) ZgStatus {
+    _ = flecs.ecs_defer_end((worldFromHandle(world) orelse return .invalid_handle));
+    return .ok;
 }
 
 // ── Component registration ─────────────────────────────────────────────────────
@@ -147,20 +153,23 @@ export fn zigote_ecs_entity_create_named(world: u64, name: [*c]const u8) u64 {
     return flecs.ecs_entity_init((worldFromHandle(world) orelse return 0), &desc);
 }
 
-export fn zigote_ecs_entity_destroy(world: u64, entity: u64) void {
-    flecs.ecs_delete((worldFromHandle(world) orelse return), entity);
+export fn zigote_ecs_entity_destroy(world: u64, entity: u64) ZgStatus {
+    flecs.ecs_delete((worldFromHandle(world) orelse return .invalid_handle), entity);
+    return .ok;
 }
 
 export fn zigote_ecs_entity_is_alive(world: u64, entity: u64) u8 {
     return if (flecs.ecs_is_alive((worldFromHandle(world) orelse return 0), entity)) 1 else 0;
 }
 
-export fn zigote_ecs_add(world: u64, entity: u64, component: u64) void {
-    flecs.ecs_add_id((worldFromHandle(world) orelse return), entity, component);
+export fn zigote_ecs_add(world: u64, entity: u64, component: u64) ZgStatus {
+    flecs.ecs_add_id((worldFromHandle(world) orelse return .invalid_handle), entity, component);
+    return .ok;
 }
 
-export fn zigote_ecs_remove(world: u64, entity: u64, component: u64) void {
-    flecs.ecs_remove_id((worldFromHandle(world) orelse return), entity, component);
+export fn zigote_ecs_remove(world: u64, entity: u64, component: u64) ZgStatus {
+    flecs.ecs_remove_id((worldFromHandle(world) orelse return .invalid_handle), entity, component);
+    return .ok;
 }
 
 export fn zigote_ecs_has(world: u64, entity: u64, component: u64) u8 {
@@ -173,8 +182,9 @@ export fn zigote_ecs_owns(world: u64, entity: u64, component: u64) u8 {
     return if (flecs.ecs_owns_id((worldFromHandle(world) orelse return 0), entity, component)) 1 else 0;
 }
 
-export fn zigote_ecs_set(world: u64, entity: u64, component: u64, data: [*c]const u8, size: usize) void {
-    _ = flecs.ecs_set_id((worldFromHandle(world) orelse return), entity, component, size, data);
+export fn zigote_ecs_set(world: u64, entity: u64, component: u64, data: [*c]const u8, size: usize) ZgStatus {
+    _ = flecs.ecs_set_id((worldFromHandle(world) orelse return .invalid_handle), entity, component, size, data);
+    return .ok;
 }
 
 export fn zigote_ecs_get(world: u64, entity: u64, component: u64) [*c]const u8 {
@@ -185,8 +195,9 @@ export fn zigote_ecs_get_mut(world: u64, entity: u64, component: u64) [*c]u8 {
     return @ptrCast(flecs.ecs_get_mut_id((worldFromHandle(world) orelse return null), entity, component));
 }
 
-export fn zigote_ecs_modified(world: u64, entity: u64, component: u64) void {
-    flecs.ecs_modified_id((worldFromHandle(world) orelse return), entity, component);
+export fn zigote_ecs_modified(world: u64, entity: u64, component: u64) ZgStatus {
+    flecs.ecs_modified_id((worldFromHandle(world) orelse return .invalid_handle), entity, component);
+    return .ok;
 }
 
 // ── Queries — pull model ───────────────────────────────────────────────────────
@@ -203,9 +214,10 @@ export fn zigote_ecs_query_create(world: u64, components: [*c]const u64, count: 
     return h;
 }
 
-export fn zigote_ecs_query_destroy(query: u64) void {
-    const q = untrack(*flecs.ecs_query_t, &queries, query) orelse return;
+export fn zigote_ecs_query_destroy(query: u64) ZgStatus {
+    const q = untrack(*flecs.ecs_query_t, &queries, query) orelse return .invalid_handle;
     flecs.ecs_query_fini(q);
+    return .ok;
 }
 
 export fn zigote_ecs_query_iter(world: u64, query: u64) u64 {
@@ -236,19 +248,21 @@ export fn zigote_ecs_iter_field(iter: u64, term_index: i32, size: usize) [*c]u8 
     return @ptrCast(flecs.ecs_field_w_size(&box.it, size, @intCast(term_index)));
 }
 
-export fn zigote_ecs_iter_fini(iter: u64) void {
-    const box = untrack(*IterBox, &iters, iter) orelse return;
+export fn zigote_ecs_iter_fini(iter: u64) ZgStatus {
+    const box = untrack(*IterBox, &iters, iter) orelse return .invalid_handle;
     flecs.ecs_iter_fini(&box.it);
     std.heap.c_allocator.destroy(box);
+    return .ok;
 }
 
 // Free only our IterBox wrapper WITHOUT calling ecs_iter_fini. Use this after a pull-query loop
 // has run ecs_query_next to completion (false return): flecs finalizes the iterator internally at
 // that point, so a second ecs_iter_fini is a double-free (it->query is NULL → crash). Only an
 // early-terminated iteration still owns a live flecs iterator and must use iterFini instead.
-export fn zigote_ecs_iter_free(iter: u64) void {
-    const box = untrack(*IterBox, &iters, iter) orelse return;
+export fn zigote_ecs_iter_free(iter: u64) ZgStatus {
+    const box = untrack(*IterBox, &iters, iter) orelse return .invalid_handle;
     std.heap.c_allocator.destroy(box);
+    return .ok;
 }
 
 // ── Systems & observers ────────────────────────────────────────────────────────
@@ -320,20 +334,23 @@ export fn zigote_ecs_iter_ctx(iter_ptr: usize) u64 {
     return @intFromPtr(it.ctx);
 }
 
-export fn zigote_ecs_add_pair(world: u64, e: u64, relation: u64, target: u64) void {
-    flecs.ecs_add_pair((worldFromHandle(world) orelse return), e, relation, target);
+export fn zigote_ecs_add_pair(world: u64, e: u64, relation: u64, target: u64) ZgStatus {
+    flecs.ecs_add_pair((worldFromHandle(world) orelse return .invalid_handle), e, relation, target);
+    return .ok;
 }
 
-export fn zigote_ecs_set_parent(world: u64, child: u64, parent: u64) void {
-    flecs.ecs_add_pair((worldFromHandle(world) orelse return), child, flecs.EcsChildOf, parent);
+export fn zigote_ecs_set_parent(world: u64, child: u64, parent: u64) ZgStatus {
+    flecs.ecs_add_pair((worldFromHandle(world) orelse return .invalid_handle), child, flecs.EcsChildOf, parent);
+    return .ok;
 }
 
 export fn zigote_ecs_get_parent(world: u64, child: u64) u64 {
     return flecs.ecs_get_target((worldFromHandle(world) orelse return 0), child, flecs.EcsChildOf, 0);
 }
 
-export fn zigote_ecs_is_a(world: u64, e: u64, baseEntity: u64) void {
-    flecs.ecs_add_pair((worldFromHandle(world) orelse return), e, flecs.EcsIsA, baseEntity);
+export fn zigote_ecs_is_a(world: u64, e: u64, baseEntity: u64) ZgStatus {
+    flecs.ecs_add_pair((worldFromHandle(world) orelse return .invalid_handle), e, flecs.EcsIsA, baseEntity);
+    return .ok;
 }
 
 export fn zigote_ecs_new_prefab(world: u64, name: [*c]const u8) u64 {
@@ -415,32 +432,33 @@ test "a stale or junk handle is rejected instead of dereferenced" {
     try t.expect(e != 0);
     try t.expectEqual(@as(u8, 1), zigote_ecs_entity_is_alive(world, e));
 
-    zigote_ecs_world_destroy(world);
+    _ = zigote_ecs_world_destroy(world);
 
     // Everything below would previously have run against a freed flecs world.
     try t.expectEqual(@as(u8, 0), zigote_ecs_progress(world, 0.016));
     try t.expectEqual(@as(u8, 0), zigote_ecs_entity_is_alive(world, e));
     try t.expectEqual(@as(u64, 0), zigote_ecs_entity_create(world));
     try t.expectEqual(@as(u64, 0), zigote_ecs_query_create(world, null, 0));
-    zigote_ecs_world_destroy(world); // double destroy is a no-op, not a double ecs_fini
-    zigote_ecs_set_threads(world, 2); // void exports simply return
+    // A dead handle now reports itself instead of failing silently.
+    try t.expectEqual(ZgStatus.invalid_handle, zigote_ecs_world_destroy(world)); // no double ecs_fini
+    try t.expectEqual(ZgStatus.invalid_handle, zigote_ecs_set_threads(world, 2));
 
     // Handles that were never issued at all.
     try t.expectEqual(@as(u8, 0), zigote_ecs_progress(0, 0.016));
     try t.expectEqual(@as(u8, 0), zigote_ecs_progress(0xDEAD_BEEF_DEAD_BEEF, 0.016));
-    zigote_ecs_query_destroy(0xDEAD_BEEF_DEAD_BEEF);
-    zigote_ecs_iter_free(0xDEAD_BEEF_DEAD_BEEF);
+    _ = zigote_ecs_query_destroy(0xDEAD_BEEF_DEAD_BEEF);
+    _ = zigote_ecs_iter_free(0xDEAD_BEEF_DEAD_BEEF);
 }
 
 test "a query outlives neither its handle nor a second destroy" {
     const t = @import("std").testing;
 
     const world = zigote_ecs_world_create();
-    defer zigote_ecs_world_destroy(world);
+    defer _ = zigote_ecs_world_destroy(world);
 
     const q = zigote_ecs_query_create(world, null, 0);
     try t.expect(q != 0);
-    zigote_ecs_query_destroy(q);
-    zigote_ecs_query_destroy(q); // no double ecs_query_fini
+    try t.expectEqual(ZgStatus.ok, zigote_ecs_query_destroy(q));
+    try t.expectEqual(ZgStatus.invalid_handle, zigote_ecs_query_destroy(q)); // no double fini
     try t.expectEqual(@as(u64, 0), zigote_ecs_query_iter(world, q));
 }

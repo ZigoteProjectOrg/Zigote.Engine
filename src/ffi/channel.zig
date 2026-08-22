@@ -22,6 +22,7 @@
 //! expected to hand work to its own loop rather than touch UI state where it lands.
 
 const std = @import("std");
+const ZgStatus = @import("zigote_abi").ZgStatus;
 const SpinLock = @import("zigote").core.sync.SpinLock;
 
 /// A native channel implementation. Reads `payload[0..payload_len]`, writes at most `reply_cap`
@@ -105,7 +106,7 @@ export fn zigote_channel_register(name: [*c]const u8, handler: *const fn (payloa
 }
 
 /// Drop a channel's native implementation. Safe to call for a name that was never registered.
-export fn zigote_channel_unregister(name: [*c]const u8) void {
+export fn zigote_channel_unregister(name: [*c]const u8) ZgStatus {
     const key = span(name);
     lock.lock();
     defer lock.unlock();
@@ -114,8 +115,9 @@ export fn zigote_channel_unregister(name: [*c]const u8) void {
         // Order carries no meaning, so the last entry fills the hole — no shifting.
         entries[i] = entries[entry_count - 1];
         entry_count -= 1;
-        return;
+        return .ok;
     }
+    return .ok;
 }
 
 /// Call a channel's native implementation. Returns the reply length written into `reply`, or -1 when
@@ -208,7 +210,7 @@ test "register, invoke, replace and unregister" {
     try std.testing.expectEqual(@as(i32, 2), zigote_channel_invoke("media", "hello", 5, &buf, buf.len));
     try std.testing.expectEqualStrings("ok", buf[0..2]);
 
-    zigote_channel_unregister("media");
+    _ = zigote_channel_unregister("media");
     try std.testing.expect(!zigote_channel_has("media"));
 }
 

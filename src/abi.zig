@@ -159,12 +159,42 @@ pub const ZgRendererCaps = extern struct {
 };
 
 
-/// Typed result code returned by fallible FFI functions.
-/// Replaces raw i32 0/-1 returns so the C# side has a typed enum to check.
-pub const ZgResult = enum(i32) {
+/// The one status code every fallible export returns.
+///
+/// Before this there were five conventions at once: 178 `void` exports that swallowed failure
+/// silently, `u64`/`u32` sentinels where 0 meant "failed", `bool`, `u8` standing in for bool, and
+/// `i32` ladders in the dialog code — with `ZgResult` (ok/err) used by 8 of ~290. A caller could
+/// not tell "not ready yet" from "you passed a dead handle" from "the GPU refused", and most of the
+/// time could not tell anything happened at all.
+///
+/// `ok` is 0 and `err` is -1, so the old two-value `ZgResult` encoding is a subset: a host that
+/// only checks `!= 0` keeps working. Everything else is negative and more specific.
+pub const ZgStatus = enum(i32) {
     ok = 0,
+    /// Unspecified failure. Prefer a specific code; this is for genuinely unclassifiable errors.
     err = -1,
+    /// The engine, or a resource handle, is not live — never created, already destroyed, or from a
+    /// previous occupant of a reused slot.
+    invalid_handle = -2,
+    /// A parameter was out of range, null where it may not be, or otherwise malformed.
+    invalid_argument = -3,
+    out_of_memory = -4,
+    /// The platform or the active backend cannot do this.
+    unsupported = -5,
+    /// The subsystem exists but is not initialised yet (audio device not opened, 3D not created).
+    not_ready = -6,
+    /// The GPU rejected the work, or a device resource could not be created.
+    gpu_failure = -7,
+    /// A file or stream operation failed.
+    io_failure = -8,
+
+    pub fn isOk(self: ZgStatus) bool {
+        return self == .ok;
+    }
 };
+
+/// Retained name for the previous two-value result. Identical encoding; `ZgStatus` is the contract.
+pub const ZgResult = ZgStatus;
 
 
 /// One entry for the parallel batch texture loader. `base_color_path` / `mr_path` / `normal_path`
