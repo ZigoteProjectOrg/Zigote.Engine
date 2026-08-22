@@ -663,7 +663,25 @@ I would have concluded the change did nothing.
 Statistically identical. That is the correct outcome: the removed bloom level was never *read*, so
 no GPU work went with it, and nothing else in this series touched per-frame work on the 3D path.
 
-### 2D paint throughput (new measurement, no "before")
+### 2D paint throughput — the tagged stream DID make it faster
+
+Measured before and after the tagged paint stream landed, same benchmark, medians of repeated runs:
+
+| commands | before (flat 112 B command) | after (tagged records) | |
+|---:|---:|---:|---|
+| 2 000 | 1.03 ms | **0.72 ms** | −30% |
+| 20 000 | 7.53 ms | **6.21 ms** | −18% |
+
+The native render column at 2 000 commands went 0.72 → 0.41 ms, a 43% cut. This was *not*
+predicted: the tagged stream was justified as a correctness change (no field aliasing), and §10
+had concluded the paint path's costs were largely already avoided. Smaller records turn out to
+matter on their own — a rect is 48 bytes rather than 112, so less crosses the boundary and less is
+touched to decode it. The clip-ring staging (P5) contributes to the same column.
+
+Worth stating plainly because it cuts against my own earlier analysis: measuring after the change
+found a win that measuring before it did not predict.
+
+### 2D paint throughput, current absolute numbers
 
 `ZIGOTE_SMOKE_PAINT`, vsync off — the benchmark did not exist before, so there is nothing to compare
 against; these are the numbers future work is measured against.
