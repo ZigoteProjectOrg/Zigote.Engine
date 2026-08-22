@@ -79,7 +79,7 @@ fn halton(index: u32, base: u32) f32 {
 // emulator's fence watchdog declares the device lost. Written once, before any Gpu3d exists.
 pub var ENV_SIZE: u32 = 512;
 const ENV_MIPS: u32 = 6; // 128 → 4 px; max LOD index = ENV_MIPS - 1
-const BLOOM_MIPS: u32 = 6; // mip-chain bloom levels (mip0 full-res, unused; chain output at mip1)
+const BLOOM_MIPS: u32 = 5; // mip-chain bloom levels; level 0 is HALF-res and is the chain output
 const ENV_CUBE_FORMAT: wgpu.TextureFormat = .rgba16_float;
 /// Uniform offset alignment for the per-face/mip bake params (wgpu min is 256).
 const ENV_SLOT: u32 = 256;
@@ -2471,7 +2471,8 @@ pub const Gpu3d = struct {
             return error.BindGroupCreateFailed;
         };
         // Same bindings as tonemap_bg but binding 0 = dof_view (the tonemap samples DoF'd colour).
-        const bloom_mip1_view = self.bloom_mip_views[1] orelse self.bloom_mip_views[0].?;
+        // Chain level 0 is the tent-upsample output (see ensurePostTargets).
+        const bloom_mip1_view = self.bloom_mip_views[0].?;
         const tonemap_dof_bg = self.device.createBindGroup(&.{
             .label = wgpu.StringView.fromSlice("tonemap dof bg"),
             .layout = self.tonemap_bgl,
@@ -2567,22 +2568,27 @@ pub const Gpu3d = struct {
         // `ensureDofTargets` at the end of this function — only when DoF is actually enabled — so the
         // common DoF-off case never pays for the full-res dof buffer. See the DoF section below.
 
-        // Mip-chain bloom: one rgba16float texture with per-mip single-level views. mip0 is full-res
-        // (allocated, unused); the chain is built scene_hdr → mip1 → … → mip(n-1) then tent-upsampled
-        // back to mip1, which the tonemap reads. Clamp the mip count so the smallest mip stays ≳16px.
+        // Mip-chain bloom: one rgba16float texture with per-mip single-level views. The chain is
+        // built scene_hdr → level 0 → … → level(n-1), then tent-upsampled back to level 0, which the
+        // tonemap reads. Clamp the level count so the smallest stays ≳16px.
+        //
+        // The chain starts at HALF resolution. It used to be allocated full-res with the full-res
+        // level 0 documented as "allocated, unused" — the chain only ever wrote from level 1 down.
+        // At 1080p that unused level was 1920×1080×8 B ≈ 16 MB of rgba16float, about three quarters
+        // of the entire bloom allocation, on every 3D app including the mobile heads. Every index
+        // below shifts down by one accordingly; the shaders read their own dimensions with
+        // textureDimensions(), and the two down/up UBOs are not per-level, so nothing else moves.
         self.releaseBloomTargets();
-        // The two tonemap bind groups sample bloom mip1, so the chain MUST have >= 2 levels. Floor the
-        // chain texture to 2px so a 2-level chain is physically creatable on a tiny/collapsed viewport
-        // (a 2x2 texture has exactly 2 mips); real viewports are unaffected (mip count already > 2).
-        // Fixes the latent null-unwrap of bloom_mip_views[1] when @min(width,height) <= 16.
-        const bloom_w = @max(2, width);
-        const bloom_h = @max(2, height);
+        // The tonemap bind groups sample chain level 0, so the chain must have >= 1 level. Floor the
+        // texture to 1px so a 1-level chain is creatable on a tiny/collapsed viewport; real viewports
+        // are unaffected.
+        const bloom_w = @max(1, width / 2);
+        const bloom_h = @max(1, height / 2);
         var max_mip: u32 = 1;
         {
             var d = @min(bloom_w, bloom_h);
             while (d > 16 and max_mip < BLOOM_MIPS) : (max_mip += 1) d /= 2;
         }
-        max_mip = @max(2, max_mip);
         const bloom_chain = self.device.createTexture(&.{
             .label = wgpu.StringView.fromSlice("bloom chain"),
             .usage = hdr_usage,
@@ -2806,13 +2812,13 @@ pub const Gpu3d = struct {
             },
         }) orelse return error.BindGroupCreateFailed;
 
-        // Mip-chain bloom bind groups. Downsample bg[i] feeds the pass writing mip i: source is
-        // scene_hdr for i=1 (with the prefilter/Karis "first" UBO), else mip i-1 (plain UBO).
+        // Mip-chain bloom bind groups. Downsample bg[i] feeds the pass writing level i: source is
+        // scene_hdr for i=0 (with the prefilter/Karis "first" UBO), else level i-1 (plain UBO).
         {
-            var i: u32 = 1;
+            var i: u32 = 0;
             while (i < self.bloom_mip_count) : (i += 1) {
-                const src_view = if (i == 1) scene_hdr_view else self.bloom_mip_views[i - 1].?;
-                const ubo = if (i == 1) self.bloom_down_first_buf else self.bloom_down_rest_buf;
+                const src_view = if (i == 0) scene_hdr_view else self.bloom_mip_views[i - 1].?;
+                const ubo = if (i == 0) self.bloom_down_first_buf else self.bloom_down_rest_buf;
                 self.bloom_down_bgs[i] = self.device.createBindGroup(&.{
                     .label = wgpu.StringView.fromSlice("bloom down bg"),
                     .layout = self.post_bgl,
@@ -2825,9 +2831,9 @@ pub const Gpu3d = struct {
                 }) orelse return error.BindGroupCreateFailed;
             }
         }
-        // Upsample bg[i] feeds the pass reading mip i and adding into mip i-1 (coarse → mip1).
+        // Upsample bg[i] feeds the pass reading level i and adding into level i-1 (coarse → 0).
         {
-            var i: u32 = 2;
+            var i: u32 = 1;
             while (i < self.bloom_mip_count) : (i += 1) {
                 self.bloom_up_bgs[i] = self.device.createBindGroup(&.{
                     .label = wgpu.StringView.fromSlice("bloom up bg"),
@@ -2853,10 +2859,10 @@ pub const Gpu3d = struct {
             },
         }) orelse return error.BindGroupCreateFailed;
 
-        // bloom mip1 always exists (max_mip floored to >= 2 above); fall back to mip0 defensively so a
-        // future mip-count regression degrades to un-bloomed output instead of a null-unwrap abort.
-        const bloom_mip1_view = self.bloom_mip_views[1] orelse self.bloom_mip_views[0].?;
-        // tonemap: HDR scene + bloom (chain mip1) + ao + ssr → LDR
+        // Chain level 0 always exists (max_mip >= 1). This is the tent-upsample output the tonemap
+        // reads — the half-res level the chain now bottoms out at.
+        const bloom_mip1_view = self.bloom_mip_views[0].?;
+        // tonemap: HDR scene + bloom (chain level 0) + ao + ssr → LDR
         const tonemap_bg = self.device.createBindGroup(&.{
             .label = wgpu.StringView.fromSlice("tonemap bg"),
             .layout = self.tonemap_bgl,
@@ -3951,13 +3957,14 @@ pub const Gpu3d = struct {
         // Karis on mip1), then additive tent upsample coarse → mip1 (read by the tonemap pass).
         // Each per-mip view is a disjoint subresource, so read mip i-1 / write mip i is valid.
         const bn = self.bloom_mip_count;
-        if (bn >= 3 and s.bloom_intensity > 0.0) {
-            var i: u32 = 1;
+        // Needs at least two levels: one to downsample into and one to upsample back from.
+        if (bn >= 2 and s.bloom_intensity > 0.0) {
+            var i: u32 = 0;
             while (i < bn) : (i += 1) {
                 self.bloomPass(encoder, self.bloom_mip_views[i].?, self.bloom_down_pipeline, self.bloom_down_bgs[i].?, true);
             }
             i = bn - 1;
-            while (i >= 2) : (i -= 1) {
+            while (i >= 1) : (i -= 1) {
                 self.bloomPass(encoder, self.bloom_mip_views[i - 1].?, self.bloom_up_pipeline, self.bloom_up_bgs[i].?, false);
             }
         }
