@@ -1,6 +1,6 @@
 # Zigote.Engine V2 — refactoring, optimization and modularization design
 
-Status: **in progress — Phases 0, 4 (partial) and 5 complete; Phase 1 partial; §3 re-scoped after measurement** · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
+Status: **Phases 0, 1, 2, 5 complete; 3 and 4 partial (remainder measured out — see §10, §12)** · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
 (`Zigote.Generators`, `Zigote.Core/Native`, `build/Zigote.Native.targets`).
 
 V2 **breaks ABI and source compatibility**. The C# side is rebuilt against it in the same change
@@ -557,9 +557,63 @@ remove, is **14 %** of that, so P7's ceiling is roughly 0.1 ms on such a frame. 
 target part of the render column. Neither justifies an ABI break; both are worth doing on their own
 merits, and can now be measured rather than argued.
 
-### Not yet started
+### Phase 2 — complete
 
-Phases 2 and 3 (see §10 — re-scoped rather than pending), and the remainder of Phase 1. The `gpu/pipeline.zig` builder and the large-file splits (`wgpu_3d.zig`, the 1417-line
+| Done | Notes |
+|---|---|
+| Scene command stream | `zigote_scene_apply`; 14 per-node setters → 1 call. Validate-then-apply, so a malformed batch changes nothing. |
+| One frame API for every window | The `zigote_window_submit_paint/_overlay/_render` trio deleted; `window` handle selects, 0 = main. |
+| **Tagged paint stream** | 20 kinds × one flat 112-byte struct → per-kind records. A rect is 48 bytes. Nothing aliases. |
+| ABI version 100 | |
+
+**Deliberate deviation — blobs stay pointer+len.** §2.1 proposed moving text/pixels/points into a
+side buffer referenced by `(offset, len)`. The host already memoises UTF-8 on the pinned object
+heap and passes stable pointers, so those cross at **zero copy** today; a side buffer would copy
+every string every frame, and §11 puts C# list building at ~26% of a paint frame. The stated goal
+(fewer pinned objects) is already met by the POH.
+
+**Deliberate deviation — `ZgEvent` stays a flat 44-byte record.** §2.1 wanted it tagged like the
+paint stream. The hazard that justified tagging the paint command does not exist here: one flat
+struct served 20 paint kinds with *cross-kind* aliasing (a text shadow's colour in the rectangle
+fields), whereas each event kind is consumed by a `switch (kind)` that immediately decodes into the
+typed `InputEvent` union, and every aliased slot already has a named accessor at a fixed offset
+(`TouchFinger`, `TouchPressure`, `CompositionStart`). Tagging it would mean ~8 record types and a
+new poll ABI to remove aliasing that is already mediated, on a path carrying dozens of 44-byte
+events per frame.
+
+### Phase 3 — partial
+
+| Done | Notes |
+|---|---|
+| P5 staged clip ring | N `writeBuffer` calls per frame → one staged write, with a per-slot fallback on allocation failure (dropping clips would render *unclipped* content, not merely slower content). |
+
+**P4 (instanced rects) attempted and reverted — see §12.** P3 (retained geometry / subtree
+versions) is not done: §10 established that an idle UI renders no frames at all, so its benefit
+applies only to frames that already changed.
+
+---
+
+## 12. P4: why instanced rects were reverted
+
+The plan was "rects/borders/shadows become instanced (one 64 B instance per rect, 4-vertex shared
+quad)" — 240 B/rect down to ~40 B. It was implemented far enough to compile, then reverted, for a
+reason the design did not account for:
+
+**`shape_vertices` is not homogeneous.** Rect, border and shadow emit six-vertex quads into it —
+but so do **polygon fills** (triangle-fanned rings, `mkSolidVertex`) and **bezier strokes**
+(triangle strips, `mkStrokeVertex`), as arbitrary triangles that no quad instancing can express.
+They share the buffer, the vertex format and the SDF shader. Instancing therefore needs a *second*
+pipeline and buffer, plus batch splitting that preserves painter's-algorithm order between the two
+— the op list can express that, but it doubles the most-used draw path.
+
+Against that, the measured payoff: at 20 000 rects the vertex upload is ~4.8 MB/frame falling to
+~0.8 MB, worth roughly 0.4 ms of a 4.6 ms render column — and a realistic 2 000-command frame is
+1.03 ms total, so the saving is ~0.04 ms, about 4% of a path that is already under 5% of a 60 Hz
+budget. Doubling the shape path for 0.2% of a frame is not a trade worth making, and the constraint
+that forces the doubling is structural rather than incidental.
+
+Recorded rather than silently skipped: if the shape path is ever split for another reason, the
+instancing falls out of it cheaply. The `gpu/pipeline.zig` builder and the large-file splits (`wgpu_3d.zig`, the 1417-line
 `Gpu3d.init`) remain from Phase 0's §4 layout; they are mechanical but large, and are best done
 alongside the rest of Phase 1 rather than as a separate pass over the same files.
 
