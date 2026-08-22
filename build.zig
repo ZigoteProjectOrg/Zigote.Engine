@@ -548,6 +548,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The FFI wire contract. Imports nothing but std, so `zig build ffi-manifest` can reflect
+    // over it without dragging in SDL/wgpu.
+    const abi_mod = b.addModule("zigote_abi", .{
+        .root_source_file = b.path("src/abi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const core_mod = b.addModule("zigote_core", .{
         .root_source_file = b.path("src/core/root.zig"),
         .target = target,
@@ -615,6 +623,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zaudio", .module = zaudio_mod },
             .{ .name = "zigimg", .module = zigimg_dep.module("zigimg") },
             .{ .name = "zigote", .module = zigote_mod },
+            .{ .name = "zigote_abi", .module = abi_mod },
             .{ .name = "zmath", .module = zmath_mod },
         },
     });
@@ -660,8 +669,8 @@ pub fn build(b: *std.Build) void {
     // Every module the engine builds. Two separate hand-ordered copies of this list used to sit
     // in the Android and Windows blocks below, so adding a module meant remembering both.
     const all_modules = [_]*std.Build.Module{
-        core_mod, ui_mod,     engine_mod, zigote_mod, ffi_mod,
-        wgpu_mod, zaudio_mod, zmath_mod,  zmesh_opt_mod,
+        abi_mod,  core_mod,   ui_mod,     engine_mod, zigote_mod,
+        ffi_mod,  wgpu_mod,   zaudio_mod, zmath_mod,  zmesh_opt_mod,
     };
 
     if (target.result.abi.isAndroid()) {
@@ -821,6 +830,27 @@ pub fn build(b: *std.Build) void {
     //
     // These shell out rather than adding eight artifacts to this graph: the options are attached
     // to `ffi_mod`, and one module can carry only one set of them.
+    // The FFI wire contract as JSON, reflected out of src/abi.zig. The C# AbiLayoutTests read the
+    // written file and assert their own Marshal.SizeOf/OffsetOf against it, so a field reorder that
+    // preserves total size can no longer pass unnoticed on both sides.
+    const manifest_mod = b.createModule(.{
+        .root_source_file = b.path("tools/ffi_manifest.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zigote_abi", .module = abi_mod }},
+    });
+    const manifest_exe = b.addExecutable(.{ .name = "ffi-manifest", .root_module = manifest_mod });
+    manifest_exe.use_llvm = true;
+    const run_manifest = b.addRunArtifact(manifest_exe);
+    const manifest_file = run_manifest.captureStdOut(.{});
+    const install_manifest = b.addInstallFile(manifest_file, "ffi-manifest.json");
+    b.step("ffi-manifest", "Write the FFI wire contract to zig-out/ffi-manifest.json")
+        .dependOn(&install_manifest.step);
+
+    const manifest_tests = b.addTest(.{ .root_module = manifest_mod });
+    manifest_tests.use_llvm = true;
+    const run_manifest_tests = b.addRunArtifact(manifest_tests);
+
     // Emit the target table as JSON. build/Zigote.Native.targets derives the same nine-way matrix
     // independently in MSBuild (RID -> OS -> zig triple -> native lib name); this gives that a
     // single source to be reconciled against, and makes the supported set greppable.
@@ -899,4 +929,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_ffi_tests.step);
     test_step.dependOn(&run_shader_check_tests.step);
+    test_step.dependOn(&run_manifest_tests.step);
 }
