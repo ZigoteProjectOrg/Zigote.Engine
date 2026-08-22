@@ -29,6 +29,15 @@ const wire_types = [_]type{
     abi.ZgTextureLoadItem,
     abi.ZgRenderSettings3D,
     abi.ZgEngineStats,
+    // Scene command stream (see abi.zig).
+    abi.ZgSceneOp,
+    abi.ZgSceneOpHeader,
+    abi.ZgSceneTransform,
+    abi.ZgSceneLight,
+    abi.ZgSceneCamera,
+    abi.ZgSceneMaterial,
+    abi.ZgSceneVisibility,
+    abi.ZgScenePrimitive,
 };
 
 fn typeName(comptime T: type) []const u8 {

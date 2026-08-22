@@ -312,3 +312,125 @@ pub const ZgEngineStats = extern struct {
     gpu_buffer_memory: u64,
     gpu_texture_memory: u64,
 };
+
+// ── Scene command stream ──────────────────────────────────────────────────────
+//
+// The scene used to be driven by fourteen per-node setters — transform, light, camera, colour,
+// roughness, surface, emissive, effect, alpha mode, double-sided, volume, occlusion, visibility,
+// primitive — each its own export and its own P/Invoke. The host dirty-gates them, so a static
+// node costs nothing per frame, but a scene load or rebuild pays three to six transitions per node
+// and the surface is fourteen functions wide for what is really one idea: "apply these changes".
+//
+// `zigote_scene_apply` takes a flat byte stream of records instead. Every record starts with
+// `ZgSceneOpHeader`; `size` is the WHOLE record including the header, so a decoder that meets an
+// op it does not know can skip it rather than lose sync — which is what lets the stream grow
+// without another ABI break. See docs/v2-design.md §2.3.
+
+pub const ZgSceneOp = enum(u32) {
+    transform = 1,
+    light = 2,
+    camera = 3,
+    material = 4,
+    visibility = 5,
+    primitive = 6,
+};
+
+pub const ZgSceneOpHeader = extern struct {
+    /// A `ZgSceneOp`. Unknown values are skipped using `size`.
+    kind: u32,
+    /// Total bytes of this record, header included. Always a multiple of 8.
+    size: u32,
+};
+
+pub const ZgSceneTransform = extern struct {
+    header: ZgSceneOpHeader,
+    node: u64,
+    x: f32,
+    y: f32,
+    z: f32,
+    qx: f32,
+    qy: f32,
+    qz: f32,
+    qw: f32,
+    sx: f32,
+    sy: f32,
+    sz: f32,
+    pad: f32 = 0,
+};
+
+pub const ZgSceneLight = extern struct {
+    header: ZgSceneOpHeader,
+    node: u64,
+    kind: u32,
+    cast_shadows: u32,
+    r: f32,
+    g: f32,
+    b: f32,
+    intensity: f32,
+    range: f32,
+    inner_angle: f32,
+    outer_angle: f32,
+    pad: f32 = 0,
+};
+
+pub const ZgSceneCamera = extern struct {
+    header: ZgSceneOpHeader,
+    node: u64,
+    fovy_degrees: f32,
+    near: f32,
+    far: f32,
+    pad: f32 = 0,
+};
+
+/// The whole PBR factor set in one record — the eight material setters it replaces were each a
+/// separate call that ended up mutating adjacent fields of the same material.
+pub const ZgSceneMaterial = extern struct {
+    header: ZgSceneOpHeader,
+    node: u64,
+    color_r: f32,
+    color_g: f32,
+    color_b: f32,
+    metallic: f32,
+    roughness: f32,
+    clearcoat: f32,
+    clearcoat_roughness: f32,
+    specular: f32,
+    emissive_r: f32,
+    emissive_g: f32,
+    emissive_b: f32,
+    ior: f32,
+    transmission: f32,
+    occlusion_strength: f32,
+    alpha_cutoff: f32,
+    effect: u32,
+    alpha_mode: u32,
+    double_sided: u32,
+    pad: u32 = 0,
+};
+
+pub const ZgSceneVisibility = extern struct {
+    header: ZgSceneOpHeader,
+    node: u64,
+    visible: u32,
+    pad: u32 = 0,
+};
+
+pub const ZgScenePrimitive = extern struct {
+    header: ZgSceneOpHeader,
+    node: u64,
+    prim_type: u32,
+    pad: u32 = 0,
+};
+
+comptime {
+    // Every record must be 8-byte aligned and a multiple of 8 bytes, so a stream of them can be
+    // walked by adding `size` without ever landing mid-field.
+    for ([_]type{
+        ZgSceneTransform, ZgSceneLight,      ZgSceneCamera,
+        ZgSceneMaterial,  ZgSceneVisibility, ZgScenePrimitive,
+    }) |T| {
+        if (@sizeOf(T) % 8 != 0) @compileError("scene op " ++ @typeName(T) ++ " must be a multiple of 8 bytes");
+        if (@alignOf(T) != 8) @compileError("scene op " ++ @typeName(T) ++ " must be 8-byte aligned");
+        if (@offsetOf(T, "header") != 0) @compileError("scene op " ++ @typeName(T) ++ " must start with its header");
+    }
+}

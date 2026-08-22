@@ -3273,6 +3273,118 @@ export fn zigote_scene_set_light_properties(node_handle: u64,
     return .ok;
 }
 
+/// Apply a batch of scene changes from a flat command stream. One call replaces the fourteen
+/// per-node setters and their three-to-six P/Invoke transitions per node on a rebuild; the setters
+/// remain for single edits.
+///
+/// Unknown ops are skipped by their `size` rather than aborting the batch, so a newer host can send
+/// ops this engine does not implement and everything it DOES understand still lands. A malformed
+/// stream — a size that is zero, misaligned, or runs past the end — stops the batch and reports
+/// invalid_argument, because past that point the decoder cannot know where the next record starts.
+export fn zigote_scene_apply(stream: [*]const u8, len: usize) ZgStatus {
+    if (len == 0) return .ok;
+    if (len % 8 != 0) return .invalid_argument;
+    const bytes = stream[0..len];
+
+    // Validate the whole stream BEFORE applying any of it, so a malformed batch changes nothing
+    // rather than leaving the scene half-updated at whichever record went bad. It also means the
+    // framing rules can be exercised without an engine.
+    if (sceneStreamBadRecord(bytes)) |bad| {
+        const header: *const abi.ZgSceneOpHeader = @ptrCast(@alignCast(&bytes[bad]));
+        std.log.err(
+            "zigote_scene_apply: malformed record at byte {d} (kind {d}, size {d}) — batch dropped",
+            .{ bad, header.kind, header.size },
+        );
+        return .invalid_argument;
+    }
+
+    const state = engineState() orelse return .invalid_handle;
+    var off: usize = 0;
+    while (off + @sizeOf(abi.ZgSceneOpHeader) <= len) {
+        const header: *const abi.ZgSceneOpHeader = @ptrCast(@alignCast(&bytes[off]));
+        applySceneOp(state, bytes[off..][0..header.size], header);
+        off += header.size;
+    }
+    return .ok;
+}
+
+/// The offset of the first malformed record, or null if the stream is walkable end to end.
+///
+/// Every record must declare a size that includes its header, keeps 8-byte alignment, and stays
+/// inside the buffer. A zero size would loop forever; a misaligned one would land the next header
+/// mid-field; an oversized one would read past the end. Pure — the caller logs — so the framing
+/// rules can be tested without an engine and without tripping the test runner's error-log check.
+fn sceneStreamBadRecord(bytes: []const u8) ?usize {
+    var off: usize = 0;
+    while (off + @sizeOf(abi.ZgSceneOpHeader) <= bytes.len) {
+        const header: *const abi.ZgSceneOpHeader = @ptrCast(@alignCast(&bytes[off]));
+        const size = header.size;
+        if (size < @sizeOf(abi.ZgSceneOpHeader) or size % 8 != 0 or off + size > bytes.len) return off;
+        off += size;
+    }
+    return null;
+}
+
+/// One record. Every op resolves its own node handle: a batch naming a node that has since been
+/// destroyed skips that record rather than failing the rest of the frame's changes.
+fn applySceneOp(state: *EngineState, record: []const u8, header: *const abi.ZgSceneOpHeader) void {
+    // The setters below each resolve the engine themselves; `state` is threaded in so a future op
+    // that needs the state directly does not change this signature.
+    _ = state;
+    switch (header.kind) {
+        @intFromEnum(abi.ZgSceneOp.transform) => {
+            if (record.len < @sizeOf(abi.ZgSceneTransform)) return;
+            const op: *const abi.ZgSceneTransform = @ptrCast(@alignCast(record.ptr));
+            _ = zigote_scene_update_node(op.node, op.x, op.y, op.z, op.qx, op.qy, op.qz, op.qw, op.sx, op.sy, op.sz);
+        },
+        @intFromEnum(abi.ZgSceneOp.light) => {
+            if (record.len < @sizeOf(abi.ZgSceneLight)) return;
+            const op: *const abi.ZgSceneLight = @ptrCast(@alignCast(record.ptr));
+            _ = zigote_scene_set_light_properties(
+                op.node,
+                @truncate(op.kind),
+                op.r,
+                op.g,
+                op.b,
+                op.intensity,
+                op.range,
+                op.inner_angle,
+                op.outer_angle,
+                op.cast_shadows,
+            );
+        },
+        @intFromEnum(abi.ZgSceneOp.camera) => {
+            if (record.len < @sizeOf(abi.ZgSceneCamera)) return;
+            const op: *const abi.ZgSceneCamera = @ptrCast(@alignCast(record.ptr));
+            _ = zigote_scene_set_camera_params(op.node, op.fovy_degrees, op.near, op.far);
+        },
+        @intFromEnum(abi.ZgSceneOp.material) => {
+            if (record.len < @sizeOf(abi.ZgSceneMaterial)) return;
+            const op: *const abi.ZgSceneMaterial = @ptrCast(@alignCast(record.ptr));
+            _ = zigote_scene_set_mesh_color(op.node, op.color_r, op.color_g, op.color_b);
+            _ = zigote_scene_set_mesh_roughness(op.node, op.metallic, op.roughness);
+            _ = zigote_scene_set_mesh_surface(op.node, op.clearcoat, op.clearcoat_roughness, op.specular);
+            _ = zigote_scene_set_mesh_emissive(op.node, op.emissive_r, op.emissive_g, op.emissive_b);
+            _ = zigote_scene_set_mesh_volume(op.node, op.ior, op.transmission);
+            _ = zigote_scene_set_mesh_occlusion_strength(op.node, op.occlusion_strength);
+            _ = zigote_scene_set_mesh_effect(op.node, op.effect);
+            _ = zigote_scene_set_mesh_alpha_mode(op.node, op.alpha_mode, op.alpha_cutoff);
+            _ = zigote_scene_set_mesh_double_sided(op.node, op.double_sided);
+        },
+        @intFromEnum(abi.ZgSceneOp.visibility) => {
+            if (record.len < @sizeOf(abi.ZgSceneVisibility)) return;
+            const op: *const abi.ZgSceneVisibility = @ptrCast(@alignCast(record.ptr));
+            _ = zigote_scene_set_node_visible(op.node, op.visible);
+        },
+        @intFromEnum(abi.ZgSceneOp.primitive) => {
+            if (record.len < @sizeOf(abi.ZgScenePrimitive)) return;
+            const op: *const abi.ZgScenePrimitive = @ptrCast(@alignCast(record.ptr));
+            _ = zigote_scene_set_mesh_primitive(op.node, @truncate(op.prim_type));
+        },
+        else => {}, // unknown op: skipped by size, see the note above
+    }
+}
+
 export fn zigote_scene_set_mesh_color(node_handle: u64, r: f32, g: f32, b: f32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
     const node = state.nodeFromHandle(node_handle) orelse return .ok;
@@ -7671,4 +7783,55 @@ test "every wgpu dependency the target table names exists in build.zig.zon" {
         }
     }
     try std.testing.expect(checked >= 9); // a rename must not make this vacuous
+}
+
+// The scene stream is a hand-built byte layout crossing the ABI, so the decoder's framing — not
+// just its happy path — is what needs pinning. A `size` the decoder trusts blindly would walk off
+// the end of the buffer or land mid-record and apply garbage to real scene nodes.
+test "scene stream framing: unknown ops skip, malformed sizes are rejected" {
+    const H = abi.ZgSceneOpHeader;
+    const hdr_size = @sizeOf(H);
+
+    // Empty and header-only-too-short streams are walkable (nothing to do).
+    try std.testing.expect(sceneStreamBadRecord(&.{}) == null);
+
+    var buf: [64]u8 align(8) = @splat(0);
+
+    // Two well-formed records, the first an op this build does not know: skipped by its size,
+    // which is what lets the stream grow without another ABI break.
+    const unknown: *H = @ptrCast(@alignCast(&buf[0]));
+    unknown.* = .{ .kind = 0xDEAD, .size = 16 };
+    const vis: *abi.ZgSceneVisibility = @ptrCast(@alignCast(&buf[16]));
+    vis.* = .{
+        .header = .{ .kind = @intFromEnum(abi.ZgSceneOp.visibility), .size = @sizeOf(abi.ZgSceneVisibility) },
+        .node = 0,
+        .visible = 1,
+    };
+    try std.testing.expect(sceneStreamBadRecord(buf[0 .. 16 + @sizeOf(abi.ZgSceneVisibility)]) == null);
+
+    const bad: *H = @ptrCast(@alignCast(&buf[0]));
+    // size = 0 would loop forever if the decoder trusted it.
+    bad.* = .{ .kind = 1, .size = 0 };
+    try std.testing.expectEqual(@as(?usize, 0), sceneStreamBadRecord(buf[0..16]));
+    // Smaller than its own header.
+    bad.* = .{ .kind = 1, .size = hdr_size - 1 };
+    try std.testing.expectEqual(@as(?usize, 0), sceneStreamBadRecord(buf[0..16]));
+    // Past the end of the buffer.
+    bad.* = .{ .kind = 1, .size = 4096 };
+    try std.testing.expectEqual(@as(?usize, 0), sceneStreamBadRecord(buf[0..16]));
+    // Misaligned: the next header would land mid-field.
+    bad.* = .{ .kind = 1, .size = 12 };
+    try std.testing.expectEqual(@as(?usize, 0), sceneStreamBadRecord(buf[0..16]));
+
+    // A bad record AFTER a good one is reported at its own offset, not at 0.
+    unknown.* = .{ .kind = 0xDEAD, .size = 16 };
+    const second: *H = @ptrCast(@alignCast(&buf[16]));
+    second.* = .{ .kind = 1, .size = 4096 };
+    try std.testing.expectEqual(@as(?usize, 16), sceneStreamBadRecord(buf[0..32]));
+}
+
+test "an empty scene batch succeeds and a misaligned length is rejected" {
+    var one: [8]u8 align(8) = @splat(0);
+    try std.testing.expectEqual(ZgStatus.ok, zigote_scene_apply(&one, 0));
+    try std.testing.expectEqual(ZgStatus.invalid_argument, zigote_scene_apply(&one, 7));
 }
