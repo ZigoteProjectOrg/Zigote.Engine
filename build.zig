@@ -175,20 +175,45 @@ const webp_decode_srcs = [_][]const u8{
     "src/demux/demux.c",
 };
 
-/// Build the vendored libwebp (libraries/libwebp) as a self-contained static decode library. Replaces
-/// the Homebrew `webp` system lib. Hand-rolled (no upstream build.zig) — libwebp uses root-relative
-/// includes ("src/dsp/dsp.h"), so the compile include root is the libwebp root.
-fn buildWebp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+/// The shell every vendored C/C++ static library shares: a static `addLibrary` over a fresh
+/// module with libc (optionally libc++) and one include root. `buildWebp`, `buildMiniaudio`,
+/// `buildFlecs` and `buildMeshoptimizer` each wrote this out; two of them said so in a comment
+/// ("Mirrors buildMiniaudio/buildWebp"). Per-file flags, extra sources and platform system libs
+/// stay with the caller, which is where they genuinely differ. See docs/v2-design.md §5.1.
+fn vendoredStaticLib(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    opts: struct {
+        name: []const u8,
+        /// Include root added to the compile — for libwebp this must be the library root, since
+        /// its headers are included root-relative ("src/dsp/dsp.h").
+        include: []const u8,
+        link_libcpp: bool = false,
+    },
+) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
-        .name = "webp",
+        .name = opts.name,
         .linkage = .static,
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .link_libcpp = opts.link_libcpp,
         }),
     });
-    lib.root_module.addIncludePath(b.path("libraries/libwebp"));
+    lib.root_module.addIncludePath(b.path(opts.include));
+    return lib;
+}
+
+/// Build the vendored libwebp (libraries/libwebp) as a self-contained static decode library. Replaces
+/// the Homebrew `webp` system lib. Hand-rolled (no upstream build.zig) — libwebp uses root-relative
+/// includes ("src/dsp/dsp.h"), so the compile include root is the libwebp root.
+fn buildWebp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const lib = vendoredStaticLib(b, target, optimize, .{
+        .name = "webp",
+        .include = "libraries/libwebp",
+    });
     lib.root_module.addCSourceFiles(.{
         .root = b.path("libraries/libwebp"),
         .files = &webp_decode_srcs,
@@ -207,16 +232,10 @@ fn buildWebp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 /// upstream zaudio's build.zig (drop WebAudio/null/JACK/DSound/WinMM backends; macOS uses CoreAudio, so
 /// no runtime backend loading there).
 fn buildMiniaudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
-    const lib = b.addLibrary(.{
+    const lib = vendoredStaticLib(b, target, optimize, .{
         .name = "miniaudio",
-        .linkage = .static,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
+        .include = "libraries/zaudio/libs/miniaudio",
     });
-    lib.root_module.addIncludePath(b.path("libraries/zaudio/libs/miniaudio"));
     lib.root_module.addCSourceFile(.{
         .file = b.path("libraries/zaudio/src/zaudio.c"),
         .flags = &.{ "-std=c99", "-fno-sanitize=undefined" },
@@ -273,16 +292,10 @@ fn buildMiniaudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
 /// QUERY_DSL+PARSER (cached queries), OS_API_IMPL (default OS timer/threads), TIMER (pipeline needs it).
 /// Mirrors buildMiniaudio/buildWebp — single C file, no Homebrew, no remote deps.
 fn buildFlecs(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
-    const lib = b.addLibrary(.{
+    const lib = vendoredStaticLib(b, target, optimize, .{
         .name = "flecs",
-        .linkage = .static,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
+        .include = "libraries/zflecs/libs/flecs",
     });
-    lib.root_module.addIncludePath(b.path("libraries/zflecs/libs/flecs"));
     lib.root_module.addCSourceFile(.{
         .file = b.path("libraries/zflecs/libs/flecs/flecs.c"),
         .flags = &.{
@@ -317,15 +330,10 @@ fn buildFlecs(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 /// referenced by the engine, so they're omitted (lean). Backs the `zmesh_opt` binding used at mesh
 /// upload to reorder indices/vertices for GPU cache locality.
 fn buildMeshoptimizer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
-    const lib = b.addLibrary(.{
+    const lib = vendoredStaticLib(b, target, optimize, .{
         .name = "meshoptimizer",
-        .linkage = .static,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-        }),
+        .include = "libraries/zmesh/libs/meshoptimizer",
+        .link_libcpp = true,
     });
     const dir = "libraries/zmesh/libs/meshoptimizer/";
     const srcs = [_][]const u8{
@@ -619,13 +627,17 @@ pub fn build(b: *std.Build) void {
         });
         linkAndCollect(b, ffi_mod, assimp_dep.artifact("assimp"));
     }
+    // Every module the engine builds. Two separate hand-ordered copies of this list used to sit
+    // in the Android and Windows blocks below, so adding a module meant remembering both.
+    const all_modules = [_]*std.Build.Module{
+        core_mod, ui_mod,     engine_mod, zigote_mod, ffi_mod,
+        wgpu_mod, zaudio_mod, zmath_mod,  zpool_mod,  zmesh_opt_mod,
+    };
+
     if (target.result.abi.isAndroid()) {
         // Every module that reaches an NDK header through @cImport needs the bionic translation
         // workarounds and the sysroot's per-architecture paths.
-        for ([_]*std.Build.Module{
-            wgpu_mod, zaudio_mod, zmath_mod,  zpool_mod,  zmesh_opt_mod,
-            core_mod, ui_mod,     engine_mod, zigote_mod, ffi_mod,
-        }) |mod| addAndroidSysrootPaths(b, mod, target);
+        for (all_modules) |mod| addAndroidSysrootPaths(b, mod, target);
     }
 
     if (target.result.os.tag == .macos) {
@@ -672,10 +684,7 @@ pub fn build(b: *std.Build) void {
     // ponytail: delete this block once translate-c handles extern-in-local-scope (ziglang/zig #23275,
     // PR #23384). It is a toolchain bug, not something the engine can fix properly.
     if (target.result.os.tag == .windows) {
-        for ([_]*std.Build.Module{
-            core_mod, ui_mod,     engine_mod, zigote_mod, ffi_mod,
-            wgpu_mod, zaudio_mod, zmath_mod,  zpool_mod,  zmesh_opt_mod,
-        }) |m| m.addCMacro("_FORTIFY_SOURCE", "0");
+        for (all_modules) |m| m.addCMacro("_FORTIFY_SOURCE", "0");
 
         // The sdl3 package builds its `c` module with its own TranslateC step and exposes no option
         // to touch its macros, so reach the step through the generated file it owns. The id check

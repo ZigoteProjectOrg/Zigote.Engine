@@ -1488,19 +1488,6 @@ export fn zigote_set_relative_mouse_mode(handle: u64, enabled: bool) bool {
     return true;
 }
 
-/// Whether the pointer is currently captured for this window.
-export fn zigote_get_relative_mouse_mode(handle: u64) bool {
-    const state = stateFromHandle(handle) orelse return false;
-    return sdl3.mouse.getWindowRelativeMode(state.window);
-}
-
-/// Move the cursor to a window-relative position. Used to park it somewhere sensible before
-/// releasing capture, so a menu opens with the pointer where the player expects it.
-export fn zigote_warp_mouse_in_window(handle: u64, x: f32, y: f32) void {
-    const state = stateFromHandle(handle) orelse return;
-    sdl3.mouse.warpInWindow(state.window, x, y);
-}
-
 /// Block the calling thread until an SDL event arrives or timeout_ms elapses.
 /// After returning, call zigote_poll_events to drain the queue.
 /// Used by the C# frame loop to sleep instead of spinning when the UI is idle.
@@ -4399,12 +4386,6 @@ const MetalMem = if (@import("builtin").os.tag == .macos) struct {
         return 0;
     }
 };
-
-/// Device-wide GPU allocated bytes (Metal `currentAllocatedSize`). 0 off macOS / before device init.
-export fn zigote_debug_gpu_allocated_bytes(handle: u64) u64 {
-    _ = handle;
-    return MetalMem.allocatedBytes();
-}
 
 /// Set ZIGOTE_GPU_MEM=1 to log the Metal device allocation + the renderer's own target breakdown
 /// every 120 frames. Pure diagnostics; no effect when the env var is unset.

@@ -138,10 +138,6 @@ export fn zigote_ecs_get_mut(world: u64, entity: u64, component: u64) [*c]u8 {
     return @ptrCast(flecs.ecs_get_mut_id(worldFromHandle(world), entity, component));
 }
 
-export fn zigote_ecs_ensure(world: u64, entity: u64, component: u64, size: usize) [*c]u8 {
-    return @ptrCast(flecs.ecs_ensure_id(worldFromHandle(world), entity, component, size));
-}
-
 export fn zigote_ecs_modified(world: u64, entity: u64, component: u64) void {
     flecs.ecs_modified_id(worldFromHandle(world), entity, component);
 }
@@ -270,26 +266,8 @@ export fn zigote_ecs_iter_ctx(iter_ptr: usize) u64 {
     return @intFromPtr(it.ctx);
 }
 
-// ── Relationships / pairs / prefabs / hierarchy ────────────────────────────────
-
-export fn zigote_ecs_make_pair(relation: u64, target: u64) u64 {
-    return flecs.ecs_make_pair(relation, target);
-}
-
 export fn zigote_ecs_add_pair(world: u64, e: u64, relation: u64, target: u64) void {
     flecs.ecs_add_pair(worldFromHandle(world), e, relation, target);
-}
-
-export fn zigote_ecs_remove_pair(world: u64, e: u64, relation: u64, target: u64) void {
-    flecs.ecs_remove_pair(worldFromHandle(world), e, relation, target);
-}
-
-export fn zigote_ecs_has_pair(world: u64, e: u64, relation: u64, target: u64) u8 {
-    return if (flecs.ecs_has_pair(worldFromHandle(world), e, relation, target)) 1 else 0;
-}
-
-export fn zigote_ecs_new_w_pair(world: u64, relation: u64, target: u64) u64 {
-    return flecs.ecs_new_w_pair(worldFromHandle(world), relation, target);
 }
 
 export fn zigote_ecs_set_parent(world: u64, child: u64, parent: u64) void {
@@ -323,9 +301,6 @@ export fn zigote_ecs_builtin_childof() u64 {
 }
 export fn zigote_ecs_builtin_isa() u64 {
     return flecs.EcsIsA;
-}
-export fn zigote_ecs_builtin_prefab() u64 {
-    return flecs.EcsPrefab;
 }
 
 // Component-instantiation traits. flecs v4 defaults a component to (OnInstantiate, Override) — copied to
