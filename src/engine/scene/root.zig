@@ -12,7 +12,6 @@ pub const Camera = components.Camera;
 pub const MeshRenderer = components.MeshRenderer;
 pub const RenderLayer = components.RenderLayer;
 pub const Light = components.Light;
-pub const RigidBody = components.RigidBody;
 pub const MeshHandle = components.MeshHandle;
 pub const MaterialHandle = components.MaterialHandle;
 pub const null_mesh = components.null_mesh;

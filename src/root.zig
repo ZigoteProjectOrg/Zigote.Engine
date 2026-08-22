@@ -27,7 +27,6 @@ pub const Vec3 = math3d.Vec3;
 pub const Vec4 = math3d.Vec4;
 pub const Mat4 = math3d.Mat4;
 pub const Quat = math3d.Quat;
-pub const Ray = math3d.Ray;
 pub const Frustum = math3d.Frustum;
 pub const World = scene.World;
 pub const SceneNode = scene.SceneNode;
@@ -35,7 +34,6 @@ pub const Mesh = resources.Mesh;
 pub const Material = resources.Material;
 
 pub const renderer = @import("renderer/root.zig");
-pub const render = @import("render/root.zig");
 
 test {
     _ = core;
@@ -46,5 +44,4 @@ test {
     _ = scene;
     _ = resources;
     _ = renderer;
-    _ = render;
 }

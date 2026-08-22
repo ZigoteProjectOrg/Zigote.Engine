@@ -1,7 +1,6 @@
 pub const vec = @import("vec.zig");
 pub const mat = @import("mat.zig");
 pub const quat = @import("quat.zig");
-pub const ray = @import("ray.zig");
 pub const frustum = @import("frustum.zig");
 
 pub const Vec2 = vec.Vec2;
@@ -9,7 +8,6 @@ pub const Vec3 = vec.Vec3;
 pub const Vec4 = vec.Vec4;
 pub const Mat4 = mat.Mat4;
 pub const Quat = quat.Quat;
-pub const Ray = ray.Ray;
 pub const Frustum = frustum.Frustum;
 
 pub const pi = @import("std").math.pi;

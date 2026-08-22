@@ -84,12 +84,11 @@ const zigimg = @import("zigimg");
 const GpuUi = wgpu_renderer.wgpu.GpuUi;
 const backend_mod = wgpu_renderer.backend;
 const gpu_select = wgpu_renderer.gpu_select;
-const WgpuBackend = wgpu_renderer.wgpu_backend.WgpuBackend;
 
-const render_mod = zg.render;
-const TransientPool = render_mod.TransientPool;
-const RenderGraph = render_mod.RenderGraph;
-const RenderSettings = render_mod.RenderSettings;
+const frame_mod = wgpu_renderer.frame;
+const TransientPool = wgpu_renderer.transient.TransientPool;
+const FrameStats = frame_mod.FrameStats;
+const RenderSettings = frame_mod.RenderSettings;
 const wgpu_blur = wgpu_renderer.wgpu_blur;
 
 const webp = @cImport({
@@ -692,17 +691,12 @@ const EngineState = struct {
     offscreen_3d_view: ?*wgpu.TextureView,
     physics: ?*physics_ffi.PhysicsState,
 
-    // ── GPU backend abstraction (RHI seam) ─────────────────────────────────────
-    // The backend actually in use — always `.wgpu` today (the only implemented backend). The seam
-    // is kept so a native Vulkan/D3D12 backend can be added later. `wgpu_backend` owns the
-    // per-frame swapchain bookkeeping; `gpu_backend` is its vtable view (Level-1 device/frame
-    // lifecycle). Both hold stable self-pointers into this (heap-allocated) state.
+    // The backend actually in use — always `.wgpu`, the only implementation. Kept as a field
+    // because the host picks it at init and reads it back through zigote_get_renderer_caps.
     backend_id: backend_mod.BackendId,
-    wgpu_backend: WgpuBackend,
-    gpu_backend: backend_mod.GpuBackend,
 
-    // ── Render graph / pass model ──────────────────────────────────────────────
-    render_graph: RenderGraph,
+    // ── Frame pass model ───────────────────────────────────────────────────────
+    frame_stats: FrameStats,
     transient_pool: TransientPool,
     render_settings: RenderSettings,
     // Transient scene-3D command encoder shared across the scene_3d graph passes
@@ -1330,9 +1324,7 @@ fn zigote_init_impl(
         .offscreen_3d_view = null,
         .physics = null,
         .backend_id = resolved_backend,
-        .wgpu_backend = undefined, // set below (needs a stable &state pointer)
-        .gpu_backend = undefined, // set below (vtable view of state.wgpu_backend)
-        .render_graph = RenderGraph.init(allocator),
+        .frame_stats = .{},
         .transient_pool = TransientPool.init(allocator, device),
         .render_settings = .{},
         .pending_scene_w = 0,
@@ -1353,19 +1345,12 @@ fn zigote_init_impl(
     // table starts empty). Failure is non-fatal: a window would just fall back to its init font.
     recordLoadedFont(state, resolved_font_name, resolved_font_path) catch {};
 
-    // Wire up the GPU backend abstraction now that `state` has a stable address. The wgpu
-    // backend borrows the shared handles and points at the live surface config; `gpu_backend`
-    // is its Level-1 vtable view. (When a native backend lands, this is where it's selected.)
-    state.wgpu_backend = WgpuBackend.init(state.surface, state.device, state.queue, &state.wgpu_config);
-    state.gpu_backend = state.wgpu_backend.asGpuBackend();
-
     // Copy font name into state buffer
     const copy_len = @min(resolved_font_name.len, state.font_name_buf.len);
     @memcpy(state.font_name_buf[0..copy_len], resolved_font_name[0..copy_len]);
     state.font_name_len = copy_len;
 
     // Register the frame pipeline as render-graph passes (executed in this order).
-    try buildRenderGraph(state);
 
     // Install the live-resize event watch: SDL calls it from inside the modal window-resize loop, so
     // the UI keeps laying out + rendering while the user drags a window edge instead of freezing until
@@ -1408,9 +1393,6 @@ fn recreateAndroidSurface(state: *EngineState) void {
         state.wgpu_config.height = @max(1, @as(u32, @intCast(size[1])));
     } else |_| {}
     state.surface.configure(&state.wgpu_config);
-
-    // The backend holds the surface BY VALUE; without this it keeps presenting to the dead one.
-    state.wgpu_backend.surface = state.surface;
     std.log.info("android: surface recreated ({d}x{d})", .{ state.wgpu_config.width, state.wgpu_config.height });
 }
 
@@ -5110,7 +5092,6 @@ export fn zigote_shutdown(handle: u64) void {
     if (state.gaussian_blur) |*gb| gb.deinit();
 
     state.transient_pool.deinit();
-    state.render_graph.deinit();
     state.world.deinit();
     state.paint_list.deinit(state.allocator);
     state.overlay_paint_list.deinit(state.allocator);
@@ -5120,7 +5101,6 @@ export fn zigote_shutdown(handle: u64) void {
         state.gpu_3d = null;
     }
     state.gpu_ui.deinit();
-    state.gpu_backend.deinit(); // drops any per-frame swapchain view it may hold
     state.surface.unconfigure();
     state.queue.release();
     state.device.release();
@@ -6288,7 +6268,7 @@ export fn zigote_get_renderer_caps(handle: u64, out_caps: *ZgRendererCaps) void 
         return;
     };
 
-    const caps = state.gpu_backend.caps();
+    const caps = backend_mod.Caps{ .active_backend = state.backend_id };
     out_caps.* = .{
         .active_backend = @intFromEnum(caps.active_backend),
         .upscalers = caps.upscalers,
@@ -6377,7 +6357,7 @@ export fn zigote_render_frame_v2(handle: u64) ZgResult {
     return .ok;
 }
 
-const PassContext = render_mod.graph.PassContext;
+const PassContext = frame_mod.PassContext;
 
 inline fn rgState(ctx: *PassContext) *EngineState {
     return ctx.userAs(EngineState);
@@ -6627,7 +6607,7 @@ fn passScene3dGeometry(ctx: *PassContext) anyerror!void {
         g3d.depth_width,
         g3d.depth_height,
     );
-    ctx.graph.frame_scene_objects += drawn;
+    ctx.stats.scene_objects += drawn;
 }
 
 /// Scene3DPost — bloom + ACES tonemap of the HDR scene buffer into the LDR offscreen
@@ -6744,25 +6724,23 @@ fn passCompositePresent(ctx: *PassContext) anyerror!void {
     }
 }
 
-/// Register the per-frame pipeline as render-graph passes, executed in this order:
-///   RTPrePass → BlurPass → Scene3D{Begin,Shadow,Sky,Geometry,Submit} → CompositeAndPresent
-/// Resource reads/writes are declared for lifetime tracking, validation and introspection;
-/// passes own their command encoders, preserving the existing multi-submit frame structure.
-fn buildRenderGraph(state: *EngineState) !void {
-    const g = &state.render_graph;
-    try g.addPass(.{ .name = "RTPrePass", .pass_type = .resource_upload, .execute = passRtPrepass });
-    try g.addPass(.{ .name = "BlurPass", .pass_type = .resource_upload, .writes = &.{.blur_temp_a}, .execute = passBlur });
-    try g.addPass(.{ .name = "Scene3DBegin", .pass_type = .scene_3d, .writes = &.{.scene_color}, .execute = passScene3dBegin });
-    try g.addPass(.{ .name = "Scene3DShadow", .pass_type = .scene_3d, .writes = &.{.shadow_depth}, .execute = passScene3dShadow });
-    try g.addPass(.{ .name = "Scene3DSky", .pass_type = .scene_3d, .writes = &.{.scene_color}, .execute = passScene3dSky });
-    try g.addPass(.{ .name = "Scene3DGeometry", .pass_type = .scene_3d, .reads = &.{.shadow_depth}, .writes = &.{ .scene_color, .scene_depth }, .execute = passScene3dGeometry });
-    try g.addPass(.{ .name = "Scene3DPost", .pass_type = .scene_3d, .reads = &.{.scene_color}, .writes = &.{.scene_color}, .execute = passScene3dPost });
-    try g.addPass(.{ .name = "Scene3DSubmit", .pass_type = .scene_3d, .reads = &.{.scene_color}, .execute = passScene3dSubmit });
-    try g.addPass(.{ .name = "CompositeAndPresent", .pass_type = .ui, .reads = &.{.scene_color}, .writes = &.{.swapchain_color}, .execute = passCompositePresent });
-    _ = g.validate();
-}
+/// The per-frame pipeline, executed in this order:
+///   RTPrePass → BlurPass → Scene3D{Begin,Shadow,Sky,Geometry,Post,Submit} → CompositeAndPresent
+/// Passes own their command encoders, preserving the existing multi-submit frame structure.
+/// The list is fixed, so it is comptime data rather than an allocated, built-at-init ArrayList.
+const frame_passes = [_]frame_mod.Pass{
+    .{ .name = "RTPrePass", .execute = passRtPrepass },
+    .{ .name = "BlurPass", .execute = passBlur },
+    .{ .name = "Scene3DBegin", .execute = passScene3dBegin },
+    .{ .name = "Scene3DShadow", .execute = passScene3dShadow },
+    .{ .name = "Scene3DSky", .execute = passScene3dSky },
+    .{ .name = "Scene3DGeometry", .execute = passScene3dGeometry },
+    .{ .name = "Scene3DPost", .execute = passScene3dPost },
+    .{ .name = "Scene3DSubmit", .execute = passScene3dSubmit },
+    .{ .name = "CompositeAndPresent", .execute = passCompositePresent },
+};
 
-/// Execute the render graph for one frame, then advance per-frame state.
+/// Execute the frame's passes, then advance per-frame state.
 fn renderFrameV2Impl(state: *EngineState) !void {
     state.frame_dropped = false;
     state.scene_rendered = false;
@@ -6771,24 +6749,27 @@ fn renderFrameV2Impl(state: *EngineState) !void {
     // texture here, so this frame draws it rather than the one before it.
     drainImageUpdates(state);
 
-    var frame = render_mod.FrameContext{
+    const frame = frame_mod.FrameContext{
         .frame_index = state.frame_index,
         .surface_width = state.wgpu_config.width,
         .surface_height = state.wgpu_config.height,
         .dpi_scale = state.pending_scale,
         .delta_time = state.pending_dt,
-        .scene_viewport_w = @floatFromInt(state.pending_scene_w),
-        .scene_viewport_h = @floatFromInt(state.pending_scene_h),
         .transient_pool = &state.transient_pool,
     };
-    state.render_graph.frame_paint_commands = @intCast(state.paint_list.commands.items.len);
+    state.frame_stats.paint_commands = @intCast(state.paint_list.commands.items.len);
 
     var ctx = PassContext{
         .frame = &frame,
-        .graph = &state.render_graph,
+        .stats = &state.frame_stats,
         .user = state,
     };
-    state.render_graph.execute(&ctx);
+    const run_result = frame_mod.run(&frame_passes, &ctx);
+    if (run_result.first_failure_err) |err| {
+        std.log.err("frame: {d} pass(es) failed, first '{s}': {}", .{
+            run_result.failed, run_result.first_failure_name, err,
+        });
+    }
 
     // On a dropped frame (swapchain unavailable) keep the overlay and frame index so the
     // next frame retries cleanly — matches the pre-graph early-return behaviour.
@@ -7596,8 +7577,25 @@ test "every audio FFI export takes audio_lock" {
 
         // The lock must come before anything else touches the state, so look only at the head of
         // the body — far enough for the stateFromHandle line, short enough that a lock buried after
-        // a state access does not pass.
-        const head = src[found..@min(src.len, found + 320)];
+        // a state access does not pass. Comment lines are dropped rather than counted: a body that
+        // documents WHY it fast-paths (see zigote_audio_update) would otherwise push its own lock
+        // out of the window and fail, which would train the next author to widen the window until
+        // the check means nothing.
+        var head_buf: [320]u8 = undefined;
+        var head_len: usize = 0;
+        var lines = std.mem.splitScalar(u8, src[found..@min(src.len, found + 2048)], '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trimStart(u8, line, " \t");
+            if (std.mem.startsWith(u8, trimmed, "//")) continue;
+            const take = @min(line.len, head_buf.len - head_len);
+            @memcpy(head_buf[head_len..][0..take], line[0..take]);
+            head_len += take;
+            if (head_len == head_buf.len) break;
+            head_buf[head_len] = '\n';
+            head_len += 1;
+            if (head_len == head_buf.len) break;
+        }
+        const head = head_buf[0..head_len];
         if (std.mem.indexOf(u8, head, "state.audio_lock.lock();") == null) {
             std.debug.print("unguarded audio export: {s}\n", .{name});
             return error.AudioExportNotLocked;

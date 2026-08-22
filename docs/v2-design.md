@@ -1,0 +1,405 @@
+# Zigote.Engine V2 — refactoring, optimization and modularization design
+
+Status: **proposal** · Date: 2026-08-22 · Scope: `Zigote.Engine` (Zig) + its C# binding seam
+(`Zigote.Generators`, `Zigote.Core/Native`, `build/Zigote.Native.targets`).
+
+V2 **breaks ABI and source compatibility**. The C# side is rebuilt against it in the same change
+series; there is no migration shim.
+
+---
+
+## 0. TL;DR
+
+Today the engine is ~28.5k lines of first-party Zig, 70 % of it in four files (`ffi/root.zig` 7687,
+`wgpu_3d.zig` 4967, `wgpu.zig` 3988, `freetype_text.zig` 3272). It works, it is fast enough, and it
+has been grown one export at a time. The cost of that growth is now structural:
+
+| Problem | Evidence |
+|---|---|
+| The frame orchestrator lives in the FFI layer | 9 render passes registered and bodied in `ffi/root.zig:6388-6761` |
+| Two scene graphs | C# `SceneNode` diffs fields and pushes them into Zig `zg.World.SceneNode` which stores them again; 14 per-node setters + 4 copy-pasted texture loaders + a `[SuppressGCTransition]` allowlist exist to make that cheap |
+| Paint commands are transcoded on arrival | `fillPaintList` (`root.zig:2696-3053`) converts every 112 B `ZgPaintCommand` into a second tagged union with per-text heap copies, every frame |
+| Five error conventions, four handle schemes, three boolean encodings | 157 `void` exports fail silently; `ZgResult` used by 8/295; ecs handles are unchecked `@ptrFromInt` |
+| Abstractions nobody dispatches through | `GpuBackend` vtable: 2/5 methods used; `RenderGraph`: reads/writes/lifetimes/setEnabled unused; `Upscaler`/`RayTracer`/`vulkan`/`d3d12` have zero implementations |
+| Per-frame CPU waste | whole-image Wyhash per image command per frame; full UI re-tessellation + 5 whole-buffer uploads even for a static frame; 192-image cache cliff with no eviction |
+| Build knowledge encoded 3× | target matrix in `build.zig.zon`, `linkWgpuNative`, and `Zigote.Native.targets`; iOS framework list in 3 places |
+| Docs are wrong about the code | "217 exports" (real: 295), "LibraryImport" (real: DllImport), "engine/scene is legacy scaffold" (real: it is the live mesh store) |
+
+V2 is organized around **five decisions**, then a file-level plan, then a phased migration.
+
+---
+
+## 1. Goals and non-goals
+
+**Goals**
+1. One convention per concern: errors, handles, booleans, strings, callbacks, stubs.
+2. The renderer owns the frame. `ffi/` becomes a thin, generated-friendly shell.
+3. One scene store. Zig stores; C# sends commands. No field mirroring.
+4. Zero-copy paint ingestion; retained 2D geometry; no per-frame hashing of bulk data.
+5. Delete every one-implementation seam and every reserved-for-later contract.
+6. Build: one source of truth for the target matrix; every option combination test-built.
+7. Every file that survives carries tests that `zig build test` actually runs.
+
+**Non-goals**
+- A second GPU backend. wgpu is the backend. (A future native backend would be a separate
+  renderer, not a vtable — see §2.4.)
+- Changing the C#/Zig ownership split (C# drives the loop; Zig is passive).
+- Rewriting vendored C libraries.
+
+---
+
+## 2. The five decisions
+
+### 2.1 One ABI contract
+
+**Errors.** Every export returns `ZgStatus` (`i32`, `0 = ok`, negative = error code from one enum)
+*unless* it is a pure getter of a scalar that cannot fail. Handles and counts are returned through
+an `out_` parameter, never as a `0 = failure` sentinel. Failure detail goes through the existing log
+callback, with the status code attached. The C# wrapper throws on non-zero; no more
+"logged a warning and dropped the handle" (`root.zig:809-813`).
+
+Delete: `bool`/`u8`/`u32` boolean returns, `i32` status ladders in dialogs (`-3..1`), `u64 0`
+sentinels (32 exports), `ZgResult` (superseded).
+
+**Handles.** One `ZgHandle = u64` = `(generation: u32, index: u32)` into a typed slot table.
+One generic `HandleTable(T)` in `core/handle.zig` replaces the five ad-hoc schemes
+(pointer-as-handle + `AutoHashMap(u64, void)` for nodes, `image_registry`, `render_textures`,
+`windows`, and the *unchecked* ecs `@ptrFromInt`). Stale handles fail with `ZgStatus.stale_handle`
+everywhere, including ECS. The `engine: u64` first parameter is dropped from every export — there is
+exactly one engine per process today and the atomic `live_engine` check already proves it
+(`root.zig:824-840`). If multi-engine ever matters it is a `zigote_engine_select`, not 295 parameters.
+
+**Booleans** are `bool` (C `_Bool`). Not `u8`, not `u32`.
+
+**Strings in** are `ZgStr { ptr, len }` (UTF-8, not NUL-terminated). C# passes `ReadOnlySpan<byte>`
+via one helper; no stackalloc-and-NUL at 40 call sites. **Strings/blobs out** are always
+caller-buffer `(buf, cap, out_len)`; the one `std.c.free` path (`zigote_model_free`) dies —
+`zigote_model_import` writes the manifest into a caller buffer in two calls (size, fill) like
+clipboard already does.
+
+**Callbacks** are `(fn ptr, userdata: ?*anyopaque)` pairs. The ecs `callback: usize` hack goes
+away once the generator maps `?*anyopaque` (§2.5).
+
+**Wire structs.** `ZgPaintCommand` stops being a union-in-disguise. V2 uses a **tagged command
+stream**: a `u32 kind` + `u32 size` header followed by a kind-specific `extern struct`. Rect
+commands are 48 B instead of 112; text commands carry their own fields; no `@bitCast` of a float
+into a shader id, no `text_len` that is secretly a quad count. Strings and pixel blobs ride a
+**side buffer** referenced by `(offset, len)` — the same trick `ZgEvent` already uses for `poll_text`
+and which C# `PaintList` already does for its pinned-object-heap strings. One pinned `byte[]` for
+commands, one for blobs, two pointers per frame.
+
+`ZgEvent` becomes a tagged union the same way (`kind` + per-kind struct); no more
+`scroll_x` meaning relative motion on move and pressure on touch.
+
+`ZgRenderSettings3D` is generated (§2.5), so `settingsToWire`/`settingsFromWire`
+(`root.zig:7085`, `7173`, 136 hand-written lines) are deleted.
+
+ABI version restarts at **100**. The startup size check stays and now covers every wire struct.
+
+### 2.2 The renderer owns the frame
+
+New module `renderer/frame.zig` holds the frame sequence that currently lives in
+`ffi/root.zig:6307-6980` (`begin_frame` → 9 passes → present → `end_frame`). `ffi/` calls
+`Frame.begin(params)`, `Frame.submitUi(stream)`, `Frame.end()` and nothing else.
+
+**RenderGraph is deleted.** Evidence: `reads`/`writes` inert, `computeLifetimes` test-only,
+`setEnabled` and `validate()` results unused, 4/7 `PassType` and 4/9 `ResourceKind` arms never
+referenced, `TransientPool` has one acquire site, `FrameContext.scene_viewport_*` written and never
+read. What remains after deletion is a `for` over an ordered list of pass functions, which is what
+`frame.zig` is. The one real need — a temp texture for blur — is a field on the blur pass.
+
+**One command encoder per frame.** Blur, scene-3D submit, and composite each open and submit their
+own encoder today (`root.zig:6480-6493`, `passScene3dSubmit`, `passCompositePresent`). V2 records
+all passes into one encoder and submits once; the frame-tail `device.poll(false)` stays.
+
+**The two 3D entry points collapse.** `zigote_render_3d` (`root.zig:4139`, 152 lines, pre-graph)
+and the `Scene3DPass` inside `render_frame_v2` do the same thing via different code; `Gpu3d.render()`
+(`wgpu_3d.zig:3550`) is a third copy with zero callers. V2 has one `Scene3d.render(target)`; the
+editor's change-gated viewport is the same function with an offscreen target and a dirty flag. The
+`0x3D3D3D3D3D3D3D3D` magic cache key (`root.zig:2836`) becomes an ordinary render-texture handle.
+
+**The two frame APIs collapse.** `begin_frame/render_frame_v2/end_frame` and
+`frame_begin/frame_end` (the latter had drifted, `root.zig:6968-6971`; `zigote_frame_begin` has no
+C# caller) become `zigote_frame_begin` + `zigote_frame_end`. Secondary windows use the **same**
+frame API with a window handle parameter; their parallel 3-call path (`root.zig:4900-4930`) is
+deleted.
+
+### 2.3 One scene store
+
+Today `Zigote.Runtime/Scene/SceneNode.cs` keeps Position/Rotation/Scale/light/material and
+diff-pushes them through 14 setters into `zg.World.SceneNode`, which keeps them again. That mirror
+is the root cause of: chatty per-node P/Invoke (3–6 calls per node on rebuild), the
+`[SuppressGCTransition]` allowlist in the generator, four copy-pasted 45-line texture loaders,
+and the `node_handles` hashmap that exists only to survive stale pointers.
+
+V2: **Zig is the authority for transforms, lights, materials and meshes. C# sends a command
+buffer**, exactly like the paint stream:
+
+```
+zigote_scene_apply(stream: ZgStr, blobs: ZgStr) -> ZgStatus
+```
+
+with commands `node_create`, `node_destroy`, `node_set_transform`, `node_set_parent`,
+`node_set_mesh`, `material_set` (one struct, all PBR factors), `material_set_texture(slot, handle)`,
+`light_set`, `visibility_set`. One call per frame regardless of how many nodes changed. C#
+`SceneNode` keeps only what C# needs for gameplay (its own transform) and marks dirty; a
+`SceneSync` flushes dirty nodes into the stream. The `_pPos.ApproxEquals` diffing moves to one
+place.
+
+Textures: `material_set_texture` takes a texture **handle**; loading is a separate async
+`zigote_texture_load(path) -> handle` (the `TextureDecodeJob` thread pool at `root.zig:3867`
+already exists). No export does a synchronous 256 MB file read on the caller's thread. The four
+`*_texture_file` setters become one.
+
+`src/engine/scene` + `src/engine/resources` are **kept and renamed** to `scene/` — the docs calling
+them "legacy scaffold" were wrong; they are the live store the 3D renderer walks every frame.
+`engine/math` stays as `math/`; `zmath` (220 KB vendored SIMD) is dropped — it backs four call sites
+in `mat.zig:15-55`, which get a hand-written 4×4 multiply with `@Vector`.
+
+### 2.4 Delete one-implementation abstractions
+
+| Delete | Why |
+|---|---|
+| `backend.zig` `GpuBackend` vtable, `BackendId.vulkan/d3d12`, `Upscaler`, `RayTracer`, `Caps.upscalers/raytracing` | Hot path bypasses the vtable (`acquire`/`present`/`configure` dead in `wgpu_backend.zig:55-95`); every reserved arm resolves to `.wgpu`; zero implementations |
+| `render/` (RenderGraph, TransientPool, FrameContext) | §2.2 |
+| `ZgRendererCaps` | only field that varies is `active_backend`, which is always wgpu |
+| `Backend`/`RendererPlan` marker structs (`wgpu.zig:3940`) | tautological test only |
+| ecs.zig `pub fn` layer (lines 18–380) | 55 pairs of fn + one-line export wrapper; the reason cited in its header no longer holds |
+| audio/physics wrapper blocks in root.zig (`:2283-2690`, `:6041-6265`, ~650 lines) | `audio.zig`/`physics.zig` export directly, like ecs/chrome/dialogs already do |
+| `zigote_frame_begin`, `zigote_render_3d`, `Gpu3d.render`, `renderFrameOverlay*` dead `frame_index` params | dead or duplicate |
+| 9 exports with no C# caller (`ecs_ensure`, `ecs_make_pair`, `ecs_remove_pair`, `ecs_has_pair`, `ecs_new_w_pair`, `ecs_builtin_prefab`, `get_relative_mouse_mode`, `warp_mouse_in_window`, `debug_gpu_allocated_bytes`) | unused |
+| `shaders/text_shader_source.wgsl` | dead and already diverged from the live inline copy at `freetype_text.zig:2860` |
+| `libraries/zflecs/src/*.zig`, `libraries/zphysics/src/zphysics.zig`, `libraries/zmesh/{libs/cgltf,libs/par_shapes,src/*}` except `zmeshoptimizer.zig`, `libraries/zpool`, `libraries/zmath` | vendored Zig bindings never imported (both libs are used via `@cImport`); zpool backs one `Pool()` instantiation → replaced by `HandleTable`; zmath per §2.3 |
+| `src/core/math/root.zig`, `src/ui/geometry.zig`, `src/ui/root.zig`, `src/core/root.zig` alias chains | six files to reach one `Rect`; four contain only the same alias list |
+| `engine/math/ray.zig`, `RigidBody`, `ProjectionKind` in `components.zig` | zero references |
+| three hand-rolled `SpinLock`s (`root.zig:551`, `netstream.zig:41`, `channel.zig:61`) | one in `core/sync.zig` |
+
+If a native Metal/Vulkan renderer is ever wanted, it is a second `renderer_*/` directory selected
+at **build time** (`-Drenderer=wgpu|metal`) through Zig's comptime module switch — no runtime
+vtable, no `Caps` bits nobody reports.
+
+### 2.5 The binding generator grows up
+
+`ZigoteBindingGenerator.cs` scans for `export fn ` at column 0 and substring-slices types. V2
+replaces the scanner with a small **Zig-side manifest**: a `zig build ffi-manifest` step that
+`@typeInfo`-walks every `export fn` and every `extern struct`/`enum` in `ffi/abi.zig` and emits a
+JSON description (names, param types, return type, struct fields with `@offsetOf`/`@sizeOf`, enum
+values, doc comments). The C# generator consumes the JSON.
+
+What this buys, concretely:
+- Structs and enums are **generated**, not hand-mirrored (`ZgStructs.cs`, 506 lines, goes away;
+  `AbiLayoutTests` becomes a generated assert per struct).
+- `?*anyopaque`, `ZgStr`, `ZgHandle`, `bool`, fn-pointer-with-userdata map properly; the
+  `desktop_shims_stub.zig` exclusion in `Zigote.Core.csproj:19-20` and the hand-written
+  `NativeMenu.cs` go away.
+- `out_` name-prefix magic is replaced by an explicit `*T` → `out T` rule for pointer params of
+  non-blob structs; blobs are `ZgStr`.
+- `[SuppressGCTransition]` becomes an attribute-like doc tag on the Zig export
+  (`/// ffi: leaf`) instead of a hardcoded list in the C# generator.
+- `[LibraryImport]` becomes possible (the generated file is source, not generator output, if the
+  manifest step writes `NativeEngine.g.cs` to disk) — faster marshalling stubs, no runtime IL emit.
+
+---
+
+## 3. Performance plan
+
+Each item names the smell, the fix, and the expected effect. None requires new dependencies.
+
+### 3.1 2D UI path (`wgpu.zig`)
+
+| # | Today | V2 |
+|---|---|---|
+| P1 | `imageKey()` Wyhashes the whole pixel buffer per image command per frame (`wgpu.zig:3594`) | Image commands carry a mandatory texture handle; pixels are uploaded once through `zigote_texture_create`. No per-frame hashing of bulk data, anywhere. |
+| P2 | `max_cached_images = 192` cliff: past it, every image is texture+view+bindgroup+upload+destroy per frame (`wgpu.zig:2991`) | Handle table + LRU with byte budget; eviction is explicit and observable in `zigote_debug_engine_stats` |
+| P3 | Full re-tessellation + 5 unconditional whole-buffer `writeBuffer`s per frame (`wgpu.zig:878`, `1196-1254`) | Command stream carries a per-subtree **version**; tessellated vertex ranges are retained per subtree and re-emitted only when the version changes. Damage rects (already sent) then also skip tessellation, not just GPU fill. |
+| P4 | `ShapeVertex` 40 B × 6 per rect = 240 B/rect (`wgpu.zig:19`, `3332`) | Rects/borders/shadows become **instanced** (one 64 B instance per rect, 4-vertex shared quad via existing `quad_index_buffer`). −75 % vertex bytes; text and images already do this. |
+| P5 | One `writeBuffer` per rounded clip per frame (`wgpu.zig:1147`) | Stage the clip ring, one write. Same for 3D shadow slices (`wgpu_3d.zig:3701/3727/3794`) and post params (`:3908-4019`, 7 writes, unconditional) — the `flushModelRing` pattern already in the codebase, applied everywhere. |
+| P6 | Blur creates 3 views + 2 bind groups + own encoder + own submit per request (`wgpu_blur.zig:218-262`) | Cache bind groups on `(src,temp,dst)`; record into the frame encoder. |
+| P7 | `fillPaintList` transcodes the wire format into a second union with per-text heap dupes (`root.zig:2696-3053`) | Tessellate **directly from the wire stream**. `ui/render/paint.zig`'s union is deleted. |
+| P8 | Shaped-run cache hashes the full text per run per frame (`freetype_text.zig:1037`) | Text command carries a caller-supplied `u64 text_id` (C# already interns strings on the POH; the address is stable and free). Hash only the id + style. |
+
+### 3.2 3D path (`wgpu_3d.zig`)
+
+| # | Today | V2 |
+|---|---|---|
+| P9 | Per-draw `worldMatrix()` + `normalMatrix()` + 7-field repack with no change detection (`wgpu_3d.zig:4767-4805`, duplicated at `4843-4870`) | `scene/` keeps a packed `ModelUniforms` per node, recomputed on `node_set_transform`/`material_set` only (it is the authority now — §2.3). Draw = copy. |
+| P10 | Chatty per-node FFI (3–6 calls per node) | `zigote_scene_apply` stream, 1 call/frame |
+| P11 | Bloom mip0 allocated full-res, never used (`wgpu_3d.zig:568`) | Drop it |
+| P12 | `Gpu3d.init` is 1417 lines with `@setEvalBranchQuota(4000)` | Split per §4; also enables lazy per-feature pipeline creation (SSR pipelines only when SSR is on) rather than the all-22-pipelines spike |
+
+### 3.3 FFI path
+
+| # | Today | V2 |
+|---|---|---|
+| P13 | `windowFromSdlId` linear-scans the window map per event (`root.zig:854`) | `HandleTable` indexed by SDL id |
+| P14 | `image_lock` spinlock taken twice per image command in the paint loop (`root.zig:2848`, `2907`) | Images are handles; the paint loop touches no lock |
+| P15 | `audio_lock` around every audio call including file opens (`root.zig:779`) | Lock only the handle table; decode/open outside |
+| P16 | Two identical 500k-iteration `mapAsync` spin-polls (`root.zig:4355`, `6938`) | One `readbackSync` helper; fine to keep synchronous, it's capture-time |
+
+---
+
+## 4. Module layout
+
+```
+src/
+  abi.zig                 every extern struct / enum / ZgStatus / ZgHandle / ZgStr — the wire contract,
+                          the single input of the manifest generator; comptime layout asserts live here
+  core/
+    geometry.zig          Color, Rect, Size, Offset, Constraints, EdgeInsets  (was core/math/geometry.zig)
+    handle.zig            HandleTable(T)  (generational slots; replaces 5 schemes + zpool)
+    sync.zig              SpinLock (one), readbackSync
+    arena.zig             per-frame arena
+  math/                   Vec, Mat4 (@Vector), Quat, Frustum   (was engine/math; ray.zig deleted)
+  scene/                  World, Node, Material, Mesh, zmesh_format, packed ModelUniforms  (was engine/*)
+                          scene/apply.zig — the command-stream decoder (§2.3)
+  text/
+    faces.zig             FreeType face/strike management, font registry
+    shape.zig             HarfBuzz shaping + bidi + run cache        (bidi.zig, bidi_table.zig move here)
+    atlas.zig             coverage + colour atlas packing
+    layout.zig            retained TextLayout, hit-test, caret
+  gpu/                    thin wgpu helpers shared by everything below
+    device.zig            instance/adapter/device/surface (was wgpu_backend.zig, minus the vtable)
+    texture.zig           ONE upload path with 256-B row alignment (was 4 copies)
+    pipeline.zig          ONE render-pipeline builder (was 75 call sites of boilerplate)
+    staging.zig           StagingRing — the flushModelRing pattern, generic
+    shaders/
+      common.wgsl         fullscreen VS, rounded_clip_coverage, srgb_decode — comptime-prepended
+      *.wgsl              every shader is a file; zero inline Zig string shaders
+  ui/                     2D renderer
+    stream.zig            wire-stream cursor (reads abi.zig command headers)
+    tessellate.zig        stream → retained per-subtree vertex ranges (P3, P4, P7)
+    images.zig            texture handle table + LRU (P1, P2)
+    pass.zig              clip ring, draw replay, damage scissor
+    blur.zig
+  scene3d/                3D renderer (was wgpu_3d.zig, split)
+    pipelines.zig         pipeline/bind-group-layout construction (was Gpu3d.init)
+    targets.zig           G-buffer / post targets, lazy allocation (was ensurePostTargets)
+    shadows.zig
+    environment.zig       sky + IBL bake
+    geometry_pass.zig     renderLayer, instancing, model staging ring
+    post.zig              ssao/ssr/bloom/dof/tonemap/taa
+    sprites.zig, particles.zig   (no longer embedded in Gpu3d; take a *Scene3d context)
+    uniforms.zig
+  renderer/
+    frame.zig             THE frame: begin → passes → one submit → present  (§2.2)
+    window.zig            main + secondary windows, one code path
+  platform/
+    sdl_events.zig        poll_events split out of root.zig (344 lines → own file)
+    input.zig             gamepad, touch slots, cursors, IME
+    macos/*.m             unchanged ObjC
+    stubs.zig             ONE stub file covering menu, drag, tray, chrome, dialogs on non-macOS (§5.2)
+  ffi/
+    engine.zig            init/shutdown/frame/window/input/text exports — thin shells over the above
+    scene.zig             zigote_scene_apply + texture_load
+    audio.zig, physics.zig, ecs.zig, dialogs.zig, chrome.zig, channel.zig, model_import.zig
+                          each exports directly; no wrapper layer in a root file
+    root.zig              ~40 lines: comptime force-references only
+```
+
+Rules enforced by `zig build test` (a test that walks `@import` graph via `std.zig.Ast` — cheap):
+- `abi.zig` imports nothing.
+- `ffi/*` may import anything; nothing imports `ffi/*`.
+- `ui/`, `scene3d/`, `text/` import `gpu/` and `core/`; they do not import each other or
+  `renderer/`. (Today `wgpu.zig:3` imports the engine root — the circular weld goes away.)
+- Every file is reachable from a `test {}` block in its directory's `root.zig` — so the current
+  situation where `wgpu_3d.zig` tests would not run even if written (`renderer/root.zig:11-16`)
+  cannot recur. A test asserts the list matches `ls`.
+
+No function over ~300 lines; `appendPaintOps` (490), `renderLayer` (333), `beginScene` (237),
+`ensurePostTargets` (410), `renderPostProcess` (196) are split along the module lines above.
+
+---
+
+## 5. Build and platform
+
+### 5.1 One target matrix
+
+`build.zig` gets a single `const Targets = [_]TargetSpec{…}` table (os, arch, abi, wgpu dep name,
+system libs, frameworks). `linkWgpuNative`, `buildMiniaudio`'s framework block, and the Apple
+framework block become lookups into it. `zig build print-targets` emits the same table as JSON;
+`Zigote.Native.targets` reads that instead of re-deriving `_RidOS`/`_ZigTriple`/`ZigNativeLib`
+(`Native.targets:51-119`) and the iOS `<Frameworks>` string.
+
+The two hand-maintained 10-module lists (`build.zig:625-628`, `675-678`) become one
+`all_modules` array. `buildWebp`/`buildMiniaudio`/`buildFlecs`/`buildMeshoptimizer` become one
+`vendoredStaticLib(spec)`.
+
+### 5.2 One stub strategy
+
+Today non-macOS builds have three strategies for macOS-only symbols: a Zig no-op stub (menu/drag),
+comptime-pruned `extern` (chrome/dialogs), and **nothing** (`zigote_mactray_*` — P/Invoked from
+`NativeMenu.cs:76-102`, undefined in `libzigote.so` on Linux/Windows). V2: `platform/stubs.zig`
+covers every macOS-only export on every other OS, and the manifest generator (§2.5) reads the real
+signatures so the stub file no longer needs excluding from the binding build. This is also what
+lets `-Decs=false` work on iOS (`Native.targets:128-132`): ecs gets a stub too, generated from the
+same manifest.
+
+### 5.3 Test every configuration
+
+`zig build test` runs the module tests for the default config **and** `zig build check-matrix`
+compiles `shared-lib` for `{enable3d, physics3d, ecs} ∈ {on,off}³` (8 builds, cached, seconds)
+plus a naga validation of every `.wgsl` through wgpu-native's `wgpuDeviceCreateShaderModule` on a
+headless adapter where available. Today the mobile and export configurations ship untested.
+
+### 5.4 Toolchain
+
+Pin Zig via a `.zigversion` read by `Native.targets` (today: bare `zig` from `$PATH`, 0.16.0
+assumed). Keep the two documented `ponytail:` workarounds (`_FORTIFY_SOURCE`, `use_llvm`) with
+their issue links; they are not design debt.
+
+---
+
+## 6. C# side changes (the seam)
+
+- `Zigote.Core/Native/ZgStructs.cs` → deleted (generated).
+- `ZigoteEngine.cs` (2814 lines): the ~40 UTF-8/stackalloc string call sites collapse to one
+  `ZgStr.From(ReadOnlySpan<byte>)`; error handling becomes `Check(status)` in the generated stub.
+- `PaintList` writes the V2 tagged stream + blob buffer directly (it already keeps POH strings and
+  a blob fix-up list; the change is the record layout).
+- `SceneNode` loses its `_p*` mirror fields; `SceneSync` builds the scene stream.
+- `App.cs:1656/1704` mixes old `BeginFrame` with new `FrameEnd`; V2 has one pair.
+
+---
+
+## 7. Migration plan
+
+Each phase is independently shippable and leaves the tree green. ABI version bumps once, at the
+end of Phase 2; until then V1 and V2 coexist behind `-Dabi=v1|v2` only for the paint/scene streams.
+
+| Phase | Work | Deletes | Risk |
+|---|---|---|---|
+| **0. Mechanical split** (1–2 wk) | Move code into the §4 layout without behaviour change; `gpu/texture.zig`, `gpu/pipeline.zig`, `common.wgsl`; fix `root.zig` test reach; `all_modules`; `vendoredStaticLib` | dead items from §2.4 table that have zero callers (backend seams, RenderGraph, wrapper layers, unused vendored trees, alias chains) | Low — BMP golden diffs (`ZIGOTE_SHOT`, `capture_ui_bmp`) gate every step |
+| **1. ABI contract** (1–2 wk) | `abi.zig`, `ZgStatus`, `HandleTable`, `ZgStr`, manifest generator, generated C# structs, drop `engine` param, one stub file | `ZgStructs.cs`, `NativeMenu.cs` hand bindings, sentinel returns | Medium — every C# call site touched, but mechanically |
+| **2. Streams** (2–3 wk) | Tagged paint stream + direct tessellation (P7), tagged events, `zigote_scene_apply` + texture handles (P1, P10), one frame API for all windows | `fillPaintList`, `paint.zig` union, 14 node setters, 4 texture loaders, `render_3d`, frame-API duplicates | High — this is the compat break; ship behind the flag, flip default, delete V1 |
+| **3. Retained 2D** (1–2 wk) | Subtree versions, retained vertex ranges, instanced rects, staged clip ring (P3–P5) | — | Medium — golden diffs must be byte-identical |
+| **4. 3D hygiene** (1 wk) | Packed uniforms in `scene/` (P9), lazy per-feature pipelines (P12), staged shadow/post params (P5), bloom mip0 | — | Low |
+| **5. Build matrix + docs** (3 d) | `Targets` table, `print-targets`, `check-matrix`, `.zigversion`; rewrite `docs/` from the manifest (export counts generated, never hand-typed again) | `_RidOS`/`_ZigTriple` derivations in MSBuild | Low |
+
+**Verification throughout**: the existing `ZIGOTE_SHOT` + `tools/bmpdiff.py` byte-exact gate for 3D,
+`zigote_capture_ui_bmp` for 2D, `AbiLayoutTests` (generated), and a new `Zigote.SmokeTest` frame
+benchmark asserting P/Invoke count per frame (≤ 4 on a static UI frame, ≤ 5 with a 3D scene).
+
+---
+
+## 8. Open questions (decided by default unless overridden)
+
+1. **Keep `ffi_mod` as the root for both `shared-lib` and `static-lib`?** Default: yes; iOS static
+   needs the same symbol set, and the stub strategy (§5.2) removes the reason they could diverge.
+2. **Instance-vs-indexed rects (P4).** Default: instanced; the sprite pass already proves the
+   vertex-pulling pattern on this wgpu version.
+3. **Does `Zigote.ECS` keep flecs, or does `scene/` become the ECS?** Out of scope for V2; the
+   `HandleTable` + stream pattern makes either future choice local to `ffi/ecs.zig`.
+4. **Drop `zmath`** (§2.3) assumes `@Vector` codegen is adequate for a 4×4 multiply on all five
+   targets. Measure in Phase 0; if it regresses on Android x86_64, keep zmath for `mat.zig` only.
+
+---
+
+## Appendix A — corrections to existing docs
+
+- Export count is **295** (207 root, 55 ecs, 11 chrome, 10 shims, 6 channel, 6 dialogs), not 217/230.
+- Bindings are `[DllImport]`, not `[LibraryImport]` (`ZigoteBindingGenerator.cs:88-91`).
+- `src/engine/scene` is the **live** mesh/material/transform store (`EngineState.world`,
+  `wgpu_3d.zig` walks it every frame), not a legacy scaffold.
+- `RenderGraph` does not topologically order anything; execution is registration order
+  (`render_graph.zig:9-10`).
+- `zigote_mactray_*` has no non-macOS definition.

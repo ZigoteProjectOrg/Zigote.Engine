@@ -1,17 +1,12 @@
+//! Pool of transient (per-frame) GPU textures, reused across frames so steady state does not
+//! allocate. One acquire site today: the UI blur pass's temp target.
+//!
+//! Was `render/render_resource.zig`. Its `ResourceKind` enum and `evictResized` went with the
+//! render graph — the enum was inert pass metadata (4 of 9 arms never referenced) and
+//! `evictResized` had no callers. See docs/v2-design.md §2.2.
+
 const std = @import("std");
 const wgpu = @import("wgpu");
-
-pub const ResourceKind = enum(u8) {
-    swapchain_color = 0,
-    scene_color = 1,
-    scene_depth = 2,
-    backdrop_color = 3,
-    ui_color = 4,
-    blur_temp_a = 5,
-    blur_temp_b = 6,
-    picking_id_buffer = 7,
-    shadow_depth = 8,
-};
 
 pub const TextureDesc = struct {
     width: u32,
@@ -93,21 +88,6 @@ pub const TransientPool = struct {
             if (e.texture == texture) {
                 e.in_use = false;
                 return;
-            }
-        }
-    }
-
-    /// Remove entries whose size no longer matches (on window resize).
-    pub fn evictResized(self: *TransientPool, width: u32, height: u32) void {
-        var i: usize = 0;
-        while (i < self.entries.items.len) {
-            const e = &self.entries.items[i];
-            if (e.desc.width != width or e.desc.height != height) {
-                e.view.release();
-                e.texture.release();
-                _ = self.entries.swapRemove(i);
-            } else {
-                i += 1;
             }
         }
     }

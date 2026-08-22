@@ -63,17 +63,8 @@ pub const Light = struct {
     cast_shadows: bool = false,
 };
 
-pub const RigidBody = struct {
-    velocity: Vec3 = Vec3.zero,
-    angular_velocity: Vec3 = Vec3.zero,
-    mass: f32 = 1.0,
-    is_static: bool = false,
-    use_gravity: bool = true,
-};
-
 pub const Component = union(enum) {
     camera: Camera,
     mesh_renderer: MeshRenderer,
     light: Light,
-    rigid_body: RigidBody,
 };
