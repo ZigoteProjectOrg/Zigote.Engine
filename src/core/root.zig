@@ -6,6 +6,7 @@
 //! root the build wires as `zigote_core`. See docs/v2-design.md §2.4.
 
 pub const geometry = @import("geometry.zig");
+pub const handle = @import("handle.zig");
 pub const sync = @import("sync.zig");
 
 pub const Color = geometry.Color;
@@ -15,8 +16,11 @@ pub const Offset = geometry.Offset;
 pub const Rect = geometry.Rect;
 pub const Size = geometry.Size;
 pub const SpinLock = sync.SpinLock;
+pub const HandleTable = handle.HandleTable;
+pub const Handle = handle.Handle;
 
 test {
     _ = geometry;
+    _ = handle;
     _ = sync;
 }

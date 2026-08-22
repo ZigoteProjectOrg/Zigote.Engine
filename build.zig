@@ -491,8 +491,8 @@ pub fn build(b: *std.Build) void {
     //   zmath — @Vector(4,f32) linear algebra backing the engine math hot paths
     //           (Mat4.mul / mulVec4 / inverse). (Frustum.intersectsSphere uses a plain 6-lane
     //           @Vector dot-and-compare in engine/math/frustum.zig, not zmath.)
-    //   zpool — generational handle pools for the renderer's per-entity GPU caches.
-    //   zjobs — persistent worker pool for the parallel texture loader.
+    // (Generational handle tables are first-party now — src/core/handle.zig — so the vendored
+    // zpool, instantiated exactly once, is gone.)
     const zmath_opts = b.addOptions();
     zmath_opts.addOption(bool, "enable_cross_platform_determinism", true);
     const zmath_mod = b.addModule("zmath", .{
@@ -502,11 +502,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zmath_options", .module = zmath_opts.createModule() },
         },
-    });
-    const zpool_mod = b.addModule("zpool", .{
-        .root_source_file = b.path("libraries/zpool/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
     });
     // zmesh's meshoptimizer binding only (extern + inline wrappers; std-only imports). Points
     // straight at zmeshoptimizer.zig so par_shapes/cgltf aren't pulled in. Symbols resolve against
@@ -556,7 +551,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zigote_ui", .module = ui_mod },
             .{ .name = "zigote_engine", .module = engine_mod },
             .{ .name = "zmath", .module = zmath_mod },
-            .{ .name = "zpool", .module = zpool_mod },
             .{ .name = "zmesh_opt", .module = zmesh_opt_mod },
         },
     });
@@ -631,7 +625,7 @@ pub fn build(b: *std.Build) void {
     // in the Android and Windows blocks below, so adding a module meant remembering both.
     const all_modules = [_]*std.Build.Module{
         core_mod, ui_mod,     engine_mod, zigote_mod, ffi_mod,
-        wgpu_mod, zaudio_mod, zmath_mod,  zpool_mod,  zmesh_opt_mod,
+        wgpu_mod, zaudio_mod, zmath_mod,  zmesh_opt_mod,
     };
 
     if (target.result.abi.isAndroid()) {

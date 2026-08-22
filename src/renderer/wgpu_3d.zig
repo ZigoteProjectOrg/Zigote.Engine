@@ -9,7 +9,7 @@
 ///   - Mesh GPU buffers cached by MeshHandle in a HashMap
 const std = @import("std");
 const wgpu = @import("wgpu");
-const zpool = @import("zpool");
+const HandleTable = @import("zigote_core").handle.HandleTable;
 const zmo = @import("zmesh_opt");
 const engine = @import("zigote_engine");
 const math = engine.math;
@@ -386,12 +386,16 @@ const InstanceGpu = struct {
     }
 };
 
-// Generational handle pools backing the per-entity GPU resource caches. Storage is
-// contiguous and capacity-reservable (no value-rehash spikes when entity counts grow
-// under load), and a handle whose slot was freed/reused fails isLiveHandle instead of
-// silently aliasing a different entity's resource. 20 index bits (≤1M live) + 12 cycle
-// bits pack into a u32 handle id, stored in the small Entity→id index maps below.
-const InstancePool = zpool.Pool(20, 12, InstanceGpu, struct { gpu: InstanceGpu });
+// Generational handle table backing the per-entity instance buffers. A handle whose slot was
+// freed and reused resolves to null instead of silently aliasing a different entity's resource.
+// Handles are stored in the small Entity→handle index map below.
+//
+// Was the vendored `zpool`, which the engine instantiated exactly once, for this. The one
+// behavioural difference: zpool auto-called each value's 0-arg `deinit` on slot release, whereas
+// the table hands the value back and lets the caller release it — so every removal site below
+// deinits explicitly. That is more code here, and less surprising than a container that decides
+// on its own when to free GPU buffers.
+const InstancePool = HandleTable(InstanceGpu);
 
 // A blended renderable tagged with its squared distance to the camera so the
 // transparent pass can draw farthest-first.
@@ -718,7 +722,7 @@ pub const Gpu3d = struct {
     model_flushed: u32 = 0,
     // Per-entity instance buffers (set via FFI zigote_scene_set_mesh_instances), same scheme.
     instance_pool: InstancePool,
-    instance_index: std.AutoHashMapUnmanaged(scene_mod.Entity, u32) = .{},
+    instance_index: std.AutoHashMapUnmanaged(scene_mod.Entity, u64) = .{},
     // Entities already reported (once) as falling back to the default material — so the renderer
     // can flag "this primitive is rendering with the grey/silver default" without log spam.
     logged_default_mat: std.AutoHashMapUnmanaged(scene_mod.Entity, void) = .{},
@@ -2169,12 +2173,18 @@ pub const Gpu3d = struct {
     /// textures, render targets). Called by zigote_scene_clear so loading a new scene or switching
     /// projects releases the previous scene's geometry + textures instead of leaking them until app
     /// shutdown. clearRetainingCapacity keeps the maps allocated for immediate reuse.
+    /// Release every live instance's CPU list and GPU buffer. The handle table stores values, not
+    /// resources, so freeing them is the owner's job — done here for both clearScene and deinit.
+    fn deinitInstances(self: *Gpu3d) void {
+        var it = self.instance_pool.iterator();
+        while (it.next()) |inst| inst.deinit();
+    }
+
     pub fn clearScene(self: *Gpu3d) void {
         self.mesh_cache.clear();
         for (self.material_gpu_cache.items) |*slot| if (slot.*) |*g| g.deinit();
         self.material_gpu_cache.clearRetainingCapacity();
-        // clear() releases every slot, which auto-calls each value's 0-arg deinit
-        // (InstanceGpu) — no manual free loop, no double-free.
+        self.deinitInstances();
         self.instance_pool.clear();
         self.instance_index.clearRetainingCapacity();
     }
@@ -2185,7 +2195,7 @@ pub const Gpu3d = struct {
         self.mesh_cache.deinit();
         for (self.material_gpu_cache.items) |*slot| if (slot.*) |*g| g.deinit();
         self.material_gpu_cache.deinit(self.allocator);
-        // pool.deinit() clears first (auto-deinits live values) then frees storage.
+        self.deinitInstances();
         if (self.model_ring_bg) |bg| bg.release();
         if (self.model_ring) |b| b.release();
         if (self.model_staging.len != 0) self.allocator.free(self.model_staging);
@@ -4906,14 +4916,16 @@ pub const Gpu3d = struct {
         // probed 2-3× per renderable per frame (shadow + cull + opaque loops). Skip the hash of
         // the entity key entirely when the map is empty — a single integer compare instead.
         if (self.instance_index.count() == 0) return null;
-        const id = self.instance_index.get(entity_id) orelse return null;
-        return self.instance_pool.getColumnPtrIfLive(.{ .id = id }, .gpu);
+        const handle = self.instance_index.get(entity_id) orelse return null;
+        return self.instance_pool.get(handle);
     }
 
     pub fn invalidateEntity(self: *Gpu3d, entity_id: scene_mod.Entity) void {
-        // removeIfLive releases the slot, auto-calling the value's 0-arg deinit.
         if (self.instance_index.fetchRemove(entity_id)) |entry| {
-            _ = self.instance_pool.removeIfLive(.{ .id = entry.value });
+            if (self.instance_pool.remove(entry.value)) |gone| {
+                var v = gone;
+                v.deinit();
+            }
         }
     }
 
@@ -4925,12 +4937,15 @@ pub const Gpu3d = struct {
     // and only read it when count > 0 and it is non-null.
     pub fn setInstances(self: *Gpu3d, entity_id: scene_mod.Entity, ptr: [*c]const f32, count: u32) void {
         const inst = self.instanceFor(entity_id) orelse blk: {
-            const handle = self.instance_pool.add(.{ .gpu = .{ .alloc = self.allocator } }) catch return;
-            self.instance_index.put(self.allocator, entity_id, handle.id) catch {
-                self.instance_pool.removeAssumeLive(handle);
+            const handle = self.instance_pool.add(.{ .alloc = self.allocator }) catch return;
+            self.instance_index.put(self.allocator, entity_id, handle) catch {
+                if (self.instance_pool.remove(handle)) |gone| {
+                    var v = gone;
+                    v.deinit();
+                }
                 return;
             };
-            break :blk self.instance_pool.getColumnPtrAssumeLive(handle, .gpu);
+            break :blk self.instance_pool.get(handle).?;
         };
         inst.cpu.clearRetainingCapacity();
         if (count > 0 and ptr != null) {
