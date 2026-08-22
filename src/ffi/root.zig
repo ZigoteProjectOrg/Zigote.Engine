@@ -494,6 +494,8 @@ const SecondaryWindow = struct {
     paint_list: zg.PaintList,
     overlay_paint_list: zg.PaintList,
     frame_index: u32,
+    /// Logical-to-pixel scale for this window, stored by zigote_frame_begin.
+    pending_scale: f32 = 1.0,
 
     fn deinit(self: *SecondaryWindow, alloc: std.mem.Allocator) void {
         self.overlay_paint_list.deinit(alloc);
@@ -4486,7 +4488,7 @@ export fn zigote_set_text_input_area(x: i32, y: i32, w: i32, h: i32, cursor: i32
 // ── Secondary OS windows (UI-only) ────────────────────────────────────────────
 //
 // A secondary window runs only the 2D paint path: C# submits a per-window paint list and calls
-// zigote_window_render, which draws it through the window's own GpuUi and presents its surface.
+// zigote_frame_end(window), which draws it through the window's own GpuUi and presents it.
 // The 3D scene / render graph stay bound to the main window. Events carry ZgEvent.window_id so
 // the C# side routes input to the right window's widget tree.
 
@@ -4786,36 +4788,12 @@ export fn zigote_window_native_parent(window_handle: u64, out_kind: *u32, out_pt
     return .ok;
 }
 
-/// Store a secondary window's paint commands for its next zigote_window_render.
-export fn zigote_window_submit_paint(window_handle: u64,
-    commands: [*]const ZgPaintCommand,
-    count: u32,) ZgStatus {
+/// Render a secondary window's submitted paint lists through its own GpuUi and present it.
+/// Reached through `zigote_frame_end(window)`; secondary windows are UI-only, so this is the whole
+/// frame for them.
+fn renderSecondaryWindow(window_handle: u64) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    const win = windowFromHandle(state, window_handle) orelse return .ok;
-    fillPaintList(state, &win.paint_list, commands, count) catch |err| {
-        std.log.err("zigote_window_submit_paint failed: {}", .{err});
-    };
-    return .ok;
-}
-
-/// Like zigote_window_submit_paint but for the window's overlay layer (popups, tooltips) —
-/// rendered after the main list, mirroring the main window's root/overlay split.
-export fn zigote_window_submit_overlay(window_handle: u64,
-    commands: [*]const ZgPaintCommand,
-    count: u32,) ZgStatus {
-    const state = engineState() orelse return .invalid_handle;
-    const win = windowFromHandle(state, window_handle) orelse return .ok;
-    fillPaintList(state, &win.overlay_paint_list, commands, count) catch |err| {
-        std.log.err("zigote_window_submit_overlay failed: {}", .{err});
-    };
-    return .ok;
-}
-
-/// Render the window's submitted paint lists through its own GpuUi and present its surface.
-/// scale converts the paint lists' logical coordinates to this window's pixels.
-export fn zigote_window_render(window_handle: u64, scale: f32) ZgResult {
-    const state = engineState() orelse return .err;
-    const win = windowFromHandle(state, window_handle) orelse return .err;
+    const win = windowFromHandle(state, window_handle) orelse return .invalid_handle;
     wgpu_renderer.wgpu.renderFrame(
         win.surface,
         state.device,
@@ -4825,15 +4803,17 @@ export fn zigote_window_render(window_handle: u64, scale: f32) ZgResult {
         win.overlay_paint_list,
         win.config.width,
         win.config.height,
-        scale,
+        win.pending_scale,
         win.frame_index,
         &[_]zg.Rect{},
         false, // secondary window: no partial repaint, no glass → render straight to its swapchain
     ) catch |err| {
-        std.log.err("zigote_window_render failed: {}", .{err});
-        return .err;
+        std.log.err("secondary window render failed: {}", .{err});
+        return .gpu_failure;
     };
     win.frame_index +%= 1;
+    win.paint_list.clearRetainingCapacity(state.allocator);
+    win.overlay_paint_list.clearRetainingCapacity(state.allocator);
     return .ok;
 }
 
@@ -6155,7 +6135,7 @@ export fn zigote_physics_raycast_closest(ox: f32,
 /// its compile-time sizeof() values before rendering any frames.
 export fn zigote_get_renderer_abi_info(out_info: *ZgAbiInfo) ZgStatus {
     out_info.* = .{
-        .abi_version = 9,
+        .abi_version = 100,
         .paint_command_size = @sizeOf(ZgPaintCommand),
         .event_size = @sizeOf(ZgEvent),
         .handle_size = @sizeOf(usize),
@@ -6232,19 +6212,34 @@ export fn zigote_submit_frame_damage(rects: [*c]const f32, count: u32) ZgStatus 
 }
 
 /// Store paint commands for the next zigote_render_frame_v2() call.
-export fn zigote_submit_paint_commands(commands: [*]const ZgPaintCommand, count: u32) ZgStatus {
+/// Hand over a frame's root paint list. `window` is 0 for the main window, or a handle from
+/// zigote_window_create for a secondary one — secondary windows used to have their own
+/// zigote_window_submit_paint/_overlay/_render trio, a second frame API the caller had to pick
+/// between. See docs/v2-design.md §2.2.
+export fn zigote_submit_paint_commands(window: u64, commands: [*]const ZgPaintCommand, count: u32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    fillPaintList(state, &state.paint_list, commands, count) catch |err| {
+    const list = if (window == 0)
+        &state.paint_list
+    else
+        &(windowFromHandle(state, window) orelse return .invalid_handle).paint_list;
+    fillPaintList(state, list, commands, count) catch |err| {
         std.log.err("zigote_submit_paint_commands failed: {}", .{err});
+        return .out_of_memory;
     };
     return .ok;
 }
 
 /// Like zigote_submit_paint_commands but for the overlay pass.
-export fn zigote_submit_overlay_commands(commands: [*]const ZgPaintCommand, count: u32) ZgStatus {
+/// The overlay layer (popups, tooltips), drawn after the root list. `window` as above.
+export fn zigote_submit_overlay_commands(window: u64, commands: [*]const ZgPaintCommand, count: u32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    fillPaintList(state, &state.overlay_paint_list, commands, count) catch |err| {
+    const list = if (window == 0)
+        &state.overlay_paint_list
+    else
+        &(windowFromHandle(state, window) orelse return .invalid_handle).overlay_paint_list;
+    fillPaintList(state, list, commands, count) catch |err| {
         std.log.err("zigote_submit_overlay_commands failed: {}", .{err});
+        return .out_of_memory;
     };
     return .ok;
 }
@@ -6860,12 +6855,22 @@ export fn zigote_render_texture_read_rgba(rt_handle: u64,
 /// begin/submit/render/end sequence with two fewer FFI transitions per frame. Pure delegation —
 /// this pair had drifted (it skipped the damage reset and the image-lifecycle drains), which is
 /// why the UI path couldn't use it.
-export fn zigote_frame_begin(scene_w: u32, scene_h: u32, scale: f32, delta_time: f32) ZgStatus {
+/// Begin a frame for `window` (0 = main). A secondary window is UI-only, so all it needs is the
+/// scale its paint list will be rasterised at; the main window also stores the 3D viewport size and
+/// the frame delta.
+export fn zigote_frame_begin(window: u64, scene_w: u32, scene_h: u32, scale: f32, delta_time: f32) ZgStatus {
+    if (window != 0) {
+        const state = engineState() orelse return .invalid_handle;
+        const win = windowFromHandle(state, window) orelse return .invalid_handle;
+        win.pending_scale = scale;
+        return .ok;
+    }
     return zigote_begin_frame(scene_w, scene_h, scale, delta_time);
 }
 
 /// Execute the render graph and present; then clear per-frame state (see zigote_frame_begin).
-export fn zigote_frame_end() ZgResult {
+export fn zigote_frame_end(window: u64) ZgStatus {
+    if (window != 0) return renderSecondaryWindow(window);
     const result = zigote_render_frame_v2();
     _ = zigote_end_frame();
     return result;
