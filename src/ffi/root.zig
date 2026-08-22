@@ -86,6 +86,7 @@ const backend_mod = wgpu_renderer.backend;
 const gpu_select = wgpu_renderer.gpu_select;
 
 const frame_mod = wgpu_renderer.frame;
+const SpinLock = zg.core.sync.SpinLock;
 const TransientPool = wgpu_renderer.transient.TransientPool;
 const FrameStats = frame_mod.FrameStats;
 const RenderSettings = frame_mod.RenderSettings;
@@ -547,29 +548,6 @@ const BlurRequest = struct {
 /// A spin lock rather than a mutex: `std.Thread.Mutex` is gone in this zig version and
 /// `std.Io.Mutex` wants an `Io` handle the FFI layer has no reason to hold, while every critical
 /// section here is one hashmap lookup or insert. Decoding always happens outside the lock.
-const SpinLock = struct {
-    locked: std.atomic.Value(bool) = .init(false),
-
-    fn lock(self: *SpinLock) void {
-        var spins: u32 = 0;
-        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            // Image sections are a hashmap op and never get past the spins. The audio lock is also
-            // held across a container-header parse on a loader thread, which is long enough that a
-            // pure spin would burn a core of the frame loop waiting for it — so hand the CPU back
-            // once it is clear this is not a short wait.
-            spins += 1;
-            if (spins < 64) {
-                std.atomic.spinLoopHint();
-            } else {
-                std.Thread.yield() catch std.atomic.spinLoopHint();
-            }
-        }
-    }
-
-    fn unlock(self: *SpinLock) void {
-        self.locked.store(false, .release);
-    }
-};
 
 pub const LoadedImage = struct {
     width: u32,

@@ -2,7 +2,8 @@
 // The widget framework, reconciler, and all layout code have been ported to C#
 // (ZigoteCS/Zigote.UI) and are no longer compiled in Zig.
 
-pub const geometry = @import("geometry.zig");
+// Re-exported so `zigote_ui` consumers need not also depend on `zigote_core`.
+pub const geometry = @import("zigote_core").geometry;
 pub const text = @import("text.zig");
 pub const render = struct {
     pub const paint = @import("render/paint.zig");

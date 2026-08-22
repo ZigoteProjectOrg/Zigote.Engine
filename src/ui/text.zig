@@ -1,5 +1,5 @@
 const std = @import("std");
-const geometry = @import("geometry.zig");
+const geometry = @import("zigote_core").geometry;
 
 pub const FontStyle = enum {
     normal,

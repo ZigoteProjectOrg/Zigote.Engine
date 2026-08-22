@@ -25,6 +25,7 @@
 //! transport, not a codec.
 
 const std = @import("std");
+const Lock = @import("zigote").core.sync.SpinLock;
 const builtin = @import("builtin");
 const zaudio = @import("zaudio");
 
@@ -38,30 +39,6 @@ const zaudio = @import("zaudio");
 /// `onDecoderRead` — is a memmove of up to `max_encoded`. A pure spin would burn that whole
 /// memmove out of the frame budget; yielding hands the core to the thread actually holding the
 /// lock, which is the one that can end the wait.
-const Lock = struct {
-    locked: std.atomic.Value(bool) = .init(false),
-
-    /// Uncontended is the overwhelming case, so spin briefly before paying for a syscall — long
-    /// enough to cover a short memcpy, short enough not to matter next to a scheduler round.
-    const spins_before_yield: u32 = 64;
-
-    fn lock(self: *Lock) void {
-        var spins: u32 = 0;
-        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            spins += 1;
-            if (spins < spins_before_yield) {
-                std.atomic.spinLoopHint();
-            } else {
-                spins = 0;
-                std.Thread.yield() catch std.atomic.spinLoopHint();
-            }
-        }
-    }
-
-    fn unlock(self: *Lock) void {
-        self.locked.store(false, .release);
-    }
-};
 
 /// How long a waiter naps before looking again. Irrelevant next to network latency, and it keeps
 /// an idle decode thread off the CPU.

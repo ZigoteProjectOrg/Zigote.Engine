@@ -1,15 +1,22 @@
-// Remaining after Zig UI cleanup: collections and async modules were deleted
-// (superseded by C#). image was removed (used deleted async_mod).
+//! Engine-neutral primitives shared by the UI, renderer and FFI layers.
+//!
+//! Reaching one `Rect` used to cost six files: geometry.zig → core/math/root.zig →
+//! core/root.zig → ui/geometry.zig → ui/root.zig → root.zig, four of which contained nothing
+//! but the same six-line alias list. The definitions live in geometry.zig; this is the module
+//! root the build wires as `zigote_core`. See docs/v2-design.md §2.4.
 
-pub const math = @import("math/root.zig");
+pub const geometry = @import("geometry.zig");
+pub const sync = @import("sync.zig");
 
-pub const Color = math.Color;
-pub const Constraints = math.Constraints;
-pub const EdgeInsets = math.EdgeInsets;
-pub const Offset = math.Offset;
-pub const Rect = math.Rect;
-pub const Size = math.Size;
+pub const Color = geometry.Color;
+pub const Constraints = geometry.Constraints;
+pub const EdgeInsets = geometry.EdgeInsets;
+pub const Offset = geometry.Offset;
+pub const Rect = geometry.Rect;
+pub const Size = geometry.Size;
+pub const SpinLock = sync.SpinLock;
 
 test {
-    _ = math;
+    _ = geometry;
+    _ = sync;
 }

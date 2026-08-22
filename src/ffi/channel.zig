@@ -22,6 +22,7 @@
 //! expected to hand work to its own loop rather than touch UI state where it lands.
 
 const std = @import("std");
+const SpinLock = @import("zigote").core.sync.SpinLock;
 
 /// A native channel implementation. Reads `payload[0..payload_len]`, writes at most `reply_cap`
 /// bytes of reply into `reply`, and returns the reply length — or a negative value for "failed".
@@ -58,25 +59,6 @@ const Entry = struct {
 /// `std.Io.Mutex` wants an `Io` handle the FFI layer has no reason to hold — the same trade
 /// root.zig and netstream.zig already make. It fits even better here: every critical section is a
 /// scan of at most 32 entries, and handlers are always called with the lock released.
-const SpinLock = struct {
-    held: std.atomic.Value(bool) = .init(false),
-
-    fn lock(self: *SpinLock) void {
-        var spins: u32 = 0;
-        while (self.held.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            spins += 1;
-            if (spins < 64) {
-                std.atomic.spinLoopHint();
-            } else {
-                std.Thread.yield() catch std.atomic.spinLoopHint();
-            }
-        }
-    }
-
-    fn unlock(self: *SpinLock) void {
-        self.held.store(false, .release);
-    }
-};
 
 var entries: [max_channels]Entry = @splat(.{});
 var entry_count: usize = 0;
