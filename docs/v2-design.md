@@ -1,6 +1,6 @@
 # Zigote.Engine V2 — refactoring, optimization and modularization design
 
-Status: **in progress — Phase 0 complete** · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
+Status: **in progress — Phase 0 complete, Phase 1 started** · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
 (`Zigote.Generators`, `Zigote.Core/Native`, `build/Zigote.Native.targets`).
 
 V2 **breaks ABI and source compatibility**. The C# side is rebuilt against it in the same change
@@ -455,8 +455,30 @@ and that probe is now a permanent part of `check-gpu`. `createImageTexture` allo
    (`libraries/zflecs/src`, `zmesh`'s cgltf/par_shapes) are not compiled, so removing them saves
    disk and nothing else, while making re-vendoring from upstream harder. Low value, non-zero cost.
 
+### Phase 1 — started
+
+| Done | Notes |
+|---|---|
+| `core/handle.zig` — `HandleTable(T)` | Generational `(generation, index)` handles; `0` is never valid. 8 tests including a churn workload. |
+| ECS handles validated | `ffi/ecs.zig`'s world/query/iterator handles were bare `@ptrFromInt` with **no validation** — a stale handle was a use-after-free. Now table indices; ABI unchanged (still opaque `u64`), so no C# change. Destroy untracks first, making a double destroy a no-op. |
+| `zpool` dropped | Its one `Pool()` instantiation (per-entity instance buffers) is now a `HandleTable`. Note the behavioural difference handled explicitly: zpool auto-called each value's 0-arg `deinit` on release; the table returns the value and the caller frees. |
+
+Remaining in Phase 1: `abi.zig` + `ZgStatus`, `ZgStr`, dropping the decorative `engine: u64`
+parameter, the Zig-side manifest generator and generated C# structs, and the single stub file.
+These change every export signature and the whole C# call surface, so they want to land as one
+series rather than piecemeal.
+
 ### Not yet started
 
-Phases 1–5. The `gpu/pipeline.zig` builder and the large-file splits (`wgpu_3d.zig`, the 1417-line
+Phases 2–5. The `gpu/pipeline.zig` builder and the large-file splits (`wgpu_3d.zig`, the 1417-line
 `Gpu3d.init`) remain from Phase 0's §4 layout; they are mechanical but large, and are best done
-alongside Phase 1 rather than as a separate pass over the same files.
+alongside the rest of Phase 1 rather than as a separate pass over the same files.
+
+### A note on the C# suite
+
+5–7 tests in `Zigote.Tests` fail both with and without these changes, and the failing set rotates
+between runs. `SvgAssetTests` (4) need `cargo`, which is not installed on this machine; the rest are
+order-dependent flakes in the Reactive and World areas (they pass in isolation). Confirmed
+pre-existing by running the full suite against the engine with the changes stashed. Not addressed
+here — it is unrelated to the engine — but worth fixing separately, because it makes the suite a
+weak gate for exactly this kind of work.
