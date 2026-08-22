@@ -706,6 +706,12 @@ pub fn build(b: *std.Build) void {
     // ponytail: unconditional — re-test with a newer Zig and drop this line when the self-hosted
     // backend stops crashing.
     shared_lib.use_llvm = true;
+    // Android 16 (API 36) requires every packaged .so to load on a 16 KB-page device, and the NDK's
+    // own default is still 4 KB — so the loader rejects a library laid out at 4 KB alignment outright.
+    // The build otherwise looks clean and the failure arrives on a user's phone; the Android SDK
+    // warns about it at package time (XA0141). Alignment costs a few KB of padding, nothing else,
+    // and a 16 KB-aligned library still loads fine on the 4 KB devices shipping today.
+    if (target.result.abi.isAndroid()) shared_lib.link_z_max_page_size = 16384;
     // Mach-O: leave room for install-name rewrites. The .NET iOS packager runs
     // install_name_tool on bundled dylibs and fails outright when the header has no padding.
     if (target.result.os.tag.isDarwin()) shared_lib.headerpad_max_install_names = true;
