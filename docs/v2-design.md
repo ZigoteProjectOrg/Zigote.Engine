@@ -485,9 +485,23 @@ Also found: `Gpu3d.init` has **no `errdefer` anywhere**, so a failure part-way t
 everything created before it. Bounded — `ensure3d` latches `gpu_3d_failed`, so it happens at most
 once per process — and now documented at the seam. Worth fixing deliberately, not as a side effect.
 
-Not done: P9 (packed model uniforms) depends on the scene-authority change in §2.3. P5's remaining
-items (staged shadow-slice and post-param uploads) are ~20 small `writeBuffer` calls per frame —
-measurable only as noise against the numbers in §10.
+**P9 (packed model uniforms) — measured, not worth doing.** The plan was to cache a packed
+`ModelUniforms` per node and recompute only on transform/material change, on the grounds that the
+draw loop "recomputes all 7 fields from the material for every draw, even a static one". A 3D scale
+benchmark had to exist first (`ZIGOTE_SMOKE_OBJECTS=<n>`, added alongside this) because the default
+smoke scene is ONE sphere, which makes per-draw costs invisible — and with vsync on, 1 sphere and
+1000 spheres both measured near the display refresh, the same trap the 2D benchmark hit.
+
+With that in place the question was answered directly: stubbing out the **entire** per-draw pack —
+all ~15 material reads and the `normalMatrix()` call, replaced by constants — moved 3 000 objects
+from 15.09 ms to 15.38 ms, i.e. nothing outside noise. The per-object cost is the draw call, the
+bind-group set and the GPU work; the pack is not measurable next to them. Caching it would mean a
+material version counter threaded through nine mutation sites plus a per-entity cache with
+invalidation — real complexity, and an invalidation bug renders the wrong material — for a win the
+instrument cannot see.
+
+P5's remaining items (staged shadow-slice and post-param uploads) are ~20 small `writeBuffer` calls
+per frame, in the same category.
 
 ### Phase 5 — complete
 
@@ -680,10 +694,13 @@ no GPU work went with it, and nothing else in this series touched per-frame work
 
 Measured before and after the tagged paint stream landed, same benchmark, medians of repeated runs:
 
-| commands | before (flat 112 B command) | after (tagged records) | |
-|---:|---:|---:|---|
-| 2 000 | 1.03 ms | **0.72 ms** | −30% |
-| 20 000 | 7.53 ms | **6.21 ms** | −18% |
+| commands | before | tagged stream | + instanced shapes | total |
+|---:|---:|---:|---:|---:|
+| 2 000 | 1.03 ms | 0.72 ms | **0.60 ms** | **−42%** |
+| 20 000 | 7.53 ms | 6.21 ms | **4.61 ms** | **−39%** |
+
+The native render column alone: 0.72 → 0.41 → **0.27 ms** at 2 000 commands, and 4.46 → 3.27 →
+**1.64 ms** at 20 000.
 
 The native render column at 2 000 commands went 0.72 → 0.41 ms, a 43% cut. This was *not*
 predicted: the tagged stream was justified as a correctness change (no field aliasing), and §10
