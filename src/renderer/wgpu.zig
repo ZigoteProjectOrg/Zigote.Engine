@@ -98,6 +98,9 @@ pub const GpuUi = struct {
     clip_bgl: *wgpu.BindGroupLayout,
     clip_buffer: ?*wgpu.Buffer = null,
     clip_buffer_capacity: usize = 0,
+    /// Scratch for staging the whole rounded-clip ring into ONE queue.writeBuffer. Grown on demand
+    /// and kept across frames, so a steady-state frame does not allocate for it.
+    clip_staging: []u8 = &.{},
     clip_bind_group: ?*wgpu.BindGroup = null,
     liquid_glass_shader: *wgpu.ShaderModule,
     liquid_glass_pipeline_layout: *wgpu.PipelineLayout,
@@ -648,6 +651,7 @@ pub const GpuUi = struct {
     }
 
     pub fn deinit(self: *GpuUi) void {
+        if (self.clip_staging.len != 0) self.allocator.free(self.clip_staging);
         releaseBuffer(self.shape_vertex_buffer);
         releaseBuffer(self.liquid_glass_vertex_buffer);
         releaseBuffer(self.text_vertex_buffer);
@@ -1130,9 +1134,29 @@ fn ensureClipBuffer(
     }
 
     const buffer = gpu_ui.clip_buffer.?;
-    for (rounded_clips, 0..) |entry, i| {
-        queue.writeBuffer(buffer, (i + 1) * CLIP_SLOT, @ptrCast(&entry), @sizeOf(ClipUniformEntry));
+    if (rounded_clips.len == 0) return;
+
+    // One write for the whole ring instead of one per clip. Each entry sits at a 256-byte dynamic
+    // offset slot, so the staging buffer is mostly padding — but a frame with N clips used to cost
+    // N queue.writeBuffer calls, each with its own bookkeeping, to move N * 32 bytes.
+    const span = rounded_clips.len * CLIP_SLOT;
+    if (gpu_ui.clip_staging.len < span) {
+        gpu_ui.clip_staging = gpu_ui.allocator.realloc(gpu_ui.clip_staging, span) catch {
+            // Out of memory for the staging copy: fall back to the per-slot writes rather than
+            // dropping the clips, which would render unclipped content.
+            for (rounded_clips, 0..) |entry, i| {
+                queue.writeBuffer(buffer, (i + 1) * CLIP_SLOT, @ptrCast(&entry), @sizeOf(ClipUniformEntry));
+            }
+            return;
+        };
     }
+
+    const stage = gpu_ui.clip_staging[0..span];
+    @memset(stage, 0);
+    for (rounded_clips, 0..) |entry, i| {
+        @memcpy(stage[i * CLIP_SLOT ..][0..@sizeOf(ClipUniformEntry)], std.mem.asBytes(&entry));
+    }
+    queue.writeBuffer(buffer, CLIP_SLOT, stage.ptr, span);
 }
 
 /// (Re)create the shared index buffer holding the repeating per-quad pattern {0,1,2, 1,3,2} for at
