@@ -10,17 +10,6 @@ struct TaaParams {
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var<uniform> p: TaaParams;
 
-struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VOut {
-  let x = f32((vid << 1u) & 2u);
-  let y = f32(vid & 2u);
-  var o: VOut;
-  o.uv = vec2<f32>(x, y);
-  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
-  return o;
-}
-
 // Sharp 5-tap Catmull-Rom (bicubic) history sample (Karis 2014). Sampling reprojected history with
 // plain bilinear softens the image a little every frame — under camera/object motion that compounds
 // into the "TAA is blurry" look. Catmull-Rom reconstructs the history with a sharpening kernel so the

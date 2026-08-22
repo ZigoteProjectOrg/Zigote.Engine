@@ -18,24 +18,9 @@ struct TonemapParams {
 @group(0) @binding(11) var albedo_tex: texture_2d<f32>; // receiver base colour, tints the SSGI bounce
 @group(0) @binding(12) var exposure_tex: texture_2d<f32>; // 1×1 auto-exposure multiplier (.r); used when debug.y==1
 
-struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VOut {
-  let x = f32((vid << 1u) & 2u);
-  let y = f32(vid & 2u);
-  var o: VOut;
-  o.uv = vec2<f32>(x, y);
-  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
-  return o;
-}
-
 // Inverse of the hardware sRGB encode (approx). The swapchain target is sRGB, so the GPU
 // applies linear→sRGB on write; pre-applying this to an already-display-ready value makes the
 // final pixel reproduce that value faithfully (used for debug-view passthrough).
-fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
-  return pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2));
-}
-
 // AgX view transform — Blender/EEVEE's default display transform. A filmic, hue-preserving
 // curve that rolls highlights off gracefully and desaturates them (the "AgX look"). Constants
 // from the standard minimal AgX (Sobotka / Wrensch). Input: linear scene radiance (post-exposure).

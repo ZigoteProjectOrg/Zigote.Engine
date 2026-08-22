@@ -15,7 +15,7 @@ pub const BlurParams = extern struct {
 
 // ── WGSL: horizontal pass (blur along X) ─────────────────────────────────────
 
-const h_wgsl =
+pub const h_wgsl =
     \\struct BlurParams { sigma: f32, width: u32, height: u32, _pad: u32 }
     \\@group(0) @binding(0) var src  : texture_2d<f32>;
     \\@group(0) @binding(1) var<uniform> p : BlurParams;
@@ -48,7 +48,7 @@ const h_wgsl =
 
 // ── WGSL: vertical pass (blur along Y) ───────────────────────────────────────
 
-const v_wgsl =
+pub const v_wgsl =
     \\struct BlurParams { sigma: f32, width: u32, height: u32, _pad: u32 }
     \\@group(0) @binding(0) var src  : texture_2d<f32>;
     \\@group(0) @binding(1) var<uniform> p : BlurParams;

@@ -15,17 +15,6 @@ struct SsaoParams {
 @group(0) @binding(4) var color_tex: texture_2d<f32>; // lit scene colour, for SSGI bounce
 @group(0) @binding(5) var gi_history: texture_2d<f32>; // previous accumulated GI/AO, for temporal blend
 
-struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VOut {
-  let x = f32((vid << 1u) & 2u);
-  let y = f32(vid & 2u);
-  var o: VOut;
-  o.uv = vec2<f32>(x, y);
-  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
-  return o;
-}
-
 fn hash23(p2: vec2<f32>) -> vec3<f32> {
   var p3 = fract(vec3<f32>(p2.xyx) * vec3<f32>(0.1031, 0.1030, 0.0973));
   p3 += dot(p3, p3.yxz + 33.33);

@@ -1,12 +1,5 @@
 @group(0) @binding(0) var src_tex: texture_2d<f32>; // the coarser (smaller) mip
 @group(0) @binding(1) var src_samp: sampler;
-struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VOut {
-  let x = f32((vid << 1u) & 2u); let y = f32(vid & 2u);
-  var o: VOut; o.uv = vec2<f32>(x, y);
-  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0); return o;
-}
 fn san(c: vec3<f32>) -> vec3<f32> {
   var v = select(c, vec3<f32>(0.0), c != c);
   return clamp(v, vec3<f32>(0.0), vec3<f32>(65000.0));

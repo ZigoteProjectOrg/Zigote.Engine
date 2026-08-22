@@ -12,6 +12,7 @@ pub const frame = @import("frame.zig");
 pub const freetype_text = @import("freetype_text.zig");
 pub const gpu_select = @import("gpu_select.zig");
 pub const mesh_cache = @import("mesh_cache.zig");
+pub const shader_prelude = @import("shader_prelude.zig");
 pub const transient = @import("transient.zig");
 pub const uniforms = @import("uniforms.zig");
 pub const wgpu = @import("wgpu.zig");
@@ -31,6 +32,7 @@ test {
     _ = freetype_text;
     _ = gpu_select;
     _ = mesh_cache;
+    _ = shader_prelude;
     _ = transient;
     _ = uniforms;
     _ = wgpu;

@@ -2,13 +2,6 @@ struct DownParams { cfg: vec4<f32> } // x=is_first(1=prefilter+karis), y=thresho
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var src_samp: sampler;
 @group(0) @binding(2) var<uniform> p: DownParams;
-struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VOut {
-  let x = f32((vid << 1u) & 2u); let y = f32(vid & 2u);
-  var o: VOut; o.uv = vec2<f32>(x, y);
-  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0); return o;
-}
 // NaN/Inf guard: drop non-finite, clamp below the fp16 max so one firefly can't poison a tile.
 fn san(c: vec3<f32>) -> vec3<f32> {
   var v = select(c, vec3<f32>(0.0), c != c);

@@ -2857,7 +2857,7 @@ fn colorToU8(color: zg.Color) [4]u8 {
     return .{ color.r, color.g, color.b, color.a };
 }
 
-const text_shader_source =
+pub const text_shader_source =
     \\@group(0) @binding(0) var text_tex: texture_2d<f32>;
     \\@group(0) @binding(1) var text_sampler: sampler;
     \\

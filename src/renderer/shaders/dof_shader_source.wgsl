@@ -9,17 +9,6 @@ struct DofParams {
 @group(0) @binding(2) var samp: sampler;
 @group(0) @binding(3) var<uniform> p: DofParams;
 
-struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VOut {
-  let x = f32((vid << 1u) & 2u);
-  let y = f32(vid & 2u);
-  var o: VOut;
-  o.uv = vec2<f32>(x, y);
-  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
-  return o;
-}
-
 // View-space linear depth (camera looks -z, so depth = -z). Background (w<0.5) reads as far.
 fn linear_depth(g: vec4<f32>) -> f32 {
   if (g.w < 0.5) { return 1.0e6; }

@@ -1,23 +1,3 @@
-// Per-batch rounded-clip uniform (dynamic offset into a small slot ring). radius.x <= 0 disables
-// the mask entirely — slot 0 is all zeros, so unclipped batches multiply coverage by exactly 1.0
-// and stay byte-identical to the pre-rounded-clip renderer. rect = (center.xy, half_size.xy) and
-// radius.x are in physical (framebuffer) pixels, matching @builtin(position).
-struct RoundedClip {
-  rect: vec4<f32>,
-  radius: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> rounded_clip: RoundedClip;
-
-fn rounded_clip_coverage(frag_pos: vec2<f32>) -> f32 {
-  if (rounded_clip.radius.x <= 0.0) {
-    return 1.0;
-  }
-  let q = abs(frag_pos - rounded_clip.rect.xy) - rounded_clip.rect.zw + vec2<f32>(rounded_clip.radius.x);
-  let dist = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - rounded_clip.radius.x;
-  return clamp(0.5 - dist, 0.0, 1.0);
-}
-
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
   @location(0) color: vec4<f32>,
@@ -54,10 +34,6 @@ fn vs_main(
 // white (#222226 -> #676769, accent #3584e4 -> pastel). Same 2.2 approximation as the
 // tonemapper's srgb_decode; blending then happens in linear space, which pairs correctly with
 // the sRGB target.
-fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
-  return pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2));
-}
-
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   let half_size = in.rect_size / 2.0;

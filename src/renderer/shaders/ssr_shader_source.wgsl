@@ -8,17 +8,6 @@ struct SsrParams {
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var<uniform> p: SsrParams;
 
-struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VOut {
-  let x = f32((vid << 1u) & 2u);
-  let y = f32(vid & 2u);
-  var o: VOut;
-  o.uv = vec2<f32>(x, y);
-  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
-  return o;
-}
-
 fn to_uv(view_pos: vec3<f32>) -> vec3<f32> {
   let clip = p.proj * vec4<f32>(view_pos, 1.0);
   let ndc = clip.xyz / clip.w;
