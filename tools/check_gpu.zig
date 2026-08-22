@@ -39,6 +39,7 @@ const Shader = struct { name: []const u8, source: []const u8 };
 /// against the shader directory below so a forgotten entry fails rather than going unvalidated.
 const shaders = [_]Shader{
     .{ .name = "shape", .source = ui_shaders.shape_shader_source },
+    .{ .name = "shape_instanced", .source = ui_shaders.shape_instanced_shader_source },
     .{ .name = "image", .source = ui_shaders.image_shader_source },
     .{ .name = "liquid_glass", .source = ui_shaders.liquid_glass_shader_source },
     .{ .name = "text", .source = freetype_text.text_shader_source },

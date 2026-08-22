@@ -4,6 +4,8 @@
 const prelude = @import("shader_prelude.zig");
 
 pub const shape_shader_source = prelude.roundedClip(0) ++ prelude.color ++ @embedFile("shaders/shape_shader_source.wgsl");
+/// Instanced rect/border/shadow — same fragment stage, corners derived from the vertex index.
+pub const shape_instanced_shader_source = prelude.roundedClip(0) ++ prelude.color ++ @embedFile("shaders/shape_instanced_shader_source.wgsl");
 
 // Liquid glass shader: physically-based refraction + rim lighting.
 // Samples a backdrop texture (captured before glass pass) at refracted UV offsets

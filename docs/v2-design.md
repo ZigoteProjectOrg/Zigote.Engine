@@ -1,6 +1,6 @@
 # Zigote.Engine V2 — refactoring, optimization and modularization design
 
-Status: **Phases 0, 1, 2, 5 complete; 3 and 4 partial (remainder measured out — see §10, §12)** · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
+Status: **Phases 0, 1, 2, 3, 5 complete; 4 partial (see §10, §12)** · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
 (`Zigote.Generators`, `Zigote.Core/Native`, `build/Zigote.Native.targets`).
 
 V2 **breaks ABI and source compatibility**. The C# side is rebuilt against it in the same change
@@ -586,34 +586,47 @@ events per frame.
 | Done | Notes |
 |---|---|
 | P5 staged clip ring | N `writeBuffer` calls per frame → one staged write, with a per-slot fallback on allocation failure (dropping clips would render *unclipped* content, not merely slower content). |
+| **P4 instanced rects** | Rect/border/shadow draw as one 56-byte instance rather than six 40-byte vertices. See §12 — it took two attempts. |
 
-**P4 (instanced rects) attempted and reverted — see §12.** P3 (retained geometry / subtree
-versions) is not done: §10 established that an idle UI renders no frames at all, so its benefit
-applies only to frames that already changed.
+P3 (retained geometry / subtree versions) is not done, and §10 is why: an idle UI renders no frames
+at all, so retaining tessellation across frames helps only frames whose content already changed.
+P4 turned out to capture most of the same win far more cheaply.
 
 ---
 
-## 12. P4: why instanced rects were reverted
+## 12. P4: instanced rects, and the two things that nearly sank them
 
-The plan was "rects/borders/shadows become instanced (one 64 B instance per rect, 4-vertex shared
-quad)" — 240 B/rect down to ~40 B. It was implemented far enough to compile, then reverted, for a
-reason the design did not account for:
+Rect, border and shadow now draw as one instance each through the shared quad index buffer. Two
+things the design did not account for had to be solved, and the first one caused a false start —
+the change was implemented, reverted as not worth it, and then reinstated once measured properly.
 
-**`shape_vertices` is not homogeneous.** Rect, border and shadow emit six-vertex quads into it —
+**1. `shape_vertices` is not homogeneous.** Rect, border and shadow emit six-vertex quads into it —
 but so do **polygon fills** (triangle-fanned rings, `mkSolidVertex`) and **bezier strokes**
-(triangle strips, `mkStrokeVertex`), as arbitrary triangles that no quad instancing can express.
-They share the buffer, the vertex format and the SDF shader. Instancing therefore needs a *second*
-pipeline and buffer, plus batch splitting that preserves painter's-algorithm order between the two
-— the op list can express that, but it doubles the most-used draw path.
+(triangle strips, `mkStrokeVertex`), as arbitrary triangles no quad instancing can express. They
+share the buffer, the vertex format and the SDF shader. So instancing needs a *second* pipeline and
+buffer, with the two kinds interleaved in painter's-algorithm order. The existing `DrawOp` union
+already sequences batches, so a `shape_instanced` variant slots in and order is preserved by
+construction; consecutive runs merge exactly as the vertex path's do, which is what makes the
+instancing pay.
 
-Against that, the measured payoff: at 20 000 rects the vertex upload is ~4.8 MB/frame falling to
-~0.8 MB, worth roughly 0.4 ms of a 4.6 ms render column — and a realistic 2 000-command frame is
-1.03 ms total, so the saving is ~0.04 ms, about 4% of a path that is already under 5% of a 60 Hz
-budget. Doubling the shape path for 0.2% of a frame is not a trade worth making, and the constraint
-that forces the doubling is structural rather than incidental.
+**2. An instance cannot store an axis-aligned rect.** The first working version packed
+`(x0, y0, x1, y1)` and derived the corners in the shader. That is wrong under
+`CMD_TRANSFORM_PUSH`, which applies an arbitrary 2×3 affine to already-emitted geometry: a rotated
+rectangle is not describable by two opposite corners. The all-commands golden, whose scene rotates
+a rect, caught it as a 1.45% pixel difference. Instances store all four corners (56 B rather than
+40 B, still down from 240 B) and the transform pass rotates all four.
 
-Recorded rather than silently skipped: if the shape path is ever split for another reason, the
-instancing falls out of it cheaply. The `gpu/pipeline.zig` builder and the large-file splits (`wgpu_3d.zig`, the 1417-line
+**The payoff, measured rather than estimated.** The first pass was reverted on an estimate of
+"~0.4 ms of a 4.6 ms render column, ~4%". The estimate was badly wrong:
+
+| commands | render column before | after | |
+|---:|---:|---:|---|
+| 2 000 | 0.41 ms | **0.27 ms** | −34% |
+| 20 000 | 3.27 ms | **1.64 ms** | −50% |
+
+Whole-frame: 2 000 commands 0.72 → **0.60 ms**, 20 000 commands 6.21 → **4.61 ms**. The lesson is
+the same one §10 records in the other direction — the estimate and the measurement disagreed, and
+only one of them was worth acting on. The `gpu/pipeline.zig` builder and the large-file splits (`wgpu_3d.zig`, the 1417-line
 `Gpu3d.init`) remain from Phase 0's §4 layout; they are mechanical but large, and are best done
 alongside the rest of Phase 1 rather than as a separate pass over the same files.
 

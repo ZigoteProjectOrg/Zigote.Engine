@@ -26,6 +26,23 @@ pub const ShapeVertex = extern struct {
     blur_radius: f32,
 };
 
+/// One rounded-rect / border / shadow, as a single 40-byte INSTANCE rather than six 40-byte
+/// vertices. Polygon fills and bezier strokes keep `ShapeVertex`: they are arbitrary triangles.
+pub const ShapeInstance = extern struct {
+    /// The four corners in clip space, in vertex-index order: TL, TR, BL, BR.
+    ///
+    /// Storing corners rather than (x0,y0,x1,y1) is what makes this work under the transform
+    /// stack: CMD_TRANSFORM_PUSH applies an arbitrary 2x3 affine to already-emitted geometry, and
+    /// a rotated rectangle is no longer axis-aligned, so two corners cannot describe it. Found by
+    /// the all-commands golden, whose scene rotates a rect.
+    corners: [8]f32,
+    color: [4]u8,
+    rect_size: [2]f32,
+    radius: f32,
+    border_width: f32,
+    blur_radius: f32,
+};
+
 pub const LiquidGlassVertex = extern struct {
     position: [2]f32,
     color: [4]u8,
@@ -119,8 +136,11 @@ pub const GpuUi = struct {
     /// Cap on *unpinned* (inline-pixel) images only — pinned entries are the app's to release.
     max_cached_images: usize = 192,
     unpinned_cached: usize = 0,
+    shape_instanced_pipeline: *wgpu.RenderPipeline,
     shape_vertex_buffer: ?*wgpu.Buffer = null,
     shape_vertex_buffer_size: usize = 0,
+    shape_instance_buffer: ?*wgpu.Buffer = null,
+    shape_instance_buffer_size: usize = 0,
     liquid_glass_vertex_buffer: ?*wgpu.Buffer = null,
     liquid_glass_vertex_buffer_size: usize = 0,
     text_vertex_buffer: ?*wgpu.Buffer = null,
@@ -201,7 +221,7 @@ pub const GpuUi = struct {
             @as(u64, self.scene_alloc_width) * self.scene_alloc_height * surf_bpp
         else
             0;
-        const vbuf: u64 = self.shape_vertex_buffer_size + self.liquid_glass_vertex_buffer_size +
+        const vbuf: u64 = self.shape_vertex_buffer_size + self.shape_instance_buffer_size + self.liquid_glass_vertex_buffer_size +
             self.text_vertex_buffer_size + self.image_vertex_buffer_size +
             self.blit_vertex_buffer_size + self.shader_effect_vertex_buffer_size +
             self.quad_index_quads * 6 * @sizeOf(u32);
@@ -334,6 +354,55 @@ pub const GpuUi = struct {
             return error.WgpuPipelineUnavailable;
         };
         errdefer shape_pipeline.release();
+
+        // ── Instanced rect/border/shadow ──────────────────────────────────────────────────
+        // Same fragment stage, same bind group, same blend — only the vertex stage differs: one
+        // 40-byte instance instead of six 40-byte vertices, corners from the vertex index.
+        var shader_desc_si = wgpu.shaderModuleWGSLDescriptor(.{
+            .label = "zigote instanced shape shader",
+            .code = ui_shaders.shape_instanced_shader_source,
+        });
+        const shape_instanced_shader = device.createShaderModule(&shader_desc_si) orelse {
+            return error.WgpuShaderUnavailable;
+        };
+        defer shape_instanced_shader.release();
+
+        const si_attributes = [_]wgpu.VertexAttribute{
+            // corners TL,TR then BL,BR — two float32x4, the largest attribute format there is.
+            .{ .format = .float32x4, .offset = @offsetOf(ShapeInstance, "corners"), .shader_location = 0 },
+            .{ .format = .float32x4, .offset = @offsetOf(ShapeInstance, "corners") + 16, .shader_location = 1 },
+            .{ .format = .unorm8x4, .offset = @offsetOf(ShapeInstance, "color"), .shader_location = 2 },
+            .{ .format = .float32x2, .offset = @offsetOf(ShapeInstance, "rect_size"), .shader_location = 3 },
+            .{ .format = .float32, .offset = @offsetOf(ShapeInstance, "radius"), .shader_location = 4 },
+            .{ .format = .float32, .offset = @offsetOf(ShapeInstance, "border_width"), .shader_location = 5 },
+            .{ .format = .float32, .offset = @offsetOf(ShapeInstance, "blur_radius"), .shader_location = 6 },
+        };
+        const si_buffer_layout = wgpu.VertexBufferLayout{
+            .array_stride = @sizeOf(ShapeInstance),
+            .step_mode = .instance,
+            .attribute_count = si_attributes.len,
+            .attributes = &si_attributes,
+        };
+        const si_fragment = wgpu.FragmentState{
+            .module = shape_instanced_shader,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = @ptrCast(&color_target),
+        };
+        const shape_instanced_pipeline = device.createRenderPipeline(&.{
+            .label = wgpu.StringView.fromSlice("zigote instanced shape pipeline"),
+            .layout = shape_pipeline_layout, // identical bind groups
+            .vertex = .{
+                .module = shape_instanced_shader,
+                .entry_point = wgpu.StringView.fromSlice("vs_main"),
+                .buffer_count = 1,
+                .buffers = @ptrCast(&si_buffer_layout),
+            },
+            .primitive = .{},
+            .multisample = .{},
+            .fragment = &si_fragment,
+        }) orelse return error.WgpuPipelineUnavailable;
+        errdefer shape_instanced_pipeline.release();
 
         var shader_desc_lg = wgpu.shaderModuleWGSLDescriptor(.{
             .label = "zigote liquid glass shader",
@@ -551,6 +620,7 @@ pub const GpuUi = struct {
             .shape_shader = shape_shader,
             .shape_pipeline_layout = shape_pipeline_layout,
             .shape_pipeline = shape_pipeline,
+            .shape_instanced_pipeline = shape_instanced_pipeline,
             .clip_bgl = clip_bgl,
             .liquid_glass_shader = liquid_glass_shader,
             .liquid_glass_pipeline_layout = lg_pipeline_layout,
@@ -653,6 +723,7 @@ pub const GpuUi = struct {
     pub fn deinit(self: *GpuUi) void {
         if (self.clip_staging.len != 0) self.allocator.free(self.clip_staging);
         releaseBuffer(self.shape_vertex_buffer);
+        releaseBuffer(self.shape_instance_buffer);
         releaseBuffer(self.liquid_glass_vertex_buffer);
         releaseBuffer(self.text_vertex_buffer);
         releaseBuffer(self.image_vertex_buffer);
@@ -692,6 +763,7 @@ pub const GpuUi = struct {
         self.liquid_glass_pipeline_layout.release();
         self.liquid_glass_shader.release();
         self.shape_pipeline.release();
+        self.shape_instanced_pipeline.release();
         self.shape_pipeline_layout.release();
         self.shape_shader.release();
         self.clip_bgl.release();
@@ -768,7 +840,11 @@ pub const ShaderEffectBatch = struct {
 };
 
 pub const DrawOp = union(enum) {
+    /// Polygon fans and bezier strips — arbitrary triangles, per-vertex.
     shape: ShapeBatch,
+    /// Rects, borders and shadows — one instance each. `vertex_offset`/`vertex_count` are the
+    /// instance offset and count.
+    shape_instanced: ShapeBatch,
     liquid_glass: ShapeBatch,
     text: TextBatch,
     image: ImageBatch,
@@ -777,6 +853,7 @@ pub const DrawOp = union(enum) {
 
 const FramePaint = struct {
     shape_vertices: std.ArrayList(ShapeVertex) = .empty,
+    shape_instances: std.ArrayList(ShapeInstance) = .empty,
     liquid_glass_vertices: std.ArrayList(LiquidGlassVertex) = .empty,
     text_vertices: std.ArrayList(ft_text.TextVertex) = .empty,
     image_vertices: std.ArrayList(ImageVertex) = .empty,
@@ -799,12 +876,15 @@ const FramePaint = struct {
         self.text_vertices.deinit(allocator);
         self.liquid_glass_vertices.deinit(allocator);
         self.shape_vertices.deinit(allocator);
+        self.shape_instances.deinit(allocator);
     }
 };
 
 const UploadedFrameVertices = struct {
     shape: ?*wgpu.Buffer = null,
     shape_bytes_len: usize = 0,
+    shape_instances: ?*wgpu.Buffer = null,
+    shape_instances_bytes_len: usize = 0,
     liquid_glass: ?*wgpu.Buffer = null,
     liquid_glass_bytes_len: usize = 0,
     text: ?*wgpu.Buffer = null,
@@ -1214,6 +1294,8 @@ fn uploadFrameVertices(
 
     // Quad index pattern for the text/image batches; the blit paths draw one quad, so at least
     // one entry is kept even on frames with no text or image content.
+    // The instanced shape path indexes the same quad pattern, one quad's worth per draw, so it
+    // needs at least one entry — but never more than one quad regardless of instance count.
     const quad_count = @max(frame.text_vertices.items.len / 4, @max(frame.image_vertices.items.len / 4, 1));
     try ensureQuadIndexBuffer(device, queue, gpu_ui, quad_count);
 
@@ -1231,6 +1313,14 @@ fn uploadFrameVertices(
         queue.writeBuffer(buffer, 0, bytes.ptr, bytes.len);
         uploaded.liquid_glass = buffer;
         uploaded.liquid_glass_bytes_len = bytes.len;
+    }
+
+    if (frame.shape_instances.items.len > 0) {
+        const bytes = std.mem.sliceAsBytes(frame.shape_instances.items);
+        const buffer = try ensureVertexBuffer(device, &gpu_ui.shape_instance_buffer, &gpu_ui.shape_instance_buffer_size, "zigote shape instances", bytes.len);
+        queue.writeBuffer(buffer, 0, bytes.ptr, bytes.len);
+        uploaded.shape_instances = buffer;
+        uploaded.shape_instances_bytes_len = bytes.len;
     }
 
     if (frame.text_vertices.items.len > 0) {
@@ -1434,9 +1524,36 @@ fn vertexRangeAabb(comptime V: type, verts: []const V, fw: f32, fh: f32) ?zg.Rec
 
 /// Device-space bounds of one draw op, from its vertex range in the per-kind list. Null = no
 /// vertices (the op draws nothing anywhere).
+/// Device-space bounds of an instance range. Each instance names its own clip-space rect, so the
+/// AABB is a min/max over corners rather than over expanded vertices.
+fn instanceRangeAabb(instances: []const ShapeInstance, fw: f32, fh: f32) ?zg.Rect {
+    if (instances.len == 0) return null;
+    var min_x = instances[0].corners[0];
+    var max_x = min_x;
+    var min_y = instances[0].corners[1];
+    var max_y = min_y;
+    for (instances) |inst| {
+        var c: usize = 0;
+        while (c < 8) : (c += 2) {
+            min_x = @min(min_x, inst.corners[c]);
+            max_x = @max(max_x, inst.corners[c]);
+            min_y = @min(min_y, inst.corners[c + 1]);
+            max_y = @max(max_y, inst.corners[c + 1]);
+        }
+    }
+    // NDC y is up, device y is down, so max NDC y maps to the device-space top edge.
+    return .{
+        .x = (min_x + 1.0) * 0.5 * fw,
+        .y = (1.0 - max_y) * 0.5 * fh,
+        .width = (max_x - min_x) * 0.5 * fw,
+        .height = (max_y - min_y) * 0.5 * fh,
+    };
+}
+
 fn opDeviceAabb(frame: *const FramePaint, op: *const DrawOp, fw: f32, fh: f32) ?zg.Rect {
     return switch (op.*) {
         .shape => |b| vertexRangeAabb(ShapeVertex, frame.shape_vertices.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
+        .shape_instanced => |b| instanceRangeAabb(frame.shape_instances.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
         .liquid_glass => |b| vertexRangeAabb(LiquidGlassVertex, frame.liquid_glass_vertices.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
         .text => |b| vertexRangeAabb(ft_text.TextVertex, frame.text_vertices.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
         .image => |b| vertexRangeAabb(ImageVertex, frame.image_vertices.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
@@ -1798,6 +1915,7 @@ fn drawOp(
 ) !void {
     switch (op.*) {
         .shape => |batch| try drawShapeOp(pass, gpu_ui, uploaded, batch, scale_factor, frame_width, frame_height, damage_clip),
+        .shape_instanced => |batch| try drawShapeInstancedOp(pass, gpu_ui, uploaded, batch, scale_factor, frame_width, frame_height, damage_clip),
         .liquid_glass => |batch| try drawLiquidGlassOp(pass, gpu_ui, uploaded, batch, backdrop_bind_group, scale_factor, frame_width, frame_height, damage_clip),
         .text => |batch| try drawTextOp(pass, gpu_ui, uploaded, batch, scale_factor, frame_width, frame_height, damage_clip),
         .image => |batch| try drawImageOp(pass, gpu_ui, uploaded, batch, scale_factor, frame_width, frame_height, damage_clip),
@@ -1824,6 +1942,29 @@ fn drawShapeOp(
     pass.setBindGroup(0, clip_bg, 1, @ptrCast(&batch.clip_offset));
     pass.setVertexBuffer(0, buffer, 0, uploaded.shape_bytes_len);
     pass.draw(batch.vertex_count, 1, batch.vertex_offset, 0);
+}
+
+fn drawShapeInstancedOp(
+    pass: *wgpu.RenderPassEncoder,
+    gpu_ui: *GpuUi,
+    uploaded: UploadedFrameVertices,
+    batch: ShapeBatch,
+    scale_factor: f32,
+    frame_width: u32,
+    frame_height: u32,
+    damage_clip: ?zg.Rect,
+) !void {
+    if (batch.vertex_count == 0) return;
+    const buffer = uploaded.shape_instances orelse return;
+    const index_buffer = gpu_ui.quad_index_buffer orelse return;
+    const clip_bg = gpu_ui.clip_bind_group orelse return;
+    if (!applyScissor(pass, batch.clip_rect, damage_clip, scale_factor, frame_width, frame_height)) return;
+    pass.setPipeline(gpu_ui.shape_instanced_pipeline);
+    pass.setBindGroup(0, clip_bg, 1, @ptrCast(&batch.clip_offset));
+    pass.setVertexBuffer(0, buffer, 0, uploaded.shape_instances_bytes_len);
+    pass.setIndexBuffer(index_buffer, .uint32, 0, gpu_ui.quad_index_quads * 6 * @sizeOf(u32));
+    // Six indices over the shared quad pattern, once per instance.
+    pass.drawIndexed(6, batch.vertex_count, 0, 0, batch.vertex_offset);
 }
 
 fn drawLiquidGlassOp(
@@ -1992,6 +2133,19 @@ fn applyNdcTransform(comptime V: type, verts: []V, m: Affine2) void {
 
 /// Shader-effect vertices also carry the screen UV the backdrop is sampled at — recompute it from
 /// the transformed NDC position so the effect keeps sampling the pixels it covers.
+/// Instances carry four corners, so a rotation transforms all four — the reason corners are
+/// stored instead of an axis-aligned rect.
+fn applyNdcTransformInstances(instances: []ShapeInstance, m: Affine2) void {
+    for (instances) |*inst| {
+        var c: usize = 0;
+        while (c < 8) : (c += 2) {
+            const p = m.apply(inst.corners[c], inst.corners[c + 1]);
+            inst.corners[c] = p[0];
+            inst.corners[c + 1] = p[1];
+        }
+    }
+}
+
 fn applyNdcTransformFx(verts: []ShaderEffectVertex, m: Affine2) void {
     for (verts) |*v| {
         const p = m.apply(v.position[0], v.position[1]);
@@ -2060,6 +2214,7 @@ fn appendPaintOps(
 
     for (paint_list.commands.items) |command| {
         const shape_mark = frame.shape_vertices.items.len;
+        const shape_inst_mark = frame.shape_instances.items.len;
         const text_mark = frame.text_vertices.items.len;
         const image_mark = frame.image_vertices.items.len;
         const glass_mark = frame.liquid_glass_vertices.items.len;
@@ -2231,10 +2386,10 @@ fn appendPaintOps(
             },
 
             .rect => |rect| {
-                const start_len = frame.shape_vertices.items.len;
+                const start_len = frame.shape_instances.items.len;
                 try appendShape(
                     allocator,
-                    &frame.shape_vertices,
+                    &frame.shape_instances,
                     .{
                         .x = rect.bounds.x * scale_factor,
                         .y = rect.bounds.y * scale_factor,
@@ -2248,8 +2403,8 @@ fn appendPaintOps(
                     frame_width,
                     frame_height,
                 );
-                const added = frame.shape_vertices.items.len - start_len;
-                try appendOrMergeShapeOp(allocator, frame, .{
+                const added = frame.shape_instances.items.len - start_len;
+                try appendOrMergeShapeInstancedOp(allocator, frame, .{
                     .vertex_offset = @intCast(start_len),
                     .vertex_count = @intCast(added),
                     .clip_rect = current_clip,
@@ -2280,10 +2435,10 @@ fn appendPaintOps(
             },
 
             .border => |border| {
-                const start_len = frame.shape_vertices.items.len;
+                const start_len = frame.shape_instances.items.len;
                 try appendShape(
                     allocator,
-                    &frame.shape_vertices,
+                    &frame.shape_instances,
                     .{
                         .x = border.bounds.x * scale_factor,
                         .y = border.bounds.y * scale_factor,
@@ -2297,8 +2452,8 @@ fn appendPaintOps(
                     frame_width,
                     frame_height,
                 );
-                const added = frame.shape_vertices.items.len - start_len;
-                try appendOrMergeShapeOp(allocator, frame, .{
+                const added = frame.shape_instances.items.len - start_len;
+                try appendOrMergeShapeInstancedOp(allocator, frame, .{
                     .vertex_offset = @intCast(start_len),
                     .vertex_count = @intCast(added),
                     .clip_rect = current_clip,
@@ -2307,14 +2462,14 @@ fn appendPaintOps(
             },
 
             .shadow => |shadow| {
-                const start_len = frame.shape_vertices.items.len;
+                const start_len = frame.shape_instances.items.len;
                 const spread = shadow.spread;
                 const blur = shadow.blur_radius;
                 const expansion = spread + blur * 2.0;
 
                 try appendShape(
                     allocator,
-                    &frame.shape_vertices,
+                    &frame.shape_instances,
                     .{
                         .x = (shadow.bounds.x - expansion) * scale_factor,
                         .y = (shadow.bounds.y - expansion) * scale_factor,
@@ -2328,8 +2483,8 @@ fn appendPaintOps(
                     frame_width,
                     frame_height,
                 );
-                const added = frame.shape_vertices.items.len - start_len;
-                try appendOrMergeShapeOp(allocator, frame, .{
+                const added = frame.shape_instances.items.len - start_len;
+                try appendOrMergeShapeInstancedOp(allocator, frame, .{
                     .vertex_offset = @intCast(start_len),
                     .vertex_count = @intCast(added),
                     .clip_rect = current_clip,
@@ -2502,6 +2657,7 @@ fn appendPaintOps(
         // color-emoji quads into image_vertices — is covered wholesale).
         if (xf) |cur| {
             applyNdcTransform(ShapeVertex, frame.shape_vertices.items[shape_mark..], cur.ndc);
+            applyNdcTransformInstances(frame.shape_instances.items[shape_inst_mark..], cur.ndc);
             applyNdcTransform(ft_text.TextVertex, frame.text_vertices.items[text_mark..], cur.ndc);
             applyNdcTransform(ImageVertex, frame.image_vertices.items[image_mark..], cur.ndc);
             applyNdcTransform(LiquidGlassVertex, frame.liquid_glass_vertices.items[glass_mark..], cur.ndc);
@@ -2532,6 +2688,26 @@ fn appendOrMergeShapeOp(allocator: std.mem.Allocator, frame: *FramePaint, batch:
     }
     try frame.ops.append(allocator, .{ .shape = batch });
 }
+/// As `appendOrMergeShapeOp`, for the instanced path. Merging consecutive runs is what makes the
+/// instancing pay: a list of adjacent rects becomes one drawIndexed with a high instance count.
+fn appendOrMergeShapeInstancedOp(allocator: std.mem.Allocator, frame: *FramePaint, batch: ShapeBatch) !void {
+    if (batch.vertex_count == 0) return;
+    if (frame.ops.items.len > 0) {
+        const last = &frame.ops.items[frame.ops.items.len - 1];
+        if (last.* == .shape_instanced) {
+            const prev = &last.shape_instanced;
+            if (prev.vertex_offset + prev.vertex_count == batch.vertex_offset and
+                prev.clip_offset == batch.clip_offset and
+                std.meta.eql(prev.clip_rect, batch.clip_rect))
+            {
+                prev.vertex_count += batch.vertex_count;
+                return;
+            }
+        }
+    }
+    try frame.ops.append(allocator, .{ .shape_instanced = batch });
+}
+
 fn appendOrMergeLiquidGlassOp(allocator: std.mem.Allocator, frame: *FramePaint, batch: ShapeBatch) !void {
     if (batch.vertex_count == 0) return;
     try frame.ops.append(allocator, .{ .liquid_glass = batch });
@@ -3280,7 +3456,7 @@ fn appendLiquidGlass(
 
 fn appendShape(
     allocator: std.mem.Allocator,
-    vertices: *std.ArrayList(ShapeVertex),
+    vertices: *std.ArrayList(ShapeInstance),
     rect: zg.Rect,
     color: zg.Color,
     radius: f32,
@@ -3296,69 +3472,13 @@ fn appendShape(
     const x1 = (rect.x + rect.width) / frame_width * 2.0 - 1.0;
     const y1 = 1.0 - (rect.y + rect.height) / frame_height * 2.0;
 
-    const c = colorToU8(color);
-
-    const w2 = rect.width / 2.0;
-    const h2 = rect.height / 2.0;
-    const size = [2]f32{ rect.width, rect.height };
-
-    try vertices.appendSlice(allocator, &.{
-        // Triangle 1
-        .{
-            .position = .{ x0, y0 },
-            .color = c,
-            .local_pos = .{ -w2, -h2 },
-            .rect_size = size,
-            .radius = radius,
-            .border_width = border_width,
-            .blur_radius = blur_radius,
-        },
-        .{
-            .position = .{ x1, y0 },
-            .color = c,
-            .local_pos = .{ w2, -h2 },
-            .rect_size = size,
-            .radius = radius,
-            .border_width = border_width,
-            .blur_radius = blur_radius,
-        },
-        .{
-            .position = .{ x0, y1 },
-            .color = c,
-            .local_pos = .{ -w2, h2 },
-            .rect_size = size,
-            .radius = radius,
-            .border_width = border_width,
-            .blur_radius = blur_radius,
-        },
-        // Triangle 2
-        .{
-            .position = .{ x1, y0 },
-            .color = c,
-            .local_pos = .{ w2, -h2 },
-            .rect_size = size,
-            .radius = radius,
-            .border_width = border_width,
-            .blur_radius = blur_radius,
-        },
-        .{
-            .position = .{ x1, y1 },
-            .color = c,
-            .local_pos = .{ w2, h2 },
-            .rect_size = size,
-            .radius = radius,
-            .border_width = border_width,
-            .blur_radius = blur_radius,
-        },
-        .{
-            .position = .{ x0, y1 },
-            .color = c,
-            .local_pos = .{ -w2, h2 },
-            .rect_size = size,
-            .radius = radius,
-            .border_width = border_width,
-            .blur_radius = blur_radius,
-        },
+    try vertices.append(allocator, .{
+        .corners = .{ x0, y0, x1, y0, x0, y1, x1, y1 },
+        .color = colorToU8(color),
+        .rect_size = .{ rect.width, rect.height },
+        .radius = radius,
+        .border_width = border_width,
+        .blur_radius = blur_radius,
     });
 }
 
