@@ -430,6 +430,480 @@ const ShadowCaster = struct {
 
 // ── Gpu3d ─────────────────────────────────────────────────────────────────────
 
+/// The post-processing chain's device objects: bind-group layouts, pipelines, the shared sampler
+/// and the parameter buffers for bloom, DoF, tonemap, exposure, SSAO, SSR and TAA.
+///
+/// Lifted out of `Gpu3d.init`, which ran to 1417 lines and needed `@setEvalBranchQuota(4000)` purely
+/// because of its own size. This block was the clean seam to cut first: it reads nothing else init
+/// builds — only the device and the surface format.
+///
+/// Note init has no `errdefer` anywhere, so a failure part-way through already leaks whatever was
+/// created before it; moving code out cannot make that worse. `ensure3d` latches `gpu_3d_failed`, so
+/// it happens at most once per process. Worth fixing, separately and deliberately.
+const PostResources = struct {
+    bloom_down_first_buf: *wgpu.Buffer,
+    bloom_down_pipeline: *wgpu.RenderPipeline,
+    bloom_down_rest_buf: *wgpu.Buffer,
+    bloom_up_bgl: *wgpu.BindGroupLayout,
+    bloom_up_pipeline: *wgpu.RenderPipeline,
+    dof_bgl: *wgpu.BindGroupLayout,
+    dof_buf: *wgpu.Buffer,
+    dof_pipeline: *wgpu.RenderPipeline,
+    exposure_bgl: *wgpu.BindGroupLayout,
+    exposure_buf: *wgpu.Buffer,
+    exposure_pipeline: *wgpu.RenderPipeline,
+    post_bgl: *wgpu.BindGroupLayout,
+    post_sampler: *wgpu.Sampler,
+    ssao_bgl: *wgpu.BindGroupLayout,
+    ssao_buf: *wgpu.Buffer,
+    ssao_pipeline: *wgpu.RenderPipeline,
+    ssr_bgl: *wgpu.BindGroupLayout,
+    ssr_buf: *wgpu.Buffer,
+    ssr_pipeline: *wgpu.RenderPipeline,
+    taa_bgl: *wgpu.BindGroupLayout,
+    taa_buf: *wgpu.Buffer,
+    taa_pipeline: *wgpu.RenderPipeline,
+    tonemap_bgl: *wgpu.BindGroupLayout,
+    tonemap_buf: *wgpu.Buffer,
+    tonemap_pipeline: *wgpu.RenderPipeline,
+};
+
+fn createPostResources(device: *wgpu.Device, surface_format: wgpu.TextureFormat) !PostResources {
+    // ── Post-processing pipelines (bloom + tonemap) ────────────────────────
+    const post_sampler = device.createSampler(&.{
+        .label = wgpu.StringView.fromSlice("post sampler"),
+        .address_mode_u = .clamp_to_edge,
+        .address_mode_v = .clamp_to_edge,
+        .address_mode_w = .clamp_to_edge,
+        .mag_filter = .linear,
+        .min_filter = .linear,
+        .mipmap_filter = .nearest,
+    }) orelse return error.WgpuSamplerUnavailable;
+
+    // Bloom/SSAO bind group layout: source texture + sampler + params UBO. min_binding_size
+    // is 0 (validated by the bound buffer size at draw) so this single layout can back both
+    // the bloom params (BloomParams) and the larger SSAO params (SsaoParams).
+    const post_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
+        .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
+        .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = 0 } },
+    };
+    const post_bgl = device.createBindGroupLayout(&.{
+        .label = wgpu.StringView.fromSlice("post bgl"),
+        .entry_count = post_bgl_entries.len,
+        .entries = &post_bgl_entries,
+    }) orelse return error.BindGroupLayoutCreateFailed;
+
+    // Tonemap bind group layout: scene HDR + bloom + AO + SSR + params + two G-buffer metadata
+    // textures (bindings 9/10 — lighting/scene meta; their slot numbers are kept to avoid a
+    // shader renumber after the Metal-RT inputs at 6/7/8 were removed).
+    const tonemap_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
+        .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
+        .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 5, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(TonemapParams) } },
+        .{ .binding = 9, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 10, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 11, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } }, // albedo G-buffer (SSGI receiver tint)
+        .{ .binding = 12, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } }, // 1×1 auto-exposure multiplier
+    };
+    const tonemap_bgl = device.createBindGroupLayout(&.{
+        .label = wgpu.StringView.fromSlice("tonemap bgl"),
+        .entry_count = tonemap_bgl_entries.len,
+        .entries = &tonemap_bgl_entries,
+    }) orelse return error.BindGroupLayoutCreateFailed;
+
+    // SSR bind group layout: scene colour + view-position + view-normal + sampler + params.
+    const ssr_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
+        .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
+        .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(SsrParams) } },
+    };
+    const ssr_bgl = device.createBindGroupLayout(&.{
+        .label = wgpu.StringView.fromSlice("ssr bgl"),
+        .entry_count = ssr_bgl_entries.len,
+        .entries = &ssr_bgl_entries,
+    }) orelse return error.BindGroupLayoutCreateFailed;
+
+    // SSAO bind group layout: view-position + view-normal G-buffers + sampler + params. The
+    // normal comes from the G-buffer (same target SSR reads) instead of cross(dpdx,dpdy).
+    const ssao_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
+        .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
+        .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(SsaoParams) } },
+        // binding 4: the lit scene colour — sampled at the horizon occluders for SSGI (indirect bounce).
+        .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        // binding 5: previous accumulated GI/AO (history) — reprojected + blended for temporal SSGI.
+        .{ .binding = 5, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+    };
+    const ssao_bgl = device.createBindGroupLayout(&.{
+        .label = wgpu.StringView.fromSlice("ssao bgl"),
+        .entry_count = ssao_bgl_entries.len,
+        .entries = &ssao_bgl_entries,
+    }) orelse return error.BindGroupLayoutCreateFailed;
+
+    // DoF bind group layout: scene colour + view-position G-buffer + sampler + params.
+    const dof_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
+        .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
+        .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(DofParams) } },
+    };
+    const dof_bgl = device.createBindGroupLayout(&.{
+        .label = wgpu.StringView.fromSlice("dof bgl"),
+        .entry_count = dof_bgl_entries.len,
+        .entries = &dof_bgl_entries,
+    }) orelse return error.BindGroupLayoutCreateFailed;
+
+    // Upsample bind group layout: just the coarser-mip texture + sampler (no UBO).
+    const bloom_up_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
+        .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
+    };
+    const bloom_up_bgl = device.createBindGroupLayout(&.{
+        .label = wgpu.StringView.fromSlice("bloom up bgl"),
+        .entry_count = bloom_up_bgl_entries.len,
+        .entries = &bloom_up_bgl_entries,
+    }) orelse return error.BindGroupLayoutCreateFailed;
+
+    const bloom_down_shader = device.createShaderModule(&.{
+        .label = wgpu.StringView.fromSlice("zigote bloom down shader"),
+        .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
+            .code = wgpu.StringView.fromSlice(shaders3d.bloom_down_shader_source),
+        }),
+    }) orelse return error.ShaderModuleCreateFailed;
+    defer bloom_down_shader.release();
+    const bloom_up_shader = device.createShaderModule(&.{
+        .label = wgpu.StringView.fromSlice("zigote bloom up shader"),
+        .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
+            .code = wgpu.StringView.fromSlice(shaders3d.bloom_up_shader_source),
+        }),
+    }) orelse return error.ShaderModuleCreateFailed;
+    defer bloom_up_shader.release();
+    const tonemap_shader = device.createShaderModule(&.{
+        .label = wgpu.StringView.fromSlice("zigote tonemap shader"),
+        .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
+            .code = wgpu.StringView.fromSlice(shaders3d.tonemap_shader_source),
+        }),
+    }) orelse return error.ShaderModuleCreateFailed;
+    defer tonemap_shader.release();
+
+    // Downsample pipeline: replace-blend, reuses post_bgl (texture + sampler + DownParams UBO).
+    const bloom_down_target = wgpu.ColorTargetState{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all };
+    const bloom_down_pl_layout = device.createPipelineLayout(&.{
+        .label = wgpu.StringView.fromSlice("bloom down pl layout"),
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = @ptrCast(&post_bgl),
+    }) orelse return error.PipelineLayoutCreateFailed;
+    defer bloom_down_pl_layout.release();
+    const bloom_down_pipeline = device.createRenderPipeline(&.{
+        .label = wgpu.StringView.fromSlice("bloom down pipeline"),
+        .layout = bloom_down_pl_layout,
+        .vertex = .{ .module = bloom_down_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
+        .primitive = .{ .topology = .triangle_list },
+        .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
+        .fragment = &.{
+            .module = bloom_down_shader,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = @ptrCast(&bloom_down_target),
+        },
+    }) orelse return error.PipelineCreateFailed;
+    // Upsample pipeline: additive (one,one) blend so each tent accumulates into the finer mip.
+    const bloom_up_target = wgpu.ColorTargetState{
+        .format = SCENE_HDR_FORMAT,
+        .write_mask = wgpu.ColorWriteMasks.all,
+        .blend = &wgpu.BlendState{
+            .color = .{ .src_factor = .one, .dst_factor = .one, .operation = .add },
+            .alpha = .{ .src_factor = .one, .dst_factor = .one, .operation = .add },
+        },
+    };
+    const bloom_up_pl_layout = device.createPipelineLayout(&.{
+        .label = wgpu.StringView.fromSlice("bloom up pl layout"),
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = @ptrCast(&bloom_up_bgl),
+    }) orelse return error.PipelineLayoutCreateFailed;
+    defer bloom_up_pl_layout.release();
+    const bloom_up_pipeline = device.createRenderPipeline(&.{
+        .label = wgpu.StringView.fromSlice("bloom up pipeline"),
+        .layout = bloom_up_pl_layout,
+        .vertex = .{ .module = bloom_up_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
+        .primitive = .{ .topology = .triangle_list },
+        .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
+        .fragment = &.{
+            .module = bloom_up_shader,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = @ptrCast(&bloom_up_target),
+        },
+    }) orelse return error.PipelineCreateFailed;
+
+    // Depth-of-field gather pipeline (own bgl: scene + view-position + sampler + DofParams).
+    const dof_shader = device.createShaderModule(&.{
+        .label = wgpu.StringView.fromSlice("zigote dof shader"),
+        .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
+            .code = wgpu.StringView.fromSlice(shaders3d.dof_shader_source),
+        }),
+    }) orelse return error.ShaderModuleCreateFailed;
+    defer dof_shader.release();
+    const dof_target = wgpu.ColorTargetState{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all };
+    const dof_pl_layout = device.createPipelineLayout(&.{
+        .label = wgpu.StringView.fromSlice("dof pl layout"),
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = @ptrCast(&dof_bgl),
+    }) orelse return error.PipelineLayoutCreateFailed;
+    defer dof_pl_layout.release();
+    const dof_pipeline = device.createRenderPipeline(&.{
+        .label = wgpu.StringView.fromSlice("dof pipeline"),
+        .layout = dof_pl_layout,
+        .vertex = .{ .module = dof_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
+        .primitive = .{ .topology = .triangle_list },
+        .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
+        .fragment = &.{
+            .module = dof_shader,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = @ptrCast(&dof_target),
+        },
+    }) orelse return error.PipelineCreateFailed;
+
+    const tonemap_target = wgpu.ColorTargetState{ .format = surface_format, .write_mask = wgpu.ColorWriteMasks.all };
+    const tonemap_pl_layout = device.createPipelineLayout(&.{
+        .label = wgpu.StringView.fromSlice("tonemap pl layout"),
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = @ptrCast(&tonemap_bgl),
+    }) orelse return error.PipelineLayoutCreateFailed;
+    defer tonemap_pl_layout.release();
+    const tonemap_pipeline = device.createRenderPipeline(&.{
+        .label = wgpu.StringView.fromSlice("tonemap pipeline"),
+        .layout = tonemap_pl_layout,
+        .vertex = .{ .module = tonemap_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
+        .primitive = .{ .topology = .triangle_list },
+        .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
+        .fragment = &.{
+            .module = tonemap_shader,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = @ptrCast(&tonemap_target),
+        },
+    }) orelse return error.PipelineCreateFailed;
+
+    // Auto-exposure metering pipeline: reads the scene HDR + the 1×1 history + params, writes the
+    // 1×1 adapted-multiplier target (SCENE_HDR_FORMAT so the value isn't clamped to [0,1]).
+    const exposure_shader = device.createShaderModule(&.{
+        .label = wgpu.StringView.fromSlice("zigote exposure shader"),
+        .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
+            .code = wgpu.StringView.fromSlice(shaders3d.exposure_shader_source),
+        }),
+    }) orelse return error.ShaderModuleCreateFailed;
+    defer exposure_shader.release();
+    const exposure_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
+        .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
+        .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(ExposureParams) } },
+    };
+    const exposure_bgl = device.createBindGroupLayout(&.{
+        .label = wgpu.StringView.fromSlice("exposure bgl"),
+        .entry_count = exposure_bgl_entries.len,
+        .entries = &exposure_bgl_entries,
+    }) orelse return error.BindGroupLayoutCreateFailed;
+    const exposure_target = wgpu.ColorTargetState{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all };
+    const exposure_pl_layout = device.createPipelineLayout(&.{
+        .label = wgpu.StringView.fromSlice("exposure pl layout"),
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = @ptrCast(&exposure_bgl),
+    }) orelse return error.PipelineLayoutCreateFailed;
+    defer exposure_pl_layout.release();
+    const exposure_pipeline = device.createRenderPipeline(&.{
+        .label = wgpu.StringView.fromSlice("exposure pipeline"),
+        .layout = exposure_pl_layout,
+        .vertex = .{ .module = exposure_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
+        .primitive = .{ .topology = .triangle_list },
+        .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
+        .fragment = &.{
+            .module = exposure_shader,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = @ptrCast(&exposure_target),
+        },
+    }) orelse return error.PipelineCreateFailed;
+    const exposure_buf = device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("exposure params"),
+        .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
+        .size = @sizeOf(ExposureParams),
+    }) orelse return error.BufferCreateFailed;
+
+    const bloom_down_first_buf = device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("bloom down first params"),
+        .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
+        .size = @sizeOf(BloomDownParams),
+    }) orelse return error.BufferCreateFailed;
+    const bloom_down_rest_buf = device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("bloom down rest params"),
+        .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
+        .size = @sizeOf(BloomDownParams),
+    }) orelse return error.BufferCreateFailed;
+    const dof_buf = device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("dof params"),
+        .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
+        .size = @sizeOf(DofParams),
+    }) orelse return error.BufferCreateFailed;
+    const tonemap_buf = device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("tonemap params"),
+        .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
+        .size = @sizeOf(TonemapParams),
+    }) orelse return error.BufferCreateFailed;
+
+    // SSAO pipeline — uses ssao_bgl (pos + normal textures + sampler + uniform); outputs an AO factor.
+    const ssao_shader = device.createShaderModule(&.{
+        .label = wgpu.StringView.fromSlice("zigote ssao shader"),
+        .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
+            .code = wgpu.StringView.fromSlice(shaders3d.ssao_shader_source),
+        }),
+    }) orelse return error.ShaderModuleCreateFailed;
+    defer ssao_shader.release();
+    const ssao_target = wgpu.ColorTargetState{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all };
+    const ssao_pl_layout = device.createPipelineLayout(&.{
+        .label = wgpu.StringView.fromSlice("ssao pl layout"),
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = @ptrCast(&ssao_bgl),
+    }) orelse return error.PipelineLayoutCreateFailed;
+    defer ssao_pl_layout.release();
+    const ssao_pipeline = device.createRenderPipeline(&.{
+        .label = wgpu.StringView.fromSlice("ssao pipeline"),
+        .layout = ssao_pl_layout,
+        .vertex = .{ .module = ssao_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
+        .primitive = .{ .topology = .triangle_list },
+        .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
+        .fragment = &.{
+            .module = ssao_shader,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = @ptrCast(&ssao_target),
+        },
+    }) orelse return error.PipelineCreateFailed;
+    const ssao_buf = device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("ssao params"),
+        .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
+        .size = @sizeOf(SsaoParams),
+    }) orelse return error.BufferCreateFailed;
+
+    // SSR pipeline — reads scene colour + view-position; outputs reflection colour.
+    const ssr_shader = device.createShaderModule(&.{
+        .label = wgpu.StringView.fromSlice("zigote ssr shader"),
+        .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
+            .code = wgpu.StringView.fromSlice(shaders3d.ssr_shader_source),
+        }),
+    }) orelse return error.ShaderModuleCreateFailed;
+    defer ssr_shader.release();
+    const ssr_target = wgpu.ColorTargetState{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all };
+    const ssr_pl_layout = device.createPipelineLayout(&.{
+        .label = wgpu.StringView.fromSlice("ssr pl layout"),
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = @ptrCast(&ssr_bgl),
+    }) orelse return error.PipelineLayoutCreateFailed;
+    defer ssr_pl_layout.release();
+    const ssr_pipeline = device.createRenderPipeline(&.{
+        .label = wgpu.StringView.fromSlice("ssr pipeline"),
+        .layout = ssr_pl_layout,
+        .vertex = .{ .module = ssr_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
+        .primitive = .{ .topology = .triangle_list },
+        .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
+        .fragment = &.{
+            .module = ssr_shader,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = @ptrCast(&ssr_target),
+        },
+    }) orelse return error.PipelineCreateFailed;
+    const ssr_buf = device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("ssr params"),
+        .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
+        .size = @sizeOf(SsrParams),
+    }) orelse return error.BufferCreateFailed;
+
+    // TAA pipeline — current LDR + history LDR + view-position → resolved LDR.
+    const taa_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
+        .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
+        .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
+        .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(TaaParams) } },
+    };
+    const taa_bgl = device.createBindGroupLayout(&.{
+        .label = wgpu.StringView.fromSlice("taa bgl"),
+        .entry_count = taa_bgl_entries.len,
+        .entries = &taa_bgl_entries,
+    }) orelse return error.BindGroupLayoutCreateFailed;
+    const taa_shader = device.createShaderModule(&.{
+        .label = wgpu.StringView.fromSlice("zigote taa shader"),
+        .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
+            .code = wgpu.StringView.fromSlice(shaders3d.taa_shader_source),
+        }),
+    }) orelse return error.ShaderModuleCreateFailed;
+    defer taa_shader.release();
+    const taa_target = wgpu.ColorTargetState{ .format = surface_format, .write_mask = wgpu.ColorWriteMasks.all };
+    const taa_pl_layout = device.createPipelineLayout(&.{
+        .label = wgpu.StringView.fromSlice("taa pl layout"),
+        .bind_group_layout_count = 1,
+        .bind_group_layouts = @ptrCast(&taa_bgl),
+    }) orelse return error.PipelineLayoutCreateFailed;
+    defer taa_pl_layout.release();
+    const taa_pipeline = device.createRenderPipeline(&.{
+        .label = wgpu.StringView.fromSlice("taa pipeline"),
+        .layout = taa_pl_layout,
+        .vertex = .{ .module = taa_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
+        .primitive = .{ .topology = .triangle_list },
+        .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
+        .fragment = &.{
+            .module = taa_shader,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = @ptrCast(&taa_target),
+        },
+    }) orelse return error.PipelineCreateFailed;
+    const taa_buf = device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("taa params"),
+        .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
+        .size = @sizeOf(TaaParams),
+    }) orelse return error.BufferCreateFailed;
+
+
+    return .{
+        .bloom_down_first_buf = bloom_down_first_buf,
+        .bloom_down_pipeline = bloom_down_pipeline,
+        .bloom_down_rest_buf = bloom_down_rest_buf,
+        .bloom_up_bgl = bloom_up_bgl,
+        .bloom_up_pipeline = bloom_up_pipeline,
+        .dof_bgl = dof_bgl,
+        .dof_buf = dof_buf,
+        .dof_pipeline = dof_pipeline,
+        .exposure_bgl = exposure_bgl,
+        .exposure_buf = exposure_buf,
+        .exposure_pipeline = exposure_pipeline,
+        .post_bgl = post_bgl,
+        .post_sampler = post_sampler,
+        .ssao_bgl = ssao_bgl,
+        .ssao_buf = ssao_buf,
+        .ssao_pipeline = ssao_pipeline,
+        .ssr_bgl = ssr_bgl,
+        .ssr_buf = ssr_buf,
+        .ssr_pipeline = ssr_pipeline,
+        .taa_bgl = taa_bgl,
+        .taa_buf = taa_buf,
+        .taa_pipeline = taa_pipeline,
+        .tonemap_bgl = tonemap_bgl,
+        .tonemap_buf = tonemap_buf,
+        .tonemap_pipeline = tonemap_pipeline,
+    };
+}
+
 pub const Gpu3d = struct {
     allocator: std.mem.Allocator,
     device: *wgpu.Device,
@@ -1654,442 +2128,39 @@ pub const Gpu3d = struct {
             .bind_group = default_bg,
         };
 
-        // ── Post-processing pipelines (bloom + tonemap) ────────────────────────
-        const post_sampler = device.createSampler(&.{
-            .label = wgpu.StringView.fromSlice("post sampler"),
-            .address_mode_u = .clamp_to_edge,
-            .address_mode_v = .clamp_to_edge,
-            .address_mode_w = .clamp_to_edge,
-            .mag_filter = .linear,
-            .min_filter = .linear,
-            .mipmap_filter = .nearest,
-        }) orelse return error.WgpuSamplerUnavailable;
-
-        // Bloom/SSAO bind group layout: source texture + sampler + params UBO. min_binding_size
-        // is 0 (validated by the bound buffer size at draw) so this single layout can back both
-        // the bloom params (BloomParams) and the larger SSAO params (SsaoParams).
-        const post_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
-            .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
-            .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = 0 } },
-        };
-        const post_bgl = device.createBindGroupLayout(&.{
-            .label = wgpu.StringView.fromSlice("post bgl"),
-            .entry_count = post_bgl_entries.len,
-            .entries = &post_bgl_entries,
-        }) orelse return error.BindGroupLayoutCreateFailed;
-
-        // Tonemap bind group layout: scene HDR + bloom + AO + SSR + params + two G-buffer metadata
-        // textures (bindings 9/10 — lighting/scene meta; their slot numbers are kept to avoid a
-        // shader renumber after the Metal-RT inputs at 6/7/8 were removed).
-        const tonemap_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
-            .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
-            .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 5, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(TonemapParams) } },
-            .{ .binding = 9, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 10, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 11, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } }, // albedo G-buffer (SSGI receiver tint)
-            .{ .binding = 12, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } }, // 1×1 auto-exposure multiplier
-        };
-        const tonemap_bgl = device.createBindGroupLayout(&.{
-            .label = wgpu.StringView.fromSlice("tonemap bgl"),
-            .entry_count = tonemap_bgl_entries.len,
-            .entries = &tonemap_bgl_entries,
-        }) orelse return error.BindGroupLayoutCreateFailed;
-
-        // SSR bind group layout: scene colour + view-position + view-normal + sampler + params.
-        const ssr_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
-            .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
-            .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(SsrParams) } },
-        };
-        const ssr_bgl = device.createBindGroupLayout(&.{
-            .label = wgpu.StringView.fromSlice("ssr bgl"),
-            .entry_count = ssr_bgl_entries.len,
-            .entries = &ssr_bgl_entries,
-        }) orelse return error.BindGroupLayoutCreateFailed;
-
-        // SSAO bind group layout: view-position + view-normal G-buffers + sampler + params. The
-        // normal comes from the G-buffer (same target SSR reads) instead of cross(dpdx,dpdy).
-        const ssao_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
-            .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
-            .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(SsaoParams) } },
-            // binding 4: the lit scene colour — sampled at the horizon occluders for SSGI (indirect bounce).
-            .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            // binding 5: previous accumulated GI/AO (history) — reprojected + blended for temporal SSGI.
-            .{ .binding = 5, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-        };
-        const ssao_bgl = device.createBindGroupLayout(&.{
-            .label = wgpu.StringView.fromSlice("ssao bgl"),
-            .entry_count = ssao_bgl_entries.len,
-            .entries = &ssao_bgl_entries,
-        }) orelse return error.BindGroupLayoutCreateFailed;
-
-        // DoF bind group layout: scene colour + view-position G-buffer + sampler + params.
-        const dof_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
-            .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
-            .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(DofParams) } },
-        };
-        const dof_bgl = device.createBindGroupLayout(&.{
-            .label = wgpu.StringView.fromSlice("dof bgl"),
-            .entry_count = dof_bgl_entries.len,
-            .entries = &dof_bgl_entries,
-        }) orelse return error.BindGroupLayoutCreateFailed;
-
-        // Upsample bind group layout: just the coarser-mip texture + sampler (no UBO).
-        const bloom_up_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
-            .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
-        };
-        const bloom_up_bgl = device.createBindGroupLayout(&.{
-            .label = wgpu.StringView.fromSlice("bloom up bgl"),
-            .entry_count = bloom_up_bgl_entries.len,
-            .entries = &bloom_up_bgl_entries,
-        }) orelse return error.BindGroupLayoutCreateFailed;
-
-        const bloom_down_shader = device.createShaderModule(&.{
-            .label = wgpu.StringView.fromSlice("zigote bloom down shader"),
-            .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
-                .code = wgpu.StringView.fromSlice(shaders3d.bloom_down_shader_source),
-            }),
-        }) orelse return error.ShaderModuleCreateFailed;
-        defer bloom_down_shader.release();
-        const bloom_up_shader = device.createShaderModule(&.{
-            .label = wgpu.StringView.fromSlice("zigote bloom up shader"),
-            .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
-                .code = wgpu.StringView.fromSlice(shaders3d.bloom_up_shader_source),
-            }),
-        }) orelse return error.ShaderModuleCreateFailed;
-        defer bloom_up_shader.release();
-        const tonemap_shader = device.createShaderModule(&.{
-            .label = wgpu.StringView.fromSlice("zigote tonemap shader"),
-            .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
-                .code = wgpu.StringView.fromSlice(shaders3d.tonemap_shader_source),
-            }),
-        }) orelse return error.ShaderModuleCreateFailed;
-        defer tonemap_shader.release();
-
-        // Downsample pipeline: replace-blend, reuses post_bgl (texture + sampler + DownParams UBO).
-        const bloom_down_target = wgpu.ColorTargetState{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all };
-        const bloom_down_pl_layout = device.createPipelineLayout(&.{
-            .label = wgpu.StringView.fromSlice("bloom down pl layout"),
-            .bind_group_layout_count = 1,
-            .bind_group_layouts = @ptrCast(&post_bgl),
-        }) orelse return error.PipelineLayoutCreateFailed;
-        defer bloom_down_pl_layout.release();
-        const bloom_down_pipeline = device.createRenderPipeline(&.{
-            .label = wgpu.StringView.fromSlice("bloom down pipeline"),
-            .layout = bloom_down_pl_layout,
-            .vertex = .{ .module = bloom_down_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
-            .primitive = .{ .topology = .triangle_list },
-            .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
-            .fragment = &.{
-                .module = bloom_down_shader,
-                .entry_point = wgpu.StringView.fromSlice("fs_main"),
-                .target_count = 1,
-                .targets = @ptrCast(&bloom_down_target),
-            },
-        }) orelse return error.PipelineCreateFailed;
-        // Upsample pipeline: additive (one,one) blend so each tent accumulates into the finer mip.
-        const bloom_up_target = wgpu.ColorTargetState{
-            .format = SCENE_HDR_FORMAT,
-            .write_mask = wgpu.ColorWriteMasks.all,
-            .blend = &wgpu.BlendState{
-                .color = .{ .src_factor = .one, .dst_factor = .one, .operation = .add },
-                .alpha = .{ .src_factor = .one, .dst_factor = .one, .operation = .add },
-            },
-        };
-        const bloom_up_pl_layout = device.createPipelineLayout(&.{
-            .label = wgpu.StringView.fromSlice("bloom up pl layout"),
-            .bind_group_layout_count = 1,
-            .bind_group_layouts = @ptrCast(&bloom_up_bgl),
-        }) orelse return error.PipelineLayoutCreateFailed;
-        defer bloom_up_pl_layout.release();
-        const bloom_up_pipeline = device.createRenderPipeline(&.{
-            .label = wgpu.StringView.fromSlice("bloom up pipeline"),
-            .layout = bloom_up_pl_layout,
-            .vertex = .{ .module = bloom_up_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
-            .primitive = .{ .topology = .triangle_list },
-            .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
-            .fragment = &.{
-                .module = bloom_up_shader,
-                .entry_point = wgpu.StringView.fromSlice("fs_main"),
-                .target_count = 1,
-                .targets = @ptrCast(&bloom_up_target),
-            },
-        }) orelse return error.PipelineCreateFailed;
-
-        // Depth-of-field gather pipeline (own bgl: scene + view-position + sampler + DofParams).
-        const dof_shader = device.createShaderModule(&.{
-            .label = wgpu.StringView.fromSlice("zigote dof shader"),
-            .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
-                .code = wgpu.StringView.fromSlice(shaders3d.dof_shader_source),
-            }),
-        }) orelse return error.ShaderModuleCreateFailed;
-        defer dof_shader.release();
-        const dof_target = wgpu.ColorTargetState{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all };
-        const dof_pl_layout = device.createPipelineLayout(&.{
-            .label = wgpu.StringView.fromSlice("dof pl layout"),
-            .bind_group_layout_count = 1,
-            .bind_group_layouts = @ptrCast(&dof_bgl),
-        }) orelse return error.PipelineLayoutCreateFailed;
-        defer dof_pl_layout.release();
-        const dof_pipeline = device.createRenderPipeline(&.{
-            .label = wgpu.StringView.fromSlice("dof pipeline"),
-            .layout = dof_pl_layout,
-            .vertex = .{ .module = dof_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
-            .primitive = .{ .topology = .triangle_list },
-            .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
-            .fragment = &.{
-                .module = dof_shader,
-                .entry_point = wgpu.StringView.fromSlice("fs_main"),
-                .target_count = 1,
-                .targets = @ptrCast(&dof_target),
-            },
-        }) orelse return error.PipelineCreateFailed;
-
-        const tonemap_target = wgpu.ColorTargetState{ .format = surface_format, .write_mask = wgpu.ColorWriteMasks.all };
-        const tonemap_pl_layout = device.createPipelineLayout(&.{
-            .label = wgpu.StringView.fromSlice("tonemap pl layout"),
-            .bind_group_layout_count = 1,
-            .bind_group_layouts = @ptrCast(&tonemap_bgl),
-        }) orelse return error.PipelineLayoutCreateFailed;
-        defer tonemap_pl_layout.release();
-        const tonemap_pipeline = device.createRenderPipeline(&.{
-            .label = wgpu.StringView.fromSlice("tonemap pipeline"),
-            .layout = tonemap_pl_layout,
-            .vertex = .{ .module = tonemap_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
-            .primitive = .{ .topology = .triangle_list },
-            .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
-            .fragment = &.{
-                .module = tonemap_shader,
-                .entry_point = wgpu.StringView.fromSlice("fs_main"),
-                .target_count = 1,
-                .targets = @ptrCast(&tonemap_target),
-            },
-        }) orelse return error.PipelineCreateFailed;
-
-        // Auto-exposure metering pipeline: reads the scene HDR + the 1×1 history + params, writes the
-        // 1×1 adapted-multiplier target (SCENE_HDR_FORMAT so the value isn't clamped to [0,1]).
-        const exposure_shader = device.createShaderModule(&.{
-            .label = wgpu.StringView.fromSlice("zigote exposure shader"),
-            .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
-                .code = wgpu.StringView.fromSlice(shaders3d.exposure_shader_source),
-            }),
-        }) orelse return error.ShaderModuleCreateFailed;
-        defer exposure_shader.release();
-        const exposure_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
-            .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
-            .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(ExposureParams) } },
-        };
-        const exposure_bgl = device.createBindGroupLayout(&.{
-            .label = wgpu.StringView.fromSlice("exposure bgl"),
-            .entry_count = exposure_bgl_entries.len,
-            .entries = &exposure_bgl_entries,
-        }) orelse return error.BindGroupLayoutCreateFailed;
-        const exposure_target = wgpu.ColorTargetState{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all };
-        const exposure_pl_layout = device.createPipelineLayout(&.{
-            .label = wgpu.StringView.fromSlice("exposure pl layout"),
-            .bind_group_layout_count = 1,
-            .bind_group_layouts = @ptrCast(&exposure_bgl),
-        }) orelse return error.PipelineLayoutCreateFailed;
-        defer exposure_pl_layout.release();
-        const exposure_pipeline = device.createRenderPipeline(&.{
-            .label = wgpu.StringView.fromSlice("exposure pipeline"),
-            .layout = exposure_pl_layout,
-            .vertex = .{ .module = exposure_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
-            .primitive = .{ .topology = .triangle_list },
-            .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
-            .fragment = &.{
-                .module = exposure_shader,
-                .entry_point = wgpu.StringView.fromSlice("fs_main"),
-                .target_count = 1,
-                .targets = @ptrCast(&exposure_target),
-            },
-        }) orelse return error.PipelineCreateFailed;
-        const exposure_buf = device.createBuffer(&.{
-            .label = wgpu.StringView.fromSlice("exposure params"),
-            .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
-            .size = @sizeOf(ExposureParams),
-        }) orelse return error.BufferCreateFailed;
-
-        const bloom_down_first_buf = device.createBuffer(&.{
-            .label = wgpu.StringView.fromSlice("bloom down first params"),
-            .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
-            .size = @sizeOf(BloomDownParams),
-        }) orelse return error.BufferCreateFailed;
-        const bloom_down_rest_buf = device.createBuffer(&.{
-            .label = wgpu.StringView.fromSlice("bloom down rest params"),
-            .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
-            .size = @sizeOf(BloomDownParams),
-        }) orelse return error.BufferCreateFailed;
-        const dof_buf = device.createBuffer(&.{
-            .label = wgpu.StringView.fromSlice("dof params"),
-            .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
-            .size = @sizeOf(DofParams),
-        }) orelse return error.BufferCreateFailed;
-        const tonemap_buf = device.createBuffer(&.{
-            .label = wgpu.StringView.fromSlice("tonemap params"),
-            .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
-            .size = @sizeOf(TonemapParams),
-        }) orelse return error.BufferCreateFailed;
-
-        // SSAO pipeline — uses ssao_bgl (pos + normal textures + sampler + uniform); outputs an AO factor.
-        const ssao_shader = device.createShaderModule(&.{
-            .label = wgpu.StringView.fromSlice("zigote ssao shader"),
-            .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
-                .code = wgpu.StringView.fromSlice(shaders3d.ssao_shader_source),
-            }),
-        }) orelse return error.ShaderModuleCreateFailed;
-        defer ssao_shader.release();
-        const ssao_target = wgpu.ColorTargetState{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all };
-        const ssao_pl_layout = device.createPipelineLayout(&.{
-            .label = wgpu.StringView.fromSlice("ssao pl layout"),
-            .bind_group_layout_count = 1,
-            .bind_group_layouts = @ptrCast(&ssao_bgl),
-        }) orelse return error.PipelineLayoutCreateFailed;
-        defer ssao_pl_layout.release();
-        const ssao_pipeline = device.createRenderPipeline(&.{
-            .label = wgpu.StringView.fromSlice("ssao pipeline"),
-            .layout = ssao_pl_layout,
-            .vertex = .{ .module = ssao_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
-            .primitive = .{ .topology = .triangle_list },
-            .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
-            .fragment = &.{
-                .module = ssao_shader,
-                .entry_point = wgpu.StringView.fromSlice("fs_main"),
-                .target_count = 1,
-                .targets = @ptrCast(&ssao_target),
-            },
-        }) orelse return error.PipelineCreateFailed;
-        const ssao_buf = device.createBuffer(&.{
-            .label = wgpu.StringView.fromSlice("ssao params"),
-            .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
-            .size = @sizeOf(SsaoParams),
-        }) orelse return error.BufferCreateFailed;
-
-        // SSR pipeline — reads scene colour + view-position; outputs reflection colour.
-        const ssr_shader = device.createShaderModule(&.{
-            .label = wgpu.StringView.fromSlice("zigote ssr shader"),
-            .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
-                .code = wgpu.StringView.fromSlice(shaders3d.ssr_shader_source),
-            }),
-        }) orelse return error.ShaderModuleCreateFailed;
-        defer ssr_shader.release();
-        const ssr_target = wgpu.ColorTargetState{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all };
-        const ssr_pl_layout = device.createPipelineLayout(&.{
-            .label = wgpu.StringView.fromSlice("ssr pl layout"),
-            .bind_group_layout_count = 1,
-            .bind_group_layouts = @ptrCast(&ssr_bgl),
-        }) orelse return error.PipelineLayoutCreateFailed;
-        defer ssr_pl_layout.release();
-        const ssr_pipeline = device.createRenderPipeline(&.{
-            .label = wgpu.StringView.fromSlice("ssr pipeline"),
-            .layout = ssr_pl_layout,
-            .vertex = .{ .module = ssr_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
-            .primitive = .{ .topology = .triangle_list },
-            .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
-            .fragment = &.{
-                .module = ssr_shader,
-                .entry_point = wgpu.StringView.fromSlice("fs_main"),
-                .target_count = 1,
-                .targets = @ptrCast(&ssr_target),
-            },
-        }) orelse return error.PipelineCreateFailed;
-        const ssr_buf = device.createBuffer(&.{
-            .label = wgpu.StringView.fromSlice("ssr params"),
-            .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
-            .size = @sizeOf(SsrParams),
-        }) orelse return error.BufferCreateFailed;
-
-        // TAA pipeline — current LDR + history LDR + view-position → resolved LDR.
-        const taa_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
-            .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
-            .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
-            .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(TaaParams) } },
-        };
-        const taa_bgl = device.createBindGroupLayout(&.{
-            .label = wgpu.StringView.fromSlice("taa bgl"),
-            .entry_count = taa_bgl_entries.len,
-            .entries = &taa_bgl_entries,
-        }) orelse return error.BindGroupLayoutCreateFailed;
-        const taa_shader = device.createShaderModule(&.{
-            .label = wgpu.StringView.fromSlice("zigote taa shader"),
-            .next_in_chain = @ptrCast(&wgpu.ShaderSourceWGSL{
-                .code = wgpu.StringView.fromSlice(shaders3d.taa_shader_source),
-            }),
-        }) orelse return error.ShaderModuleCreateFailed;
-        defer taa_shader.release();
-        const taa_target = wgpu.ColorTargetState{ .format = surface_format, .write_mask = wgpu.ColorWriteMasks.all };
-        const taa_pl_layout = device.createPipelineLayout(&.{
-            .label = wgpu.StringView.fromSlice("taa pl layout"),
-            .bind_group_layout_count = 1,
-            .bind_group_layouts = @ptrCast(&taa_bgl),
-        }) orelse return error.PipelineLayoutCreateFailed;
-        defer taa_pl_layout.release();
-        const taa_pipeline = device.createRenderPipeline(&.{
-            .label = wgpu.StringView.fromSlice("taa pipeline"),
-            .layout = taa_pl_layout,
-            .vertex = .{ .module = taa_shader, .entry_point = wgpu.StringView.fromSlice("vs_main") },
-            .primitive = .{ .topology = .triangle_list },
-            .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
-            .fragment = &.{
-                .module = taa_shader,
-                .entry_point = wgpu.StringView.fromSlice("fs_main"),
-                .target_count = 1,
-                .targets = @ptrCast(&taa_target),
-            },
-        }) orelse return error.PipelineCreateFailed;
-        const taa_buf = device.createBuffer(&.{
-            .label = wgpu.StringView.fromSlice("taa params"),
-            .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
-            .size = @sizeOf(TaaParams),
-        }) orelse return error.BufferCreateFailed;
-
+        // Post-processing chain (bloom/DoF/tonemap/exposure/SSAO/SSR/TAA) — see PostResources.
+        const post = try createPostResources(device, surface_format);
         return .{
             .allocator = allocator,
             .device = device,
             .surface_format = surface_format,
             .mesh_cache = MeshCache.init(device, allocator),
             .instance_pool = InstancePool.init(allocator),
-            .bloom_down_pipeline = bloom_down_pipeline,
-            .bloom_up_pipeline = bloom_up_pipeline,
-            .dof_pipeline = dof_pipeline,
-            .tonemap_pipeline = tonemap_pipeline,
-            .ssao_pipeline = ssao_pipeline,
-            .ssr_pipeline = ssr_pipeline,
-            .taa_pipeline = taa_pipeline,
-            .exposure_pipeline = exposure_pipeline,
-            .exposure_bgl = exposure_bgl,
-            .exposure_buf = exposure_buf,
-            .post_bgl = post_bgl,
-            .ssao_bgl = ssao_bgl,
-            .bloom_up_bgl = bloom_up_bgl,
-            .dof_bgl = dof_bgl,
-            .tonemap_bgl = tonemap_bgl,
-            .ssr_bgl = ssr_bgl,
-            .taa_bgl = taa_bgl,
-            .post_sampler = post_sampler,
-            .bloom_down_first_buf = bloom_down_first_buf,
-            .bloom_down_rest_buf = bloom_down_rest_buf,
-            .dof_buf = dof_buf,
-            .tonemap_buf = tonemap_buf,
-            .ssao_buf = ssao_buf,
-            .ssr_buf = ssr_buf,
-            .taa_buf = taa_buf,
+            .bloom_down_pipeline = post.bloom_down_pipeline,
+            .bloom_up_pipeline = post.bloom_up_pipeline,
+            .dof_pipeline = post.dof_pipeline,
+            .tonemap_pipeline = post.tonemap_pipeline,
+            .ssao_pipeline = post.ssao_pipeline,
+            .ssr_pipeline = post.ssr_pipeline,
+            .taa_pipeline = post.taa_pipeline,
+            .exposure_pipeline = post.exposure_pipeline,
+            .exposure_bgl = post.exposure_bgl,
+            .exposure_buf = post.exposure_buf,
+            .post_bgl = post.post_bgl,
+            .ssao_bgl = post.ssao_bgl,
+            .bloom_up_bgl = post.bloom_up_bgl,
+            .dof_bgl = post.dof_bgl,
+            .tonemap_bgl = post.tonemap_bgl,
+            .ssr_bgl = post.ssr_bgl,
+            .taa_bgl = post.taa_bgl,
+            .post_sampler = post.post_sampler,
+            .bloom_down_first_buf = post.bloom_down_first_buf,
+            .bloom_down_rest_buf = post.bloom_down_rest_buf,
+            .dof_buf = post.dof_buf,
+            .tonemap_buf = post.tonemap_buf,
+            .ssao_buf = post.ssao_buf,
+            .ssr_buf = post.ssr_buf,
+            .taa_buf = post.taa_buf,
             .pipeline = pipeline,
             .pipeline_double_sided = pipeline_double_sided,
             .transparent_pipeline = transparent_pipeline,
