@@ -779,11 +779,12 @@ pub fn build(b: *std.Build) void {
     ffi_tests.use_llvm = true; // same self-hosted-backend crash the shared library works around
     const run_ffi_tests = b.addRunArtifact(ffi_tests);
 
-    // Headless WGSL validation. Shaders are compiled by naga at RUNTIME, so a broken one builds
+    // Headless GPU checks. Shaders are compiled by naga at RUNTIME, so a broken one builds
     // clean and fails on the first frame that draws it — see tools/check_shaders.zig. Needs an
-    // adapter; skips (exit 0) with a notice where there is none, so it is safe in CI.
+    // adapter; skips (exit 0) with a notice where there is none, so it is safe in CI. Also asserts
+    // the unaligned-writeTexture contract the image upload paths rely on.
     const shader_check_mod = b.createModule(.{
-        .root_source_file = b.path("tools/check_shaders.zig"),
+        .root_source_file = b.path("tools/check_gpu.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -791,13 +792,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wgpu", .module = wgpu_mod },
         },
     });
-    const shader_check = b.addExecutable(.{ .name = "check-shaders", .root_module = shader_check_mod });
+    const shader_check = b.addExecutable(.{ .name = "check-gpu", .root_module = shader_check_mod });
     shader_check.use_llvm = true; // same self-hosted-backend crash the shared library works around
     linkWgpuNative(b, shader_check_mod, target);
     const run_shader_check = b.addRunArtifact(shader_check);
     // Reads src/renderer/shaders/ in its own test; run from the build root either way.
     run_shader_check.setCwd(b.path("."));
-    const shader_check_step = b.step("check-shaders", "Compile every WGSL shader headlessly (naga validation)");
+    const shader_check_step = b.step("check-gpu", "Headless GPU checks: compile every WGSL shader, verify the texture row-pitch contract");
     shader_check_step.dependOn(&run_shader_check.step);
 
     const shader_check_tests = b.addTest(.{ .root_module = shader_check_mod });

@@ -1,4 +1,7 @@
-//! Headless WGSL validation — `zig build check-shaders`.
+//! Headless GPU checks — `zig build check-gpu`.
+//!
+//! Two things, on one throwaway device: every WGSL shader compiles, and the texture row-pitch
+//! contract three upload paths depend on actually holds.
 //!
 //! Every `.wgsl` in this engine is compiled by wgpu-native's embedded naga at **runtime**, on the
 //! first frame that uses it. A broken shader therefore builds perfectly and fails in front of a
@@ -13,6 +16,13 @@
 //!
 //! Requires a working adapter (a GPU, or a software rasteriser such as lavapipe). Where none is
 //! available it exits 0 with a notice rather than failing a build that has nothing to do with it.
+//! The row-pitch check exists because `updateCachedImage`, `createImageTexture` and
+//! `uploadMipLevel` each used to repack unaligned images into a 256-byte-aligned staging buffer —
+//! an allocation, a per-row memcpy and a memset per upload, for any width that is not a multiple
+//! of 64 px. That alignment rule is real, but it governs buffer<->texture COPIES, not
+//! `queue.writeTexture`, which takes the row pitch as given. Removing the staging is only safe as
+//! long as that stays true, so it is asserted here rather than assumed.
+//!
 //! See docs/v2-design.md §5.3.
 
 const std = @import("std");
@@ -79,7 +89,7 @@ pub fn main() !u8 {
     wgpu.setLogLevel(.warn);
 
     const instance = wgpu.Instance.create(null) orelse {
-        std.debug.print("check-shaders: no wgpu instance available — skipping\n", .{});
+        std.debug.print("check-gpu: no wgpu instance available — skipping\n", .{});
         return 0;
     };
     defer instance.release();
@@ -89,7 +99,7 @@ pub fn main() !u8 {
     var adapter_opts = wgpu.RequestAdapterOptions{ .compatible_surface = null };
     const adapter_resp = instance.requestAdapterSync(&adapter_opts, 5_000_000);
     const adapter = adapter_resp.adapter orelse {
-        std.debug.print("check-shaders: no GPU adapter (need a GPU or lavapipe) — skipping\n", .{});
+        std.debug.print("check-gpu: no GPU adapter (need a GPU or lavapipe) — skipping\n", .{});
         return 0;
     };
     defer adapter.release();
@@ -101,7 +111,7 @@ pub fn main() !u8 {
     };
     const device_resp = adapter.requestDeviceSync(instance, &device_desc, 5_000_000);
     const device = device_resp.device orelse {
-        std.debug.print("check-shaders: no wgpu device — skipping\n", .{});
+        std.debug.print("check-gpu: no wgpu device — skipping\n", .{});
         return 0;
     };
     defer device.release();
@@ -122,11 +132,108 @@ pub fn main() !u8 {
     current_shader = "";
 
     if (failures != 0) {
-        std.debug.print("check-shaders: {d} shader diagnostic(s) across {d} shaders\n", .{ failures, shaders.len });
+        std.debug.print("check-gpu: {d} shader diagnostic(s) across {d} shaders\n", .{ failures, shaders.len });
         return 1;
     }
-    std.debug.print("check-shaders: {d} shaders compiled clean\n", .{shaders.len});
+    std.debug.print("check-gpu: {d} shaders compiled clean\n", .{shaders.len});
+
+    const queue = device.getQueue() orelse {
+        std.debug.print("check-gpu: no queue — skipping the row-pitch check\n", .{});
+        return 0;
+    };
+    const pitch_mismatches = checkUnalignedRowPitch(device, queue) catch |err| {
+        std.debug.print("check-gpu: row-pitch check failed: {}\n", .{err});
+        return 1;
+    };
+    if (failures != 0 or pitch_mismatches != 0) {
+        std.debug.print(
+            "check-gpu: unaligned writeTexture is NOT safe here ({d} error(s), {d} byte mismatch(es)) —\n" ++
+                "  the staging removal in wgpu.zig/wgpu_3d.zig must be reverted\n",
+            .{ failures, pitch_mismatches },
+        );
+        return 1;
+    }
+    std.debug.print("check-gpu: unaligned writeTexture round-trips byte-exact\n", .{});
     return 0;
+}
+
+/// Write a texture whose row pitch is deliberately not a multiple of 256, read it back, and
+/// compare every byte. Returns the mismatch count.
+fn checkUnalignedRowPitch(device: *wgpu.Device, queue: *wgpu.Queue) !u32 {
+    const w: u32 = 100; // 400 bytes/row
+    const h: u32 = 10;
+    std.debug.assert((w * 4) % 256 != 0);
+
+    const tex = device.createTexture(&.{
+        .label = wgpu.StringView.fromSlice("row-pitch probe"),
+        .usage = wgpu.TextureUsages.texture_binding | wgpu.TextureUsages.copy_dst | wgpu.TextureUsages.copy_src,
+        .dimension = .@"2d",
+        .size = .{ .width = w, .height = h, .depth_or_array_layers = 1 },
+        .format = .rgba8_unorm,
+        .mip_level_count = 1,
+        .sample_count = 1,
+    }) orelse return error.CreateTextureFailed;
+    defer tex.release();
+
+    // Every pixel distinct, so a pitch mistake shows up as shifted data rather than passing.
+    var pixels: [w * h * 4]u8 = undefined;
+    for (0..h) |y| for (0..w) |x| {
+        const i = (y * w + x) * 4;
+        pixels[i + 0] = @intCast(x);
+        pixels[i + 1] = @intCast(y);
+        pixels[i + 2] = @intCast((x *% 7 +% y *% 13) & 0xff);
+        pixels[i + 3] = 0xff;
+    };
+    queue.writeTexture(
+        &.{ .texture = tex, .mip_level = 0, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = .all },
+        &pixels,
+        pixels.len,
+        &.{ .offset = 0, .bytes_per_row = w * 4, .rows_per_image = h },
+        &.{ .width = w, .height = h, .depth_or_array_layers = 1 },
+    );
+
+    // copyTextureToBuffer DOES require the 256-byte pitch, so the readback pads.
+    const dst_stride: u32 = std.mem.alignForward(u32, w * 4, 256);
+    const buf = device.createBuffer(&.{
+        .label = wgpu.StringView.fromSlice("row-pitch readback"),
+        .usage = wgpu.BufferUsages.copy_dst | wgpu.BufferUsages.map_read,
+        .size = @as(u64, dst_stride) * h,
+        .mapped_at_creation = @intFromBool(false),
+    }) orelse return error.CreateBufferFailed;
+    defer buf.release();
+
+    const enc = device.createCommandEncoder(&.{ .label = wgpu.StringView.fromSlice("row-pitch enc") }) orelse
+        return error.CreateEncoderFailed;
+    enc.copyTextureToBuffer(
+        &.{ .texture = tex, .mip_level = 0, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = .all },
+        &.{ .buffer = buf, .layout = .{ .offset = 0, .bytes_per_row = dst_stride, .rows_per_image = h } },
+        &.{ .width = w, .height = h, .depth_or_array_layers = 1 },
+    );
+    const cmd = enc.finish(&.{ .label = wgpu.StringView.fromSlice("row-pitch cmd") }) orelse
+        return error.FinishFailed;
+    queue.submit(&.{cmd});
+
+    const Ctx = struct {
+        var done: bool = false;
+        var ok: bool = false;
+        fn cb(status: wgpu.MapAsyncStatus, msg: wgpu.StringView, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+            _ = msg;
+            ok = status == .success;
+            done = true;
+        }
+    };
+    _ = buf.mapAsync(wgpu.MapModes.read, 0, @as(usize, dst_stride) * h, .{ .callback = Ctx.cb });
+    var guard: u32 = 0;
+    while (!Ctx.done and guard < 100_000) : (guard += 1) _ = device.poll(true, null);
+    if (!Ctx.ok) return error.MapFailed;
+
+    const mapped = buf.getConstMappedRange(0, @as(usize, dst_stride) * h) orelse return error.MapRangeFailed;
+    const bytes: [*]const u8 = @ptrCast(mapped);
+    var mismatches: u32 = 0;
+    for (0..h) |y| for (0..w * 4) |b| {
+        if (bytes[y * dst_stride + b] != pixels[y * w * 4 + b]) mismatches += 1;
+    };
+    return mismatches;
 }
 
 fn wgpuLog(level: wgpu.LogLevel, message: wgpu.StringView, userdata: ?*anyopaque) callconv(.c) void {

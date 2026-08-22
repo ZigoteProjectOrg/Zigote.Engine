@@ -2965,7 +2965,7 @@ pub const Gpu3d = struct {
 
         var level: u32 = 0;
         while (true) : (level += 1) {
-            try self.uploadMipLevel(queue, texture, level, cur_w, cur_h, cur);
+            try uploadMipLevel(queue, texture, level, cur_w, cur_h, cur);
             if (level + 1 >= mip_count) break;
 
             const nw = @max(@as(u32, 1), cur_w / 2);
@@ -2983,7 +2983,6 @@ pub const Gpu3d = struct {
 
     /// Upload one tightly-packed RGBA8 mip level, honouring wgpu's 256-byte row alignment.
     fn uploadMipLevel(
-        self: *Gpu3d,
         queue: *wgpu.Queue,
         texture: *wgpu.Texture,
         level: u32,
@@ -2991,38 +2990,18 @@ pub const Gpu3d = struct {
         height: u32,
         pixels: []const u8,
     ) !void {
+        // Straight from the source at its own pitch. The 256-byte row alignment WebGPU requires is
+        // a rule for buffer<->texture copies, not for queue.writeTexture, which takes the pitch as
+        // given. This used to allocate a staging buffer and memcpy+memset every row for any mip
+        // whose width was not a multiple of 64 px — which, down a mip chain, is most of them. The
+        // glyph atlas and sprite uploads have always written unaligned rows directly on every
+        // backend the engine ships, which is what shows the staging was never doing anything.
         const src_stride = @as(usize, width) * 4;
-        const bytes_per_row = std.mem.alignForward(usize, src_stride, 256);
-
-        // Row stride already 256-aligned: upload straight from the source, no staging copy.
-        // With a full mip chain this otherwise allocates + zero-fills once per level.
-        if (bytes_per_row == src_stride) {
-            queue.writeTexture(
-                &.{ .texture = texture, .mip_level = level, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = .all },
-                pixels.ptr,
-                src_stride * @as(usize, height),
-                &.{ .offset = 0, .bytes_per_row = @intCast(bytes_per_row), .rows_per_image = height },
-                &.{ .width = width, .height = height, .depth_or_array_layers = 1 },
-            );
-            return;
-        }
-
-        const upload = try self.allocator.alloc(u8, bytes_per_row * @as(usize, height));
-        defer self.allocator.free(upload);
-
-        var row: usize = 0;
-        while (row < height) : (row += 1) {
-            const src_start = row * src_stride;
-            const dst_start = row * bytes_per_row;
-            @memcpy(upload[dst_start .. dst_start + src_stride], pixels[src_start .. src_start + src_stride]);
-            @memset(upload[dst_start + src_stride .. dst_start + bytes_per_row], 0);
-        }
-
         queue.writeTexture(
             &.{ .texture = texture, .mip_level = level, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = .all },
-            upload.ptr,
-            upload.len,
-            &.{ .offset = 0, .bytes_per_row = @intCast(bytes_per_row), .rows_per_image = height },
+            pixels.ptr,
+            src_stride * @as(usize, height),
+            &.{ .offset = 0, .bytes_per_row = @intCast(src_stride), .rows_per_image = height },
             &.{ .width = width, .height = height, .depth_or_array_layers = 1 },
         );
     }

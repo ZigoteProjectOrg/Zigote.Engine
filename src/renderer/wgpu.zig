@@ -607,31 +607,14 @@ pub const GpuUi = struct {
         const rows: u32 = bottom - top;
         const band = pixels[@as(usize, top) * src_stride ..][0 .. @as(usize, rows) * src_stride];
 
-        // wgpu wants rows aligned to 256 bytes; a frame whose width already satisfies that (every
-        // multiple of 64 px — 1280, 1920, 3840) uploads straight from the caller's buffer with no
-        // staging copy at all.
-        const bytes_per_row = std.mem.alignForward(usize, src_stride, 256);
-        if (bytes_per_row == src_stride) {
-            writeImageRows(queue, cached.texture, band, bytes_per_row, width, rows, top);
-            return true;
-        }
-
-        // Not aligned: repack into a staging buffer whose rows are. `src_stride` may carry the
-        // producer's padding, so copy width*4 out of each row and leave the rest zeroed.
-        const row_bytes = @as(usize, width) * 4;
-
-        const staging = self.allocator.alloc(u8, bytes_per_row * @as(usize, rows)) catch return false;
-        defer self.allocator.free(staging);
-        var row: usize = 0;
-        while (row < rows) : (row += 1) {
-            const src_start = row * src_stride;
-            const dst = staging[row * bytes_per_row ..][0..bytes_per_row];
-            @memcpy(dst[0..row_bytes], band[src_start..][0..row_bytes]);
-            // Zero only the padding tail — the old full-buffer @memset cleared bytes the row
-            // copies above immediately overwrote.
-            @memset(dst[row_bytes..], 0);
-        }
-        writeImageRows(queue, cached.texture, staging, bytes_per_row, width, rows, top);
+        // Upload straight from the caller's buffer. The 256-byte row alignment that WebGPU
+        // requires applies to buffer<->texture COPIES, not to queue.writeTexture, which takes the
+        // row pitch as given — so `src_stride` goes through as-is, producer padding included.
+        // This used to repack every unaligned image into a staging buffer (an allocation, a
+        // per-row memcpy and a memset per upload) for any width that was not a multiple of 64 px.
+        // The glyph atlas and the sprite path have always written unaligned rows directly, on
+        // every backend this engine ships, which is the proof that the staging was never needed.
+        writeImageRows(queue, cached.texture, band, src_stride, width, rows, top);
         return true;
     }
 
@@ -2158,7 +2141,7 @@ fn appendPaintOps(
                 // require a bind group that does not exist.
                 var image_bg: ?*wgpu.BindGroup = null;
                 if (se.image_key) |key| {
-                    const resolved = createImageBatch(device, queue, allocator, .{
+                    const resolved = createImageBatch(device, queue, .{
                         .bounds = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
                         .width = se.image_width,
                         .height = se.image_height,
@@ -2383,7 +2366,7 @@ fn appendPaintOps(
             },
 
             .image => |image| {
-                var batch = try createImageBatch(device, queue, allocator, image, gpu_ui, current_clip, current_clip_offset);
+                var batch = try createImageBatch(device, queue, image, gpu_ui, current_clip, current_clip_offset);
                 errdefer batch.deinit();
                 const start_len = frame.image_vertices.items.len;
                 try appendImage(
@@ -2947,7 +2930,6 @@ fn createCustomShaderPipeline(
 fn createImageBatch(
     device: *wgpu.Device,
     queue: *wgpu.Queue,
-    allocator: std.mem.Allocator,
     image: zg.paint.Image,
     gpu_ui: *GpuUi,
     clip_rect: ?zg.Rect,
@@ -2967,7 +2949,7 @@ fn createImageBatch(
         };
     }
 
-    const texture = try createImageTexture(device, queue, allocator, image);
+    const texture = try createImageTexture(device, queue, image);
     errdefer texture.release();
 
     const texture_view = texture.createView(null) orelse return error.WgpuImageTextureViewUnavailable;
@@ -3026,10 +3008,11 @@ fn createImageBatch(
     };
 }
 
+/// Create a GPU texture from decoded pixels and upload them. Allocates nothing: the pixels go to
+/// the queue at their source pitch.
 fn createImageTexture(
     device: *wgpu.Device,
     queue: *wgpu.Queue,
-    allocator: std.mem.Allocator,
     image: zg.paint.Image,
 ) !*wgpu.Texture {
     if (image.width == 0 or image.height == 0) return error.WgpuImageTextureUnavailable;
@@ -3059,11 +3042,11 @@ fn createImageTexture(
         .sample_count = 1,
     }) orelse return error.WgpuImageTextureUnavailable;
 
-    const bytes_per_row = std.mem.alignForward(usize, src_stride, 256);
-
-    // Already 256-aligned (any width that's a multiple of 64 px): upload straight from the decoded
-    // pixels — no staging alloc, no zero-fill, no per-row copy.
-    if (bytes_per_row == src_stride) {
+    // Straight from the decoded pixels at the source pitch: queue.writeTexture imposes no row
+    // alignment (that rule is for buffer<->texture copies), so the former staging repack for
+    // non-multiple-of-64 widths is gone. See updateCachedImage for the full note.
+    {
+        const bytes_per_row = src_stride;
         queue.writeTexture(
             &.{
                 .texture = texture,
@@ -3084,46 +3067,13 @@ fn createImageTexture(
                 .depth_or_array_layers = 1,
             },
         );
-        return texture;
     }
-
-    const upload = try allocator.alloc(u8, bytes_per_row * @as(usize, image.height));
-    var row: usize = 0;
-    while (row < image.height) : (row += 1) {
-        const src_start = row * src_stride;
-        const dst_start = row * bytes_per_row;
-        @memcpy(upload[dst_start .. dst_start + row_bytes], image.pixels[src_start .. src_start + row_bytes]);
-        // Zero only the padding tail — the old full @memset cleared the whole buffer and the
-        // copies above overwrote most of it again.
-        @memset(upload[dst_start + row_bytes .. dst_start + bytes_per_row], 0);
-    }
-
-    queue.writeTexture(
-        &.{
-            .texture = texture,
-            .mip_level = 0,
-            .origin = .{ .x = 0, .y = 0, .z = 0 },
-            .aspect = .all,
-        },
-        upload.ptr,
-        upload.len,
-        &.{
-            .offset = 0,
-            .bytes_per_row = @intCast(bytes_per_row),
-            .rows_per_image = image.height,
-        },
-        &.{
-            .width = image.width,
-            .height = image.height,
-            .depth_or_array_layers = 1,
-        },
-    );
 
     return texture;
 }
 
-/// The `queue.writeTexture` call shared by the create and update paths. `rows` is already padded to
-/// `bytes_per_row`.
+/// The `queue.writeTexture` call shared by the create and update paths. `bytes_per_row` is the
+/// source pitch as-is — writeTexture needs no particular row alignment.
 fn writeImageRows(
     queue: *wgpu.Queue,
     texture: *wgpu.Texture,
