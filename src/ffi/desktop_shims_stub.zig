@@ -1,5 +1,5 @@
-//! No-op stands-in for the macOS-only Objective-C platform shims (native menu bar, OS drag-out),
-//! compiled on every NON-macOS target so the FFI surface is identical everywhere.
+//! No-op stands-in for the macOS-only Objective-C platform shims (native menu bar, OS drag-out,
+//! status-bar tray), compiled on every NON-macOS target so the FFI surface is identical everywhere.
 //!
 //! Why this exists rather than "the caller just doesn't call them": the C# bindings are generated
 //! from the export list and are therefore platform-independent, and on iOS the engine is linked
@@ -8,9 +8,17 @@
 //! it. The managed side already gates these behind OperatingSystem.IsMacOS(), so these bodies are
 //! never entered — they exist to satisfy the linker.
 //!
-//! Behaviour matches "the platform has no such feature": menu operations do nothing, menu
+//! Behaviour matches "the platform has no such feature": menu and tray operations do nothing, menu
 //! creation yields a null handle, and the OS drag-out reports that it did not take the drag (0),
 //! which is exactly what the C# side treats as "fall back to the in-app drag".
+//!
+//! The tray entries were missing until the option matrix was first compiled: `zigote_mactray_*` is
+//! P/Invoked unconditionally from Zigote.Core/Native/NativeMenu.cs but had no definition outside
+//! macOS, so `libzigote.so` and `zigote.dll` simply did not export it. On desktop that survives
+//! only because the managed side gates on OperatingSystem.IsMacOS() and lazy binding never
+//! resolves the symbol; on iOS, where the engine is linked statically, it is a link error whether
+//! or not anything calls it — which is exactly what the note above says this file exists to
+//! prevent. See docs/v2-design.md §5.2.
 
 const std = @import("std");
 
@@ -72,3 +80,23 @@ export fn zigote_macdrag_begin(text: [*c]const u8, files_nl: [*c]const u8) i32 {
     _ = files_nl;
     return 0;
 }
+
+// ── Status-bar tray (macos_tray.m) ────────────────────────────────────────────
+
+export fn zigote_mactray_set_handler(cb: ?*const fn (i32) callconv(.c) void) void {
+    _ = cb;
+}
+
+export fn zigote_mactray_show(tooltip: [*c]const u8) void {
+    _ = tooltip;
+}
+
+export fn zigote_mactray_set_tooltip(tooltip: [*c]const u8) void {
+    _ = tooltip;
+}
+
+export fn zigote_mactray_set_menu(spec: [*c]const u8) void {
+    _ = spec;
+}
+
+export fn zigote_mactray_hide() void {}

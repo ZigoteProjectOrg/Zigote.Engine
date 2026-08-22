@@ -44,102 +44,123 @@ fn addAndroidSysrootPaths(b: *std.Build, mod: *std.Build.Module, target: std.Bui
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ "/usr/lib", arch_dir, "34" }) });
 }
 
-fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    const os = target.result.os.tag;
-    const arch = target.result.cpu.arch;
+/// One row per target the engine builds for: which prebuilt wgpu-native archive it needs, and what
+/// that archive's Rust/system dependencies are. The same nine-way matrix used to be spelled out as
+/// two switches inside `linkWgpuNative` and again in `build.zig.zon`'s lazy dependency list — and a
+/// third time, in MSBuild, in build/Zigote.Native.targets. It is data now, and `zig build
+/// print-targets` emits it so the other copies can be checked against one source.
+/// See docs/v2-design.md §5.1.
+const TargetSpec = struct {
+    /// Stable id, also the name printed by `print-targets`.
+    name: []const u8,
+    os: std.Target.Os.Tag,
+    arch: std.Target.Cpu.Arch,
+    /// Android is the `android` ABI of linux, not its own OS tag.
+    android: bool = false,
+    /// The iOS simulator is a distinct platform from the device, with its own archive.
+    simulator: bool = false,
+    /// Lazy dependency in build.zig.zon holding wgpu-native's prebuilt static archive.
+    wgpu_dep: []const u8,
+    /// Apple frameworks the wgpu archive pulls in (from `otool -L`).
+    frameworks: []const []const u8 = &.{},
+    /// System libraries the wgpu archive pulls in.
+    system_libs: []const []const u8 = &.{},
+};
 
-    const dep_name: []const u8 = switch (os) {
-        .macos => switch (arch) {
-            .aarch64 => "wgpu_macos_aarch64",
-            .x86_64 => "wgpu_macos_x86_64",
-            else => std.debug.panic("wgpu-native: unsupported macOS arch {s}", .{@tagName(arch)}),
-        },
-        .windows => switch (arch) {
-            .x86_64 => "wgpu_windows_x86_64",
-            else => std.debug.panic("wgpu-native: unsupported Windows arch {s}", .{@tagName(arch)}),
-        },
-        // Android is not its own OS tag — it is the `android` ABI of linux (aarch64-linux-android).
-        .linux => if (target.result.abi.isAndroid()) switch (arch) {
-            .aarch64 => "wgpu_android_aarch64",
-            .x86_64 => "wgpu_android_x86_64", // emulator
-            else => std.debug.panic("wgpu-native: unsupported Android arch {s}", .{@tagName(arch)}),
-        } else switch (arch) {
-            .x86_64 => "wgpu_linux_x86_64",
-            .aarch64 => "wgpu_linux_aarch64",
-            else => std.debug.panic("wgpu-native: unsupported Linux arch {s}", .{@tagName(arch)}),
-        },
-        // Device and simulator are distinct platforms with distinct archives; the simulator is
-        // selected by the `simulator` target ABI (aarch64-ios-simulator).
-        .ios => switch (arch) {
-            .aarch64 => if (target.result.abi == .simulator)
-                "wgpu_ios_aarch64_simulator"
-            else
-                "wgpu_ios_aarch64",
-            else => std.debug.panic("wgpu-native: unsupported iOS arch {s}", .{@tagName(arch)}),
-        },
-        else => std.debug.panic("wgpu-native: unsupported OS {s}", .{@tagName(os)}),
-    };
+const apple_wgpu_frameworks = [_][]const u8{ "Metal", "QuartzCore", "Foundation", "CoreFoundation" };
+
+const target_specs = [_]TargetSpec{
+    // macOS: Metal/QuartzCore/Foundation/CoreFoundation + libobjc + libiconv.
+    .{
+        .name = "macos-aarch64",       .os = .macos, .arch = .aarch64,
+        .wgpu_dep = "wgpu_macos_aarch64",
+        .frameworks = &apple_wgpu_frameworks, .system_libs = &.{ "objc", "iconv" },
+    },
+    .{
+        .name = "macos-x86_64",        .os = .macos, .arch = .x86_64,
+        .wgpu_dep = "wgpu_macos_x86_64",
+        .frameworks = &apple_wgpu_frameworks, .system_libs = &.{ "objc", "iconv" },
+    },
+    // iOS: the same Metal stack, no iconv — the iOS archive does not pull it.
+    .{
+        .name = "ios-aarch64",         .os = .ios,   .arch = .aarch64,
+        .wgpu_dep = "wgpu_ios_aarch64",
+        .frameworks = &apple_wgpu_frameworks, .system_libs = &.{"objc"},
+    },
+    .{
+        .name = "ios-aarch64-sim",     .os = .ios,   .arch = .aarch64, .simulator = true,
+        .wgpu_dep = "wgpu_ios_aarch64_simulator",
+        .frameworks = &apple_wgpu_frameworks, .system_libs = &.{"objc"},
+    },
+    // Android: Vulkan is dlopen'd at runtime; the hard deps are the NDK log and android
+    // (ANativeWindow) libs. bionic keeps dlopen in its own library, which SDL's loadso path needs
+    // — linked here rather than on the SDL archive, where zig would record it as an archive member
+    // and the final link would warn. bionic does not export the _Unwind_* set the Rust panic path
+    // references, so zig supplies it from its bundled LLVM libunwind.
+    .{
+        .name = "android-aarch64",     .os = .linux, .arch = .aarch64, .android = true,
+        .wgpu_dep = "wgpu_android_aarch64",
+        .system_libs = &.{ "log", "android", "dl", "unwind" },
+    },
+    .{
+        .name = "android-x86_64",      .os = .linux, .arch = .x86_64,  .android = true,
+        .wgpu_dep = "wgpu_android_x86_64", // emulator
+        .system_libs = &.{ "log", "android", "dl", "unwind" },
+    },
+    // Linux: link_libc already covers pthread/dl/m; Rust's panic path needs unwind.
+    .{
+        .name = "linux-x86_64",        .os = .linux, .arch = .x86_64,
+        .wgpu_dep = "wgpu_linux_x86_64",  .system_libs = &.{"unwind"},
+    },
+    .{
+        .name = "linux-aarch64",       .os = .linux, .arch = .aarch64,
+        .wgpu_dep = "wgpu_linux_aarch64", .system_libs = &.{"unwind"},
+    },
+    // Windows links wgpu_native.dll's import lib, so the DLL resolves its own d3d12/dxgi/WinRT/CRT
+    // dependencies at load and there is nothing extra to link statically.
+    .{
+        .name = "windows-x86_64",      .os = .windows, .arch = .x86_64,
+        .wgpu_dep = "wgpu_windows_x86_64",
+    },
+};
+
+fn specFor(t: std.Target) ?TargetSpec {
+    const is_android = t.abi.isAndroid();
+    const is_sim = t.os.tag == .ios and t.abi == .simulator;
+    for (target_specs) |spec| {
+        if (spec.os == t.os.tag and spec.arch == t.cpu.arch and
+            spec.android == is_android and spec.simulator == is_sim) return spec;
+    }
+    return null;
+}
+
+fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+    const t = target.result;
+    const spec = specFor(t) orelse std.debug.panic(
+        "wgpu-native: unsupported target {s}-{s}{s} — add a row to target_specs in build.zig",
+        .{ @tagName(t.cpu.arch), @tagName(t.os.tag), if (t.abi.isAndroid()) "-android" else "" },
+    );
 
     // The Zig binding (libraries/wgpu) is pure `extern fn` — no @cImport — so only the static
     // archive is needed to resolve symbols; the bundled headers are not added to the include path.
-    if (b.lazyDependency(dep_name, .{})) |dep| {
+    if (b.lazyDependency(spec.wgpu_dep, .{})) |dep| {
         // Windows links wgpu-native's DLL import lib, not its static .lib: the static MSVC archive
         // drags in the full MSVC CRT + WinRT/d3dcompiler import libs MinGW lacks, so it can't link a
         // `windows-gnu` cross-build (the only Windows target that cross-compiles from macOS/Linux,
         // since `windows-msvc` needs the MSVC SDK). The import lib pulls only the C exports;
         // wgpu_native.dll self-resolves d3d12/dxgi/CRT at load and is installed next to zigote.dll.
-        const lib_path = if (os == .windows) "lib/wgpu_native.dll.lib" else "lib/libwgpu_native.a";
+        const lib_path = if (t.os.tag == .windows) "lib/wgpu_native.dll.lib" else "lib/libwgpu_native.a";
         mod.addObjectFile(dep.path(lib_path));
         // wgpu_native.dll itself is installed next to zigote.dll by `installWgpuDll` in build().
     }
 
-    // Transitive system dependencies of the wgpu-native static archive.
-    switch (os) {
-        .macos => {
-            // From `otool -L libwgpu_native.dylib`: Metal/QuartzCore/Foundation/CoreFoundation +
-            // libobjc + libiconv. (Metal/QuartzCore/Foundation are also linked for the Metal backend;
-            // frameworks dedupe.)
-            mod.linkFramework("Metal", .{});
-            mod.linkFramework("QuartzCore", .{});
-            mod.linkFramework("Foundation", .{});
-            mod.linkFramework("CoreFoundation", .{});
-            mod.linkSystemLibrary("objc", .{});
-            mod.linkSystemLibrary("iconv", .{});
-            addAppleSdkPaths(b, mod);
-        },
-        .linux => if (target.result.abi.isAndroid()) {
-            // Vulkan is dlopen'd at runtime; the archive's hard deps are the NDK log and
-            // android (ANativeWindow) libs, resolved against the NDK sysroot.
-            mod.linkSystemLibrary("log", .{});
-            mod.linkSystemLibrary("android", .{});
-            // bionic keeps dlopen in its own library; SDL's loadso path needs it. Linked here
-            // rather than on the SDL static archive, where zig would record it as an archive
-            // member and the final link would warn about it.
-            mod.linkSystemLibrary("dl", .{});
-            // The wgpu archive's Rust panic path references the _Unwind_* set, which bionic does
-            // not export; zig satisfies it from its bundled LLVM libunwind.
-            mod.linkSystemLibrary("unwind", .{});
-            addAndroidSysrootPaths(b, mod, target);
-        } else {
-            // libc (link_libc) already covers pthread/dl/m; Rust's panic/unwind path needs unwind.
-            mod.linkSystemLibrary("unwind", .{});
-        },
-        .windows => {
-            // Using wgpu_native.dll's import lib (above), so the DLL resolves its own d3d12/dxgi/
-            // WinRT/CRT dependencies at load — nothing extra to link statically here.
-        },
-        .ios => {
-            // Same Metal stack as macOS, resolved against the iOS SDK sysroot. No iconv — the
-            // iOS archive doesn't pull it.
-            mod.linkFramework("Metal", .{});
-            mod.linkFramework("QuartzCore", .{});
-            mod.linkFramework("Foundation", .{});
-            mod.linkFramework("CoreFoundation", .{});
-            mod.linkSystemLibrary("objc", .{});
-            addAppleSdkPaths(b, mod);
-        },
-        else => {},
-    }
+    for (spec.frameworks) |f| mod.linkFramework(f, .{});
+    for (spec.system_libs) |l| mod.linkSystemLibrary(l, .{});
+
+    // Per-platform sysroot wiring: neither Apple's nor the NDK's search paths are derived from
+    // --sysroot alone.
+    if (t.os.tag.isDarwin()) addAppleSdkPaths(b, mod);
+    if (t.abi.isAndroid()) addAndroidSysrootPaths(b, mod, target);
 }
 
 /// Decode-only source set for the vendored libwebp (libraries/libwebp), taken from upstream's
@@ -411,6 +432,21 @@ fn linkNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resol
 }
 
 pub fn build(b: *std.Build) void {
+    // The toolchain is pinned in .zigversion, which build/Zigote.Native.targets also reads, so the
+    // C# build and this one cannot disagree about which zig they mean. `minimum_zig_version` in
+    // build.zig.zon only sets a floor; this pins the exact version, because the engine tracks a
+    // language and std that still move between point releases (this file has already worked around
+    // two self-hosted-backend bugs).
+    comptime {
+        const pinned = @embedFile(".zigversion");
+        const want = std.mem.trim(u8, pinned, " \r\n\t");
+        const have = @import("builtin").zig_version_string;
+        if (!std.mem.eql(u8, want, have)) {
+            @compileError("zig " ++ want ++ " is pinned in .zigversion but this is zig " ++ have ++
+                " — install the pinned version, or update .zigversion deliberately");
+        }
+    }
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -777,6 +813,62 @@ pub fn build(b: *std.Build) void {
     // clean and fails on the first frame that draws it — see tools/check_shaders.zig. Needs an
     // adapter; skips (exit 0) with a notice where there is none, so it is safe in CI. Also asserts
     // the unaligned-writeTexture contract the image upload paths rely on.
+    // Every combination of the three feature options, compiled. The lean configurations are the
+    // ones that ship — both mobile heads and every game export build with -Denable3d=false, and
+    // exports also drop physics — yet only the all-on default was ever compiled here, so a stub
+    // that stopped matching its real counterpart broke a shipping build and nothing else. Eight
+    // sub-builds, each cached, so a no-op run costs seconds.
+    //
+    // These shell out rather than adding eight artifacts to this graph: the options are attached
+    // to `ffi_mod`, and one module can carry only one set of them.
+    // Emit the target table as JSON. build/Zigote.Native.targets derives the same nine-way matrix
+    // independently in MSBuild (RID -> OS -> zig triple -> native lib name); this gives that a
+    // single source to be reconciled against, and makes the supported set greppable.
+    {
+        var json: []const u8 = "[\n";
+        for (target_specs, 0..) |spec, i| {
+            json = b.fmt(
+                "{s}  {{\"name\":\"{s}\",\"os\":\"{s}\",\"arch\":\"{s}\"," ++
+                    "\"android\":{},\"simulator\":{},\"wgpu_dep\":\"{s}\"}}{s}",
+                .{
+                    json,         spec.name,      @tagName(spec.os), @tagName(spec.arch),
+                    spec.android, spec.simulator, spec.wgpu_dep,
+                    if (i + 1 < target_specs.len) ",\n" else "\n",
+                },
+            );
+        }
+        json = b.fmt("{s}]\n", .{json});
+        const print_targets = b.addSystemCommand(&.{ "printf", "%s", json });
+        b.step("print-targets", "Print the supported build targets as JSON").dependOn(&print_targets.step);
+    }
+
+    const matrix_step = b.step("check-matrix", "Compile shared-lib in every -Denable3d/-Dphysics3d/-Decs combination");
+    for ([_]bool{ true, false }) |d3| {
+        for ([_]bool{ true, false }) |phys| {
+            for ([_]bool{ true, false }) |ecs| {
+                const run = b.addSystemCommand(&.{
+                    b.graph.zig_exe,
+                    "build",
+                    "shared-lib",
+                    b.fmt("-Denable3d={s}", .{if (d3) "true" else "false"}),
+                    b.fmt("-Dphysics3d={s}", .{if (phys) "true" else "false"}),
+                    b.fmt("-Decs={s}", .{if (ecs) "true" else "false"}),
+                    // Keep each configuration's artifacts out of the others' way and out of the
+                    // main zig-out, which the C# build consumes.
+                    "-p",
+                    b.fmt("zig-out/matrix/{s}{s}{s}", .{
+                        if (d3) "3" else "-",
+                        if (phys) "p" else "-",
+                        if (ecs) "e" else "-",
+                    }),
+                });
+                run.setName(b.fmt("check-matrix 3d={} physics={} ecs={}", .{ d3, phys, ecs }));
+                run.setCwd(b.path("."));
+                matrix_step.dependOn(&run.step);
+            }
+        }
+    }
+
     const shader_check_mod = b.createModule(.{
         .root_source_file = b.path("tools/check_gpu.zig"),
         .target = target,

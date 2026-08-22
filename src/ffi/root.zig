@@ -31,9 +31,18 @@ const audio_ffi = @import("audio.zig");
 // The `zigote_ecs_*` C-ABI exports live in ecs.zig (moved out of root.zig). Force-reference the
 // module so its `export fn`s are analyzed and linked — an unreferenced `@import` can be lazily skipped.
 // Gated by -Decs (default on): a pure-UI app that never touches World/ECS drops flecs entirely
-// (ecs.zig isn't referenced → not compiled → flecs not linked; see build.zig).
+// (ecs.zig isn't referenced → not compiled → flecs not linked; see build.zig) while keeping the
+// export surface via ecs_stub.zig.
 comptime {
-    if (@import("build_options").enable_ecs) _ = @import("ecs.zig");
+    // When ECS is off, a stub with the same export surface takes its place rather than the
+    // exports simply vanishing — the generated C# bindings are identical on every configuration,
+    // and iOS links the engine statically, where an undeclared symbol is a link error even if
+    // unreachable. Same reason physics_stub.zig exists. See ecs_stub.zig.
+    if (@import("build_options").enable_ecs) {
+        _ = @import("ecs.zig");
+    } else {
+        _ = @import("ecs_stub.zig");
+    }
 }
 // The `zigote_file_dialog_*` C-ABI exports (native OS open/save/folder dialogs over SDL3's
 // dialog subsystem) live in dialogs.zig — force-reference for the same reason as ecs.zig above.
@@ -7641,4 +7650,172 @@ test "downsampleFromPixels handles alpha and declines when no scaling is needed"
     // Already small enough, and a zero axis, both decline rather than allocating or indexing.
     try std.testing.expect(downsampleFromPixels(allocator, &storage, 2, 1, 64) == null);
     try std.testing.expect(downsampleFromPixels(allocator, &storage, 2, 0, 1) == null);
+}
+
+// The C# P/Invoke bindings are generated from the Zig export list, so they are IDENTICAL on every
+// build configuration and every platform. That is only sound if the export list itself is
+// identical too — and twice it was not. `-Decs=false` dropped 49 `zigote_ecs_*` symbols while the
+// bindings still declared them, which is why that option was documented as unusable on iOS (a
+// static link rejects an undeclared symbol even when nothing calls it). And `zigote_mactray_*` was
+// P/Invoked unconditionally but defined only on macOS. Both were invisible until the option matrix
+// was first compiled.
+//
+// These compare the source lists directly rather than the built binaries: no `nm`, no dependence
+// on which configuration happens to be built, and it runs on every platform.
+
+/// Collect the names following `export fn ` at the start of a line.
+fn collectExports(comptime src: []const u8, out: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+    const decl = "export fn ";
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, at, decl)) |found| {
+        at = found + decl.len;
+        if (found != 0 and src[found - 1] != '\n') continue; // not a real declaration
+        const end = std.mem.indexOfScalarPos(u8, src, at, '(') orelse continue;
+        try out.append(allocator, src[at..end]);
+    }
+}
+
+test "the ECS stub exports exactly what ecs.zig does" {
+    const allocator = std.testing.allocator;
+    var real: std.ArrayList([]const u8) = .empty;
+    defer real.deinit(allocator);
+    var stub: std.ArrayList([]const u8) = .empty;
+    defer stub.deinit(allocator);
+
+    try collectExports(@embedFile("ecs.zig"), &real, allocator);
+    try collectExports(@embedFile("ecs_stub.zig"), &stub, allocator);
+
+    try std.testing.expect(real.items.len >= 40); // a rename must not make this vacuous
+    for (real.items) |name| {
+        const found = for (stub.items) |s| {
+            if (std.mem.eql(u8, s, name)) break true;
+        } else false;
+        if (!found) {
+            std.debug.print("ecs_stub.zig is missing {s} — -Decs=false would drop it\n", .{name});
+            return error.StubMissingExport;
+        }
+    }
+    for (stub.items) |name| {
+        const found = for (real.items) |s| {
+            if (std.mem.eql(u8, s, name)) break true;
+        } else false;
+        if (!found) {
+            std.debug.print("ecs_stub.zig exports {s}, which ecs.zig does not\n", .{name});
+            return error.StubExtraExport;
+        }
+    }
+    try std.testing.expectEqual(real.items.len, stub.items.len);
+}
+
+test "every macOS-only platform export has a non-macOS stub" {
+    const allocator = std.testing.allocator;
+    var stub: std.ArrayList([]const u8) = .empty;
+    defer stub.deinit(allocator);
+    try collectExports(@embedFile("desktop_shims_stub.zig"), &stub, allocator);
+
+    // The Objective-C shims C# calls by name. Their symbols must exist on every target, or a
+    // static link (iOS) fails and a desktop call throws EntryPointNotFound. Read at runtime
+    // because @embedFile cannot reach outside this module's package path.
+    var io_state = std.Io.Threaded.init(allocator, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+    var dir = std.Io.Dir.cwd().openDir(io, "src/platform", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest, // not run from the build root
+        else => return err,
+    };
+    defer dir.close(io);
+
+    // A macOS-only symbol needs a stub only when something OUTSIDE Zig binds it by name (the C#
+    // P/Invoke set). The ones Zig itself calls are declared `extern fn` in this directory and sit
+    // behind a comptime `is_macos` check, so on other targets the call is pruned and no reference
+    // to the symbol is ever emitted — zigote_macwin_* (chrome.zig) and zigote_macdlg_begin /
+    // zigote_mac_trash_item (dialogs.zig). Stubbing those would be dead code.
+    var zig_declared: std.ArrayList([]const u8) = .empty;
+    defer zig_declared.deinit(allocator);
+    for ([_][]const u8{ @embedFile("chrome.zig"), @embedFile("dialogs.zig") }) |ffi_src| {
+        const marker = "extern fn ";
+        var p: usize = 0;
+        while (std.mem.indexOfPos(u8, ffi_src, p, marker)) |found| {
+            p = found + marker.len;
+            const paren = std.mem.indexOfScalarPos(u8, ffi_src, p, '(') orelse continue;
+            try zig_declared.append(allocator, ffi_src[p..paren]);
+        }
+    }
+
+    var checked: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".m")) continue;
+        const src = try dir.readFileAlloc(io, entry.name, allocator, .limited(1 << 20));
+        defer allocator.free(src);
+
+        const marker = "ZEXPORT ";
+        var at: usize = 0;
+        while (std.mem.indexOfPos(u8, src, at, marker)) |found| {
+            at = found + marker.len;
+            if (found != 0 and src[found - 1] != '\n') continue;
+            // ZEXPORT <ret> <name>(...)
+            const paren = std.mem.indexOfScalarPos(u8, src, at, '(') orelse continue;
+            const decl = src[at..paren];
+            const sp = std.mem.lastIndexOfScalar(u8, decl, ' ') orelse continue;
+            const name = std.mem.trim(u8, decl[sp + 1 ..], " *");
+            if (!std.mem.startsWith(u8, name, "zigote_")) continue;
+            const zig_internal = for (zig_declared.items) |d| {
+                if (std.mem.eql(u8, d, name)) break true;
+            } else false;
+            if (zig_internal) continue;
+            checked += 1;
+            const found_stub = for (stub.items) |s| {
+                if (std.mem.eql(u8, s, name)) break true;
+            } else false;
+            if (!found_stub) {
+                std.debug.print("desktop_shims_stub.zig is missing {s} (from {s})\n", .{ name, entry.name });
+                return error.PlatformStubMissing;
+            }
+        }
+    }
+    // Only the shims C# binds by name need stubs; the chrome/dialog externs are comptime-pruned.
+    try std.testing.expect(checked >= 12);
+}
+
+// The wgpu-native archive matrix exists in two places in this repo — the `target_specs` table in
+// build.zig and the lazy dependency list in build.zig.zon — plus a third, independent derivation in
+// MSBuild (build/Zigote.Native.targets). A name that appears in one and not the other fails only
+// when someone cross-compiles for that platform, which is exactly when nobody is watching. Lives
+// with the other source-text invariants above; reads at runtime because these files are outside
+// this module's package path.
+test "every wgpu dependency the target table names exists in build.zig.zon" {
+    const allocator = std.testing.allocator;
+    var io_state = std.Io.Threaded.init(allocator, .{});
+    defer io_state.deinit();
+    const io = io_state.io();
+
+    const dir = std.Io.Dir.cwd();
+    const build_src = dir.readFileAlloc(io, "build.zig", allocator, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest, // not run from the build root
+        else => return err,
+    };
+    defer allocator.free(build_src);
+    const zon_src = try dir.readFileAlloc(io, "build.zig.zon", allocator, .limited(1 << 20));
+    defer allocator.free(zon_src);
+
+    const marker = ".wgpu_dep = \"";
+    var at: usize = 0;
+    var checked: usize = 0;
+    while (std.mem.indexOfPos(u8, build_src, at, marker)) |found| {
+        const start = found + marker.len;
+        const end = std.mem.indexOfScalarPos(u8, build_src, start, '"') orelse break;
+        const name = build_src[start..end];
+        at = end;
+        checked += 1;
+
+        // The zon declares them as `.wgpu_linux_x86_64 = .{ ... }`.
+        const decl = try std.fmt.allocPrint(allocator, ".{s} = ", .{name});
+        defer allocator.free(decl);
+        if (std.mem.indexOf(u8, zon_src, decl) == null) {
+            std.debug.print("build.zig names wgpu dependency {s}, which build.zig.zon does not declare\n", .{name});
+            return error.WgpuDependencyMissing;
+        }
+    }
+    try std.testing.expect(checked >= 9); // a rename must not make this vacuous
 }
