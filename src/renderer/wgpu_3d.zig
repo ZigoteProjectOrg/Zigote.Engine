@@ -3261,9 +3261,14 @@ pub const Gpu3d = struct {
         }
         // depth (MSAA depth32) + msaa_color (MSAA hdr)
         const depth_msaa: u64 = px * 4 * samples + px * hdr_bpp * samples;
-        // scene_hdr + refraction_src (each full-res hdr) + bloom mip-chain (~4/3 full-res hdr) + dof
-        // (full-res hdr, allocated only while DoF is enabled — see ensureDofTargets).
-        var hdr: u64 = px * hdr_bpp * 2 + (px * hdr_bpp * 4 / 3);
+        // scene_hdr + refraction_src (each full-res hdr) + the bloom mip chain + dof.
+        //
+        // The chain starts at HALF resolution, so its levels sum to 1/4 + 1/16 + … = 1/3 of a
+        // full-res image — not the 4/3 this used to assume, which was correct only while level 0
+        // was full-res and allocated-but-never-read. Leaving the old figure here would have made
+        // the [gpu-mem] diagnostic under-report the saving by exactly the level that was removed:
+        // one full-res rgba16float, ~16 MB at 1080p.
+        var hdr: u64 = px * hdr_bpp * 2 + (px * hdr_bpp / 3);
         if (self.dof_view != null) hdr += px * hdr_bpp;
         // 3 G-buffers (pos/normal/albedo), each an MSAA target + a single-sample resolve
         const gbuffer: u64 = 3 * (px * hdr_bpp * samples + px * hdr_bpp);
