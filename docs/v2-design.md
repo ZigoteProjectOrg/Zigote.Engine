@@ -1,6 +1,6 @@
 # Zigote.Engine V2 — refactoring, optimization and modularization design
 
-Status: **in progress — Phase 0 complete, Phase 1 started** · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
+Status: **in progress — Phases 0, 4 (partial) and 5 complete; Phase 1 partial; §3 re-scoped after measurement** · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
 (`Zigote.Generators`, `Zigote.Core/Native`, `build/Zigote.Native.targets`).
 
 V2 **breaks ABI and source compatibility**. The C# side is rebuilt against it in the same change
@@ -468,9 +468,69 @@ parameter, the Zig-side manifest generator and generated C# structs, and the sin
 These change every export signature and the whole C# call surface, so they want to land as one
 series rather than piecemeal.
 
+### Phase 4 — partial
+
+| Done | Notes |
+|---|---|
+| P11 bloom level 0 | The chain was allocated full-res with level 0 marked "allocated, unused" — ~16 MB of rgba16float at 1080p, ~¾ of the bloom allocation, on every 3D app. Chain now starts half-res; golden capture byte-identical, which is the proof the level was dead. |
+
+Not done: P9 (packed model uniforms) depends on the scene-authority change in §2.3. P12 (splitting
+`Gpu3d.init`) is mechanical but large. P5's remaining items (staged shadow-slice and post-param
+uploads) are ~20 small `writeBuffer` calls per frame — real but negligible against a frame, and not
+worth the churn ahead of the splits.
+
+### Phase 5 — complete
+
+| Done | Notes |
+|---|---|
+| `zig build check-matrix` | All 8 `-Denable3d/-Dphysics3d/-Decs` combinations. Found two real defects (below). |
+| `ecs_stub.zig` | `-Decs=false` dropped 49 exports the generated C# bindings still declared — the reason ECS was documented as un-disableable on iOS. |
+| Tray stubs | `zigote_mactray_*` was P/Invoked unconditionally but defined only on macOS. |
+| `target_specs` + `print-targets` | The nine-way wgpu matrix is data; a test checks every row against `build.zig.zon`. |
+| `.zigversion` | Pinned and enforced at comptime. |
+
+All 8 configurations now export an **identical 291-symbol set** — the invariant that makes
+platform-independent generated bindings correct, and which was violated before. Two source-level
+tests keep it that way.
+
+`Zigote.Native.targets`' RID→triple derivation is deliberately left alone: it drives iOS/Android
+paths that cannot be exercised on this machine, and rewriting it blind would trade a documented
+duplication for an untestable regression.
+
+---
+
+## 10. §3 re-scoped: what measurement changed
+
+The performance plan in §3 was written from an audit that located code without establishing whether
+it runs. Three of its headline items turn out to be cold, and the conclusion matters more than the
+individual corrections: **Phases 2 and 3, as specified, are largely premature optimisation.**
+
+| Claim | What is actually true |
+|---|---|
+| **P1** — "`imageKey()` Wyhashes the whole pixel buffer per image command per frame… 1 MiB hashed per frame". Called the "worst offender". | `imageKey` returns immediately when `cache_key` is set, and **every** real caller passes one with `pixels: null` (`AsyncImage`, `ImagePreviewProvider`, `TilePalettePanel`, `ViewportPanel`, `GameViewport`, …). The hash is a correctness fallback for unkeyed raw pixels, and production never takes it. |
+| **P10** — "chatty per-node FFI, 3–6 calls per node" | Every one of the 14 setters in `SceneNode.cs` is dirty-gated behind `first \|\| <value changed>`. 3–6 calls happen on the first push after (re)creation; a static node costs **zero** calls per frame, a moving one costs **one**. |
+| **P3** — "a static UI pays 100% of tessellation + upload cost at 60 Hz" | `App.Tick` returns before painting: `if (!_repaint.AnyDirty && !ContinuousUpdate && !ForceContinuousRender) return;`. An idle UI renders **no frames at all**, so it pays no tessellation, no uploads and no hashing. |
+
+What survives: re-tessellation is real on frames that *do* change (one blinking caret rebuilds the
+whole list), and P4's unindexed 40-byte × 6 vertices per rect is real whenever anything animates.
+Those are worth doing on their own merits — but they do not justify the ABI break and stream
+redesign of §2.1/§2.2/§2.3, which were sold largely on P1/P3/P7/P10.
+
+**Recommendation.** Do not execute Phases 2–3 as written. The parts worth keeping are:
+- **P4** instanced rects — a contained change inside `wgpu.zig`, no ABI impact.
+- **P12** splitting `wgpu_3d.zig` / `Gpu3d.init`, and the §4 module layout — maintainability, no ABI impact.
+- The `ZgStatus`/`ZgStr`/`engine`-parameter sweep from §2.1 — genuinely better, but it is a
+  coordinated break across ~290 exports and the whole C# call surface, and its strongest
+  justification (silent ABI drift) is now closed by the manifest test in §9.
+
+Before any of it, the engine needs a **rendering benchmark**. There is none — `Zigote.SmokeTest`
+reports a frame time for a fixed scene, and the four `*.Benchmark` projects cover Bloc, ECS, HTTP
+and Reactive. Every §3 number above was reasoned from code, not measured, which is exactly how §3
+came to overstate three of its own items.
+
 ### Not yet started
 
-Phases 2–5. The `gpu/pipeline.zig` builder and the large-file splits (`wgpu_3d.zig`, the 1417-line
+Phases 2 and 3 (see §10 — re-scoped rather than pending), and the remainder of Phase 1. The `gpu/pipeline.zig` builder and the large-file splits (`wgpu_3d.zig`, the 1417-line
 `Gpu3d.init`) remain from Phase 0's §4 layout; they are mechanical but large, and are best done
 alongside the rest of Phase 1 rather than as a separate pass over the same files.
 
