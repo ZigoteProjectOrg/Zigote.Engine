@@ -482,6 +482,9 @@ const LoadedFont = struct {
 /// holds per-target state (vertex buffers, scene/backdrop textures sized to one target, glyph
 /// atlas), so it cannot be shared across surfaces. The handle C# holds is this struct's address.
 const SecondaryWindow = struct {
+    /// The handle this window was issued (see EngineState.windows). Kept on the window because the
+    /// handle is a generational table index, not the address, so it cannot be derived back.
+    ffi_handle: u64 = 0,
     id: u32, // SDL window id — routes events on the C# side
     window: sdl3.video.Window,
     metal_view: ?sdl3.MetalView, // macOS-only, like EngineState.metal_view
@@ -543,7 +546,12 @@ const EngineState = struct {
     // start of every poll; read by C# via zigote_poll_text_ptr before the next poll.
     poll_text: std.ArrayListUnmanaged(u8) = .empty,
     // Live-node tracking: prevents C# from dereferencing freed/stale handles.
-    node_handles: std.AutoHashMap(u64, void),
+    /// Scene-node handles. Generational, so a handle to a destroyed node cannot resolve — not
+    /// even if a later node lands on the same address. This was `@intFromPtr(node)` plus an
+    /// AutoHashMap(u64, void) of live pointers: that rejects a handle to a node that is simply
+    /// gone, but a freed node's address IS reusable, and a stale handle naming a recycled address
+    /// passed the membership check and then mutated whichever node had taken its place.
+    nodes: zg.core.handle.HandleTable(*zg.SceneNode),
     selected_node_ptr: u64,
     world: zg.World,
     // The 3D renderer, created lazily by ensure3d() on first real 3D use (render, scene resource
@@ -630,7 +638,9 @@ const EngineState = struct {
     audio_lock: SpinLock = .{},
 
     // ── Secondary OS windows (UI-only; see SecondaryWindow) ───────────────────
-    windows: std.AutoHashMap(u64, *SecondaryWindow),
+    /// Secondary-window handles. Generational for the same reason node handles are: this was
+    /// `@intFromPtr(win)` in an AutoHashMap, and a destroyed window's address is reusable.
+    windows: zg.core.handle.HandleTable(*SecondaryWindow),
     main_window_id: u32,
     // Fonts registered so far, replayed onto every new window's GpuUi (entry 0 = the boot font).
     loaded_fonts: std.ArrayListUnmanaged(LoadedFont) = .empty,
@@ -665,21 +675,30 @@ const EngineState = struct {
     }
 
     fn isValidNode(self: *const EngineState, handle: u64) bool {
-        return handle != 0 and self.node_handles.contains(handle);
+        return self.nodes.contains(handle);
     }
 
-    fn trackNode(self: *EngineState, handle: u64) void {
-        self.node_handles.put(handle, {}) catch {
-            std.log.warn("zigote: OOM tracking node handle 0x{x}", .{handle});
+    /// Register a node and return its handle, or 0 if the table could not grow.
+    fn trackNode(self: *EngineState, node: *zg.SceneNode) u64 {
+        const h = self.nodes.add(node) catch {
+            std.log.warn("zigote: OOM tracking a scene node", .{});
+            return 0;
         };
+        node.ffi_handle = h;
+        return h;
+    }
+
+    /// The node a handle names, or null if it is stale, freed or never issued.
+    fn nodeFromHandle(self: *EngineState, handle: u64) ?*zg.SceneNode {
+        return (self.nodes.get(handle) orelse return null).*;
     }
 
     fn untrackNode(self: *EngineState, handle: u64) void {
-        _ = self.node_handles.remove(handle);
+        _ = self.nodes.remove(handle);
     }
 
     fn untrackAllNodes(self: *EngineState) void {
-        self.node_handles.clearRetainingCapacity();
+        self.nodes.clear();
     }
 };
 
@@ -728,13 +747,11 @@ fn engineIo(state: *EngineState) std.Io {
 /// Resolve a secondary-window handle, validating it against the live-window table so C# can never
 /// dereference a destroyed window (same pattern as node handles).
 inline fn windowFromHandle(state: *EngineState, window_handle: u64) ?*SecondaryWindow {
-    if (window_handle == 0) return null;
-    if (!state.windows.contains(window_handle)) return null;
-    return @ptrFromInt(window_handle);
+    return (state.windows.get(window_handle) orelse return null).*;
 }
 
 fn windowFromSdlId(state: *EngineState, sdl_id: u32) ?*SecondaryWindow {
-    var it = state.windows.valueIterator();
+    var it = state.windows.iterator();
     while (it.next()) |win| {
         if (win.*.id == sdl_id) return win.*;
     }
@@ -1203,7 +1220,7 @@ fn zigote_init_impl(
         .font_name_len = 0,
         .image_registry = std.AutoHashMap(u64, LoadedImage).init(allocator),
         .next_gpu_handle = 1,
-        .node_handles = std.AutoHashMap(u64, void).init(allocator),
+        .nodes = zg.core.handle.HandleTable(*zg.SceneNode).init(allocator),
         .selected_node_ptr = 0,
         .world = zg.World.init(allocator),
         .gpu_3d = null,
@@ -1221,7 +1238,7 @@ fn zigote_init_impl(
         .render_textures = std.AutoHashMap(u64, RenderTextureEntry).init(allocator),
         .blur_requests = .empty,
         .gaussian_blur = null,
-        .windows = std.AutoHashMap(u64, *SecondaryWindow).init(allocator),
+        .windows = zg.core.handle.HandleTable(*SecondaryWindow).init(allocator),
         .main_window_id = window.getId() catch 0,
         .gpus = selection.gpus,
         .gpu_count = selection.count,
@@ -3083,11 +3100,10 @@ export fn zigote_scene_add_child_node(parent_handle: u64, name_ptr: [*c]const u8
     if (parent_handle == 0) {
         node = state.world.createNode(name) catch return 0;
     } else {
-        if (!state.isValidNode(parent_handle)) {
+        const parent = state.nodeFromHandle(parent_handle) orelse {
             std.log.warn("zigote_scene_add_child_node: invalid parent handle 0x{x}", .{parent_handle});
             return 0;
-        }
-        const parent: *zg.SceneNode = @ptrFromInt(parent_handle);
+        };
         node = state.world.createChild(parent, name) catch return 0;
     }
 
@@ -3118,9 +3134,7 @@ export fn zigote_scene_add_child_node(parent_handle: u64, name_ptr: [*c]const u8
         } }) catch return 0;
     }
 
-    const node_handle = @intFromPtr(node);
-    state.trackNode(node_handle);
-    return node_handle;
+    return state.trackNode(node);
 }
 
 /// Set the projection parameters of a camera node: perspective vertical FOV (degrees) + clip planes.
@@ -3130,8 +3144,7 @@ export fn zigote_scene_add_child_node(parent_handle: u64, name_ptr: [*c]const u8
 /// whatever FOV/near/far is set here — see the FOV lockstep note there.
 export fn zigote_scene_set_camera_params(node_handle: u64, fovy_degrees: f32, near: f32, far: f32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const cam_comp = node.getComponent(.camera) orelse return .ok;
     cam_comp.camera.fovy_degrees = fovy_degrees;
     cam_comp.camera.near = near;
@@ -3188,11 +3201,10 @@ fn setNodeMeshRenderer(state: *EngineState, node: *zg.SceneNode, mesh_handle: u3
 export fn zigote_scene_set_mesh_blob(node_handle: u64, data_ptr: [*c]const u8, data_len: usize) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
     if (data_ptr == null or data_len == 0) return .ok;
-    if (!state.isValidNode(node_handle)) {
+    const node = state.nodeFromHandle(node_handle) orelse {
         std.log.warn("zigote_scene_set_mesh_blob: invalid handle 0x{x}", .{node_handle});
         return .ok;
-    }
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    };
     const data = data_ptr[0..data_len];
 
     const mesh = zmesh_format.parseZmesh(state.allocator, data) catch |err| {
@@ -3209,11 +3221,10 @@ export fn zigote_scene_set_mesh_blob(node_handle: u64, data_ptr: [*c]const u8, d
 
 export fn zigote_scene_set_mesh_primitive(node_handle: u64, prim_type: u8) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) {
+    const node = state.nodeFromHandle(node_handle) orelse {
         std.log.warn("zigote_scene_set_mesh_primitive: invalid handle 0x{x}", .{node_handle});
         return .ok;
-    }
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    };
 
     var mesh: zg.resources.Mesh = undefined;
     switch (prim_type) {
@@ -3242,8 +3253,7 @@ export fn zigote_scene_set_light_properties(node_handle: u64,
     outer_angle: f32,
     cast_shadows: u32,) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
 
     var light_comp = node.getComponent(.light) orelse return .ok;
     light_comp.light.kind = switch (kind) {
@@ -3263,8 +3273,7 @@ export fn zigote_scene_set_light_properties(node_handle: u64,
 
 export fn zigote_scene_set_mesh_color(node_handle: u64, r: f32, g: f32, b: f32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
 
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
@@ -3281,8 +3290,7 @@ export fn zigote_scene_set_mesh_color(node_handle: u64, r: f32, g: f32, b: f32) 
 /// a single fallback draw — used to empty a LOD bucket / stop drawing without leaving a stray mesh).
 export fn zigote_scene_set_mesh_instances(node_handle: u64, matrices: [*c]const f32, count: u32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const g = ensure3d(state) orelse return .ok;
     g.setInstances(node.entity, matrices, count);
     return .ok;
@@ -3420,8 +3428,7 @@ export fn zigote_sprites_draw(texture: u32, texture2: u32, shader: u32, blend: u
 /// system to hide distant detail / select LOD levels without re-uploading geometry.
 export fn zigote_scene_set_node_visible(node_handle: u64, visible: u32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     mr_comp.mesh_renderer.visible = visible != 0;
     return .ok;
@@ -3439,8 +3446,7 @@ export fn zigote_render_set_frustum_cull(enabled: u32) ZgStatus {
 
 export fn zigote_scene_set_mesh_roughness(node_handle: u64, metallic: f32, roughness: f32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3454,8 +3460,7 @@ export fn zigote_scene_set_mesh_roughness(node_handle: u64, metallic: f32, rough
 /// the material each frame into the per-draw uniforms, so no GPU cache invalidation is needed.
 export fn zigote_scene_set_mesh_surface(node_handle: u64, clearcoat: f32, clearcoat_roughness: f32, specular: f32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3470,8 +3475,7 @@ export fn zigote_scene_set_mesh_surface(node_handle: u64, clearcoat: f32, clearc
 /// side). Read into the per-draw uniforms each frame; no GPU cache invalidation needed.
 export fn zigote_scene_set_mesh_emissive(node_handle: u64, r: f32, g: f32, b: f32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3482,8 +3486,7 @@ export fn zigote_scene_set_mesh_emissive(node_handle: u64, r: f32, g: f32, b: f3
 
 export fn zigote_scene_set_mesh_effect(node_handle: u64, effect: u32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3498,8 +3501,7 @@ export fn zigote_scene_set_mesh_effect(node_handle: u64, effect: u32) ZgStatus {
 /// we also seed a see-through base-colour tint so it reads as a window, not a solid panel.
 export fn zigote_scene_set_mesh_alpha_mode(node_handle: u64, mode: u32, cutoff: f32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3517,8 +3519,7 @@ export fn zigote_scene_set_mesh_alpha_mode(node_handle: u64, mode: u32, cutoff: 
 /// transparent and glass passes via their per-draw pipeline selection.
 export fn zigote_scene_set_mesh_double_sided(node_handle: u64, double_sided: u32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3532,8 +3533,7 @@ export fn zigote_scene_set_mesh_double_sided(node_handle: u64, double_sided: u32
 /// glass response. Read into the per-draw uniforms each frame; no GPU cache invalidation needed.
 export fn zigote_scene_set_mesh_volume(node_handle: u64, ior: f32, transmission: f32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3547,8 +3547,7 @@ export fn zigote_scene_set_mesh_volume(node_handle: u64, ior: f32, transmission:
 /// channel is baked ambient occlusion (the glTF ORM packing) and scales its effect on ambient.
 export fn zigote_scene_set_mesh_occlusion_strength(node_handle: u64, strength: f32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3573,9 +3572,7 @@ fn invalidateMaterialGpu(state: *EngineState, mat_handle: u32) void {
 
 export fn zigote_scene_set_mesh_texture_file(node_handle: u64, path_c: [*c]const u8) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3631,9 +3628,7 @@ export fn zigote_scene_set_mesh_texture_file(node_handle: u64, path_c: [*c]const
 /// glTF convention: roughness in the green channel, metallic in the blue channel.
 export fn zigote_scene_set_mesh_mr_texture_file(node_handle: u64, path_c: [*c]const u8) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3675,9 +3670,7 @@ export fn zigote_scene_set_mesh_mr_texture_file(node_handle: u64, path_c: [*c]co
 /// mesh shipped none).
 export fn zigote_scene_set_mesh_normal_texture_file(node_handle: u64, path_c: [*c]const u8) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3718,9 +3711,7 @@ export fn zigote_scene_set_mesh_normal_texture_file(node_handle: u64, path_c: [*
 /// colour; the shader multiplies it by the material's emissive factor.
 export fn zigote_scene_set_mesh_emissive_texture_file(node_handle: u64, path_c: [*c]const u8) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return .ok;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
@@ -3811,8 +3802,7 @@ fn queueDecode(
 
 /// Resolve a node handle to its material index, or null if the node has no valid material.
 fn materialHandleForNode(state: *EngineState, node_handle: u64) ?u32 {
-    if (!state.isValidNode(node_handle)) return null;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return null;
     const mr_comp = node.getComponent(.mesh_renderer) orelse return null;
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return null;
@@ -3930,7 +3920,7 @@ const SubtreeAssets = struct {
 fn gatherSubtreeForRemoval(state: *EngineState, node: *zg.SceneNode, assets: *SubtreeAssets) void {
     if (state.gpu_3d) |g| g.invalidateEntity(node.entity);
 
-    const nh = @intFromPtr(node);
+    const nh = node.ffi_handle;
     state.untrackNode(nh);
     if (state.selected_node_ptr == nh) state.selected_node_ptr = 0;
 
@@ -3956,8 +3946,7 @@ fn markSubtreeAssets(node: *zg.SceneNode, used_meshes: []bool, used_materials: [
 
 export fn zigote_scene_remove_node(node_handle: u64) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) return .ok;
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    const node = state.nodeFromHandle(node_handle) orelse return .ok;
 
     // Collect the subtree's assets + shed per-node renderer/handle state while the tree is still live.
     var assets = SubtreeAssets{};
@@ -4013,11 +4002,10 @@ export fn zigote_scene_update_node(node_handle: u64,
     sy: f32,
     sz: f32,) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    if (!state.isValidNode(node_handle)) {
+    const node = state.nodeFromHandle(node_handle) orelse {
         std.log.warn("zigote_scene_update_node: invalid handle 0x{x}", .{node_handle});
         return .ok;
-    }
-    const node: *zg.SceneNode = @ptrFromInt(node_handle);
+    };
 
     node.local_transform.position = .{ .x = x, .y = y, .z = z };
 
@@ -4601,7 +4589,7 @@ fn createSecondaryWindowImpl(
         .overlay_paint_list = .{},
         .frame_index = 0,
     };
-    try state.windows.put(@intFromPtr(win), win);
+    win.ffi_handle = try state.windows.add(win);
     return win;
 }
 
@@ -4617,14 +4605,14 @@ export fn zigote_window_create(width: u32,
         out_window.* = 0;
         return .err;
     };
-    out_window.* = @intFromPtr(win);
+    out_window.* = win.ffi_handle;
     return .ok;
 }
 
 /// Destroy a secondary window and free all its GPU/window resources. The handle is dead after this.
 export fn zigote_window_destroy(window_handle: u64) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    const win = windowFromHandle(state, window_handle) orelse return .ok;
+    const win = windowFromHandle(state, window_handle) orelse return .invalid_handle;
     _ = state.windows.remove(window_handle);
     win.deinit(state.allocator);
     state.allocator.destroy(win);
@@ -4899,7 +4887,7 @@ export fn zigote_get_scroll_orientation() u32 {
 export fn zigote_text_reset_caches() ZgStatus {
     const state = engineState() orelse return .invalid_handle;
     state.gpu_ui.text.resetAllTextCaches();
-    var it = state.windows.valueIterator();
+    var it = state.windows.iterator();
     while (it.next()) |win| win.*.gpu_ui.text.resetAllTextCaches();
     return .ok;
 }
@@ -4939,7 +4927,7 @@ export fn zigote_shutdown() ZgStatus {
 
     // Secondary windows first — they borrow the shared device/queue released below.
     {
-        var win_it = state.windows.valueIterator();
+        var win_it = state.windows.iterator();
         while (win_it.next()) |win| {
             win.*.deinit(state.allocator);
             state.allocator.destroy(win.*);
@@ -4967,7 +4955,7 @@ export fn zigote_shutdown() ZgStatus {
     state.pending_image_releases.deinit(state.allocator);
     state.pending_image_updates.deinit(state.allocator);
     state.image_lock.unlock();
-    state.node_handles.deinit();
+    state.nodes.deinit();
     state.poll_text.deinit(state.allocator);
 
     // Remove the 3D offscreen entry from the image cache BEFORE gpu_ui.deinit() releases
@@ -5814,7 +5802,7 @@ export fn zigote_load_font(name_ptr: [*c]const u8, path_ptr: [*c]const u8) ZgRes
 
     // Keep every window's face table in sync: broadcast to live secondary windows and record the
     // font so windows created later replay it (see createSecondaryWindowImpl).
-    var it = state.windows.valueIterator();
+    var it = state.windows.iterator();
     while (it.next()) |win| {
         win.*.gpu_ui.text.loadFontFromCPath(name, path_ptr) catch |err| {
             std.log.warn("zigote: window font load '{s}' failed: {}", .{ name, err });
@@ -5837,7 +5825,7 @@ export fn zigote_add_emoji_font(name_ptr: [*c]const u8) ZgResult {
     if (!state.gpu_ui.text.emojiFamilyRendersColor(name)) return .err;
     state.gpu_ui.text.addEmojiFontFamily(name);
 
-    var it = state.windows.valueIterator();
+    var it = state.windows.iterator();
     while (it.next()) |win| win.*.gpu_ui.text.addEmojiFontFamily(name);
     if (state.emoji_family) |old| state.allocator.free(old);
     state.emoji_family = state.allocator.dupeZ(u8, name) catch null;
@@ -5857,7 +5845,7 @@ export fn zigote_add_fallback_font(name_ptr: [*c]const u8) ZgResult {
     const name = std.mem.span(name_ptr);
 
     state.gpu_ui.text.addFallbackFontFamily(name);
-    var it = state.windows.valueIterator();
+    var it = state.windows.iterator();
     while (it.next()) |win| win.*.gpu_ui.text.addFallbackFontFamily(name);
 
     const owned = state.allocator.dupeZ(u8, name) catch return .ok;

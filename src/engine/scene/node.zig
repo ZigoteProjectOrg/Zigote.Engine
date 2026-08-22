@@ -25,6 +25,14 @@ pub const SceneNode = struct {
     children: std.ArrayListUnmanaged(*SceneNode) = .{ .items = &.{}, .capacity = 0 },
     components: std.ArrayListUnmanaged(Component) = .{ .items = &.{}, .capacity = 0 },
     active: bool = true,
+    /// The FFI handle this node was issued, or 0 if it was never handed across the C ABI.
+    ///
+    /// The handle used to BE `@intFromPtr(node)`, so anything needing one could derive it. It is a
+    /// generational table index now (see EngineState.nodes), which is not derivable from the
+    /// pointer — so the node carries it. Two places need the reverse direction: subtree removal,
+    /// which must untrack every descendant, and the renderer's selection highlight, which compares
+    /// the host's selected handle against the node it is drawing.
+    ffi_handle: u64 = 0,
 
     pub fn deinit(self: *SceneNode, allocator: std.mem.Allocator) void {
         for (self.children.items) |child| {

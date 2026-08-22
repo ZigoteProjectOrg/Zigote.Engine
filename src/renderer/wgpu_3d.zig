@@ -4849,8 +4849,10 @@ pub const Gpu3d = struct {
         // Fresnel glass response (opaque/reflective at grazing angles).
         const alpha_code: u32 = if (mat_data) |m| @intFromEnum(m.alpha_mode) else 0;
         const cutoff_bits: u32 = if (mat_data) |m| @bitCast(m.alpha_cutoff) else @bitCast(@as(f32, 0.5));
+        // Compare FFI handles, not addresses: the host's "selected node" is a generational table
+        // index now, and a node's address is not derivable from it (nor unique over time).
         const is_selected: u32 = if (self.selected_node_ptr != 0 and
-            @intFromPtr(renderable.node) == self.selected_node_ptr) 1 else 0;
+            renderable.node.ffi_handle == self.selected_node_ptr) 1 else 0;
         // Extended surface params (surface vec4): IOR + transmission + ORM occlusion strength.
         // Legacy glass (alpha mode glass, transmission never set) is treated as fully transmissive.
         const ior = if (mat_data) |m| m.ior else 1.5;
