@@ -85,6 +85,11 @@ pub const ShaderEffect = struct {
     image_width: u32 = 0,
     image_height: u32 = 0,
     image_pixels: []const u8 = &.{},
+    /// A filter in a chain: refresh the backdrop capture before drawing, so this effect sees the
+    /// previous one's output instead of sharing its input. Off by default — sibling glass and
+    /// stacked backdrop blurs deliberately read the same scene, and refreshing per op costs a
+    /// full-frame copy and a render-pass break each.
+    chains_backdrop: bool = false,
 };
 
 pub const LiquidGlass = struct {

@@ -223,6 +223,26 @@ pub fn myLogFn(
     if (log_callback) |cb| cb(@intFromEnum(level), msg.ptr);
 }
 
+/// Every wgpu validation error, routed to the engine log. wgpu discards these by default, so a
+/// draw whose bind group or dynamic offset is wrong renders nothing and reports nothing — the
+/// single hardest class of graphics bug to find, and the cheapest to surface.
+fn wgpuUncapturedError(
+    device: ?*wgpu.Device,
+    error_type: wgpu.ErrorType,
+    message: wgpu.StringView,
+    userdata1: ?*anyopaque,
+    userdata2: ?*anyopaque,
+) callconv(.c) void {
+    _ = device;
+    _ = userdata1;
+    _ = userdata2;
+    const text = message.toSlice() orelse "(no message)";
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrintZ(&buf, "wgpu {s}: {s}", .{ @tagName(error_type), text }) catch return;
+    android_log.write(.err, msg.ptr);
+    if (log_callback) |cb| cb(@intFromEnum(std.log.Level.err), msg.ptr);
+}
+
 /// Forward wgpu-native's own diagnostics into the same sink. Without this the only trace of a
 /// surface/adapter failure on Android is an abort with no message.
 fn wgpuLogToEngine(level: wgpu.LogLevel, message: wgpu.StringView, userdata: ?*anyopaque) callconv(.c) void {
@@ -297,7 +317,11 @@ pub const ZgPaintCommand = extern struct {
     font_style: u8, // offset   1  (0=normal, 1=italic)
     font_weight: u16, // offset   2  (100..900)
     has_cache_key: u8, // offset   4
-    pad0: [3]u8 = .{0} ** 3,
+    /// CMD_SHADER_EFFECT only: this effect is a FILTER and must see the previous effect's
+    /// output, so the backdrop capture is refreshed before it. Off = the effect shares the
+    /// capture with its neighbours, which is what Liquid Glass and backdrop blur want.
+    chains_backdrop: u8, // offset   5
+    pad0: [2]u8 = .{0} ** 2,
     text_ptr: [*c]const u8, // offset  8  (also the GlyphRunQuad array pointer for CMD_GLYPH_RUN)
     pixels_ptr: [*c]const u8, // offset 16  (image pixels / font-family bytes / polygon points)
     rect_x: f32, // offset  24
@@ -331,6 +355,7 @@ comptime {
     std.debug.assert(@offsetOf(ZgPaintCommand, "font_style") == 1);
     std.debug.assert(@offsetOf(ZgPaintCommand, "font_weight") == 2);
     std.debug.assert(@offsetOf(ZgPaintCommand, "has_cache_key") == 4);
+    std.debug.assert(@offsetOf(ZgPaintCommand, "chains_backdrop") == 5);
     std.debug.assert(@offsetOf(ZgPaintCommand, "text_ptr") == 8);
     std.debug.assert(@offsetOf(ZgPaintCommand, "pixels_ptr") == 16);
     std.debug.assert(@offsetOf(ZgPaintCommand, "rect_x") == 24);
@@ -1209,6 +1234,11 @@ fn zigote_init_impl(
     var device_desc = wgpu.DeviceDescriptor{
         .label = wgpu.StringView.fromSlice("zigote-ffi device"),
         .required_limits = null,
+        // Without this, wgpu drops validation errors on the floor: a draw with a bad bind group
+        // or an out-of-range dynamic offset simply produces nothing, with no diagnostic anywhere.
+        // Silent wrong pixels are the worst failure a renderer can have, so every validation
+        // error goes to the engine log.
+        .uncaptured_error_callback_info = .{ .callback = wgpuUncapturedError },
     };
     if (feature_count > 0) {
         device_desc.required_feature_count = feature_count;
@@ -2910,6 +2940,7 @@ fn fillPaintList(
                     .image_width = image_w,
                     .image_height = image_h,
                     .image_pixels = image_pixels,
+                    .chains_backdrop = cmd.chains_backdrop != 0,
                 } });
             },
             CMD_TEXT_LAYOUT => {

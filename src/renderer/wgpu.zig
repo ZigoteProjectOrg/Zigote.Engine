@@ -769,6 +769,10 @@ pub const ShaderEffectBatch = struct {
     clip_rect: ?zg.Rect,
     /// Bound at @group(1) when the shader was registered wanting one (see CustomShader).
     image_bind_group: ?*wgpu.BindGroup = null,
+    /// This effect is a filter in a chain: refresh the backdrop capture before it so it sees the
+    /// previous effect's output. Off = share the capture with neighbours, which is what a lens
+    /// (glass, backdrop blur) wants and what keeps a row of them from copying the frame each.
+    chains_backdrop: bool = false,
     // Carried for uniformity but NOT applied: custom shader-effect pipelines have a fixed,
     // user-facing bind-group contract (g0 = backdrop), so a rounded clip degrades to the
     // bounding-rect scissor here. Same fallback for liquid glass (its ShapeBatch offset is
@@ -1308,6 +1312,12 @@ fn replayFramePaint(
             frame_height,
             null, // full-frame path: no damage scissor
         );
+
+        // A chained filter must see the previous pass's output, or a multi-pass pipeline
+        // (tone -> LUT -> grain) silently collapses to whichever pass ran last. Only effects
+        // that ask for it pay the refresh: Liquid Glass and backdrop blur share one capture on
+        // purpose, and a copy per op is what made a row of glass capsules drop frames.
+        if (op.* == .shader_effect and op.shader_effect.chains_backdrop) backdrop_fresh = false;
     }
 
     pass.end();
@@ -1370,6 +1380,12 @@ fn replayFramePaintLoad(
             frame_height,
             null, // full-frame path: no damage scissor
         );
+
+        // A chained filter must see the previous pass's output, or a multi-pass pipeline
+        // (tone -> LUT -> grain) silently collapses to whichever pass ran last. Only effects
+        // that ask for it pay the refresh: Liquid Glass and backdrop blur share one capture on
+        // purpose, and a copy per op is what made a row of glass capsules drop frames.
+        if (op.* == .shader_effect and op.shader_effect.chains_backdrop) backdrop_fresh = false;
     }
 
     pass.end();
@@ -1603,6 +1619,10 @@ fn replayFramePaintDamage(
                 frame_height,
                 region,
             );
+
+            // Same rule as the full-frame path: an opted-in filter must see the previous
+            // pass's output.
+            if (op.* == .shader_effect and op.shader_effect.chains_backdrop) backdrop_fresh = false;
         }
         if (debug_replay) std.log.info(
             "[replay] region=({d:.1},{d:.1} {d:.1}x{d:.1}) sf={d:.1} fb={d}x{d} drawn={d} culled={d}",
@@ -2172,6 +2192,7 @@ fn appendPaintOps(
                     .clip_rect = current_clip,
                     .clip_offset = current_clip_offset,
                     .image_bind_group = image_bg,
+                    .chains_backdrop = se.chains_backdrop,
                 });
             },
 
@@ -3067,8 +3088,6 @@ fn createImageTexture(
     }
 
     const upload = try allocator.alloc(u8, bytes_per_row * @as(usize, image.height));
-    defer allocator.free(upload);
-
     var row: usize = 0;
     while (row < image.height) : (row += 1) {
         const src_start = row * src_stride;
