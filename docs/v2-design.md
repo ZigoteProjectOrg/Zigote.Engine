@@ -1,6 +1,9 @@
 # Zigote.Engine V2 — refactoring, optimization and modularization design
 
-Status: **Phases 0, 1, 2, 3, 5 complete; 4 partial (see §10, §12)** · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
+Status: **complete.** Phases 0, 1, 2, 3 and 5 implemented in full; Phase 4's remaining item (P9)
+was measured and deliberately not implemented — §10 and the Phase 4 table say why, with the
+experiment. Four other items were likewise settled by measurement rather than assumption; every one
+of those decisions is recorded rather than silently skipped. · Date: 2026-08-22 · See §9 for what landed · Scope: `Zigote.Engine` (Zig) + its C# binding seam
 (`Zigote.Generators`, `Zigote.Core/Native`, `build/Zigote.Native.targets`).
 
 V2 **breaks ABI and source compatibility**. The C# side is rebuilt against it in the same change
