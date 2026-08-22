@@ -15,7 +15,7 @@
 
 const std = @import("std");
 
-/// Glyph quad for CMD_GLYPH_RUN — matches C# ZgGlyphQuad (32 bytes).
+/// Glyph quad for the glyph_run paint op.
 pub const ZgGlyphRunQuad = extern struct {
     x: f32,
     y: f32,
@@ -28,85 +28,9 @@ pub const ZgGlyphRunQuad = extern struct {
 };
 
 
-/// Flat C-ABI paint command. Layout must match ZgStructs.cs ZgPaintCommand.
-/// Total size: 112 bytes on 64-bit.
-/// Fields are ordered large→small (8-byte pointers first, then f32/u32, then the small ints) so the
-/// struct packs with a single 3-byte hole instead of the ~11 padding bytes the natural declaration
-/// order used to force — 120→112 B, ~8 B saved on every one of the hundreds–thousands of commands a
-/// painted frame streams to fillPaintList. All fields keep their meaning; Zig reads them by name, so
-/// the reorder is transparent to the renderer. The comptime block below pins every offset — a drift
-/// on either side of the ABI now fails the Zig build (C# side is pinned by AbiLayoutTests).
-pub const ZgPaintCommand = extern struct {
-    kind: u8, // offset   0
-    font_style: u8, // offset   1  (0=normal, 1=italic)
-    font_weight: u16, // offset   2  (100..900)
-    has_cache_key: u8, // offset   4
-    /// CMD_SHADER_EFFECT only: this effect is a FILTER and must see the previous effect's
-    /// output, so the backdrop capture is refreshed before it. Off = the effect shares the
-    /// capture with its neighbours, which is what Liquid Glass and backdrop blur want.
-    chains_backdrop: u8, // offset   5
-    pad0: [2]u8 = .{0} ** 2,
-    text_ptr: [*c]const u8, // offset  8  (also the GlyphRunQuad array pointer for CMD_GLYPH_RUN)
-    pixels_ptr: [*c]const u8, // offset 16  (image pixels / font-family bytes / polygon points)
-    rect_x: f32, // offset  24
-    rect_y: f32, // offset  28
-    rect_w: f32, // offset  32
-    rect_h: f32, // offset  36
-    color_r: f32, // offset  40
-    color_g: f32, // offset  44
-    color_b: f32, // offset  48
-    color_a: f32, // offset  52
-    radius: f32, // offset  56  (aliased: image u0 / shader id via @bitCast)
-    border_width: f32, // offset  60  (image v0)
-    baseline_x: f32, // offset  64  (image u1)
-    baseline_y: f32, // offset  68  (image v1)
-    font_size: f32, // offset  72
-    line_height: f32, // offset  76
-    letter_spacing: f32, // offset  80
-    word_spacing: f32, // offset  84
-    img_pixel_w: u32, // offset  88
-    img_pixel_h: u32, // offset  92
-    cache_key_lo: u32, // offset  96
-    cache_key_hi: u32, // offset 100
-    text_len: u32, // offset 104
-    pixels_len: u32, // offset 108
-    // total: 112 bytes
-};
+// The flat 112-byte ZgPaintCommand that every kind shared lived here. It is gone: see the
+// "Paint command stream" section below for the tagged records that replaced it, and why.
 
-comptime {
-    std.debug.assert(@sizeOf(ZgPaintCommand) == 112);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "kind") == 0);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "font_style") == 1);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "font_weight") == 2);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "has_cache_key") == 4);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "chains_backdrop") == 5);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "text_ptr") == 8);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "pixels_ptr") == 16);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "rect_x") == 24);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "color_r") == 40);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "radius") == 56);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "border_width") == 60);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "baseline_x") == 64);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "baseline_y") == 68);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "font_size") == 72);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "line_height") == 76);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "letter_spacing") == 80);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "word_spacing") == 84);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "img_pixel_w") == 88);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "img_pixel_h") == 92);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "cache_key_lo") == 96);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "cache_key_hi") == 100);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "text_len") == 104);
-    std.debug.assert(@offsetOf(ZgPaintCommand, "pixels_len") == 108);
-}
-
-
-/// Flat C-ABI input event. Layout must match ZgStructs.cs ZgEvent.
-/// Total size: 44 bytes. The text_input / text_editing UTF-8 payload is stored OUT OF BAND: it is
-/// appended to the engine's per-poll `poll_text` buffer and the event carries only (text_off, text_len)
-/// into it — so the common flood of mouse/key events (which have no text) costs 44 B, not 288 B. The
-/// out-of-band buffer is unbounded, so IME pre-edit is never truncated. C# reads it via
-/// zigote_poll_text_ptr right after polling (valid until the next poll; single-threaded drain-decode).
 pub const ZgEvent = extern struct {
     kind: u8, // offset  0
     button: u8, // offset  1  (mouse button; for key events: 1 = OS auto-repeat)
@@ -137,7 +61,7 @@ pub const ZgSize = extern struct {
 /// C# must call this at startup and verify sizes match its compile-time @sizeOf values.
 pub const ZgAbiInfo = extern struct {
     abi_version: u32, // offset  0  — bump when breaking ABI changes occur
-    paint_command_size: u32, // offset  4  — must equal sizeof(ZgPaintCommand) on C# side
+    paint_op_header_size: u32, // offset  4  — must equal sizeof(ZgPaintOpHeader) on C# side
     event_size: u32, // offset  8  — must equal sizeof(ZgEvent) on C# side
     handle_size: u32, // offset 12  — size of an opaque resource handle (usize)
     render_settings_3d_size: u32, // offset 16  — must equal sizeof(ZgRenderSettings3D) on C# side
@@ -433,4 +357,257 @@ comptime {
         if (@alignOf(T) != 8) @compileError("scene op " ++ @typeName(T) ++ " must be 8-byte aligned");
         if (@offsetOf(T, "header") != 0) @compileError("scene op " ++ @typeName(T) ++ " must start with its header");
     }
+}
+
+// ── Paint command stream ──────────────────────────────────────────────────────
+//
+// `ZgPaintCommand` is one flat 112-byte struct shared by all 20 command kinds, which made it a
+// union in all but name. `radius` is also an image's u0 AND a shader id (`@bitCast` from f32).
+// `img_pixel_w` is also a text shadow's blur radius. `text_len` is also a GLYPH_RUN's quad COUNT.
+// A text shadow packs its colour into `rect_x/y/w/h` — the rectangle fields — while its geometry
+// lives in `baseline_x/y`. Every one of those is documented, and every one is a place where
+// reading the wrong field yields a plausible number instead of an error.
+//
+// The V2 stream is tagged and variable-size: `ZgPaintOpHeader` then a struct that names its own
+// fields. A rect is 48 bytes rather than 112, and nothing aliases. `size` covers the whole record,
+// so an unknown op is skipped rather than desynchronising the stream. See docs/v2-design.md §2.1.
+//
+// Blobs (text bytes, font family, pixel data, polygon points, glyph quads) stay as pointer+len
+// rather than moving into a side buffer as §2.1 proposed. The host already memoises UTF-8 text on
+// the pinned object heap and passes stable pointers, so today those cross at zero copy; a side
+// buffer would copy every string every frame. The benchmark in §11 puts C# list building at ~26%
+// of a paint frame, which is the wrong number to add copying to.
+
+pub const ZgPaintOp = enum(u32) {
+    rect = 0,
+    border = 1,
+    text = 2,
+    image = 3,
+    clip_start = 4,
+    clip_end = 5,
+    push_opacity = 6,
+    pop_opacity = 7,
+    shadow = 8,
+    liquid_glass = 9,
+    shader_effect = 10,
+    text_layout = 11,
+    glyph_run = 12,
+    render_texture_begin = 13,
+    render_texture_end = 14,
+    blur = 15,
+    bezier = 16,
+    polygon = 17,
+    transform_push = 18,
+    transform_pop = 19,
+};
+
+pub const ZgPaintOpHeader = extern struct {
+    /// A `ZgPaintOp`. Unknown values are skipped using `size`.
+    kind: u32,
+    /// Total bytes of this record, header included. Always a multiple of 8.
+    size: u32,
+};
+
+/// Straight (non-premultiplied) RGBA, 0..1 — the same range the flat struct used.
+pub const ZgRgba = extern struct {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+};
+
+pub const ZgXywh = extern struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+};
+
+pub const ZgPaintRect = extern struct {
+    header: ZgPaintOpHeader,
+    bounds: ZgXywh,
+    color: ZgRgba,
+    radius: f32,
+    pad: f32 = 0,
+};
+
+pub const ZgPaintBorder = extern struct {
+    header: ZgPaintOpHeader,
+    bounds: ZgXywh,
+    color: ZgRgba,
+    radius: f32,
+    width: f32,
+};
+
+pub const ZgPaintShadow = extern struct {
+    header: ZgPaintOpHeader,
+    bounds: ZgXywh,
+    color: ZgRgba,
+    radius: f32,
+    blur_radius: f32,
+    spread: f32,
+    pad: f32 = 0,
+};
+
+pub const ZgPaintLiquidGlass = extern struct {
+    header: ZgPaintOpHeader,
+    bounds: ZgXywh,
+    color: ZgRgba,
+    radius: f32,
+    thickness: f32,
+    glow_x: f32,
+    glow_y: f32,
+    pinch: f32,
+    adapt: f32,
+};
+
+/// One text run. `is_shadow` selects the drop-shadow variant, which used to be signalled by
+/// stuffing the colour into the rect fields and the blur into `img_pixel_w`.
+pub const ZgPaintText = extern struct {
+    header: ZgPaintOpHeader,
+    text_ptr: [*c]const u8,
+    text_len: u32,
+    family_len: u32,
+    family_ptr: [*c]const u8,
+    color: ZgRgba,
+    baseline_x: f32,
+    baseline_y: f32,
+    font_size: f32,
+    line_height: f32,
+    letter_spacing: f32,
+    word_spacing: f32,
+    font_weight: u32,
+    /// 0 = normal, 1 = italic.
+    font_style: u32,
+    /// Non-zero draws the run as a drop shadow, offset by (shadow_dx, shadow_dy).
+    is_shadow: u32,
+    shadow_blur: f32,
+    shadow_dx: f32,
+    shadow_dy: f32,
+};
+
+pub const ZgPaintImage = extern struct {
+    header: ZgPaintOpHeader,
+    pixels_ptr: [*c]const u8,
+    pixels_len: u32,
+    pixel_w: u32,
+    pixel_h: u32,
+    has_cache_key: u32,
+    cache_key: u64,
+    bounds: ZgXywh,
+    tint: ZgRgba,
+    u0: f32,
+    v0: f32,
+    u1: f32,
+    v1: f32,
+};
+
+pub const ZgPaintClipStart = extern struct {
+    header: ZgPaintOpHeader,
+    bounds: ZgXywh,
+    radius: f32,
+    pad: f32 = 0,
+};
+
+/// clip_end, pop_opacity, render_texture_end and transform_pop carry nothing but their header.
+pub const ZgPaintBare = extern struct {
+    header: ZgPaintOpHeader,
+};
+
+pub const ZgPaintPushOpacity = extern struct {
+    header: ZgPaintOpHeader,
+    bounds: ZgXywh,
+    alpha: f32,
+    pad: f32 = 0,
+};
+
+pub const ZgPaintShaderEffect = extern struct {
+    header: ZgPaintOpHeader,
+    bounds: ZgXywh,
+    /// A real u32 id, not a float reinterpreted through @bitCast.
+    shader_id: u32,
+    has_cache_key: u32,
+    cache_key: u64,
+    chains_backdrop: u32,
+    pad: u32 = 0,
+    params: [8]f32,
+};
+
+pub const ZgPaintTextLayout = extern struct {
+    header: ZgPaintOpHeader,
+    layout: u64,
+    color: ZgRgba,
+    draw_x: f32,
+    draw_y: f32,
+};
+
+pub const ZgPaintGlyphRun = extern struct {
+    header: ZgPaintOpHeader,
+    /// Points at `quad_count` ZgGlyphRunQuad. Was `text_ptr`, with the count in `text_len`.
+    quads_ptr: [*c]const u8,
+    quad_count: u32,
+    pad: u32 = 0,
+    atlas: u64,
+    color: ZgRgba,
+};
+
+pub const ZgPaintRenderTextureBegin = extern struct {
+    header: ZgPaintOpHeader,
+    rt_handle: u64,
+    bounds: ZgXywh,
+};
+
+pub const ZgPaintBlur = extern struct {
+    header: ZgPaintOpHeader,
+    src_handle: u64,
+    sigma: f32,
+    pad: f32 = 0,
+};
+
+pub const ZgPaintBezier = extern struct {
+    header: ZgPaintOpHeader,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    x3: f32,
+    y3: f32,
+    color: ZgRgba,
+    width: f32,
+    pad: f32 = 0,
+};
+
+pub const ZgPaintPolygon = extern struct {
+    header: ZgPaintOpHeader,
+    points_ptr: [*c]const u8,
+    points_len: u32,
+    pad: u32 = 0,
+    color: ZgRgba,
+};
+
+pub const ZgPaintTransformPush = extern struct {
+    header: ZgPaintOpHeader,
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    tx: f32,
+    ty: f32,
+};
+
+comptime {
+    for ([_]type{
+        ZgPaintRect,          ZgPaintBorder,             ZgPaintShadow,   ZgPaintLiquidGlass,
+        ZgPaintText,          ZgPaintImage,              ZgPaintClipStart, ZgPaintBare,
+        ZgPaintPushOpacity,   ZgPaintShaderEffect,       ZgPaintTextLayout, ZgPaintGlyphRun,
+        ZgPaintRenderTextureBegin, ZgPaintBlur,          ZgPaintBezier,   ZgPaintPolygon,
+        ZgPaintTransformPush,
+    }) |T| {
+        if (@sizeOf(T) % 8 != 0) @compileError("paint op " ++ @typeName(T) ++ " must be a multiple of 8 bytes");
+        if (@offsetOf(T, "header") != 0) @compileError("paint op " ++ @typeName(T) ++ " must start with its header");
+    }
+    // The whole point: the common case got smaller.
+    if (@sizeOf(ZgPaintRect) >= 112) @compileError("ZgPaintRect should be far smaller than the old flat command");
 }

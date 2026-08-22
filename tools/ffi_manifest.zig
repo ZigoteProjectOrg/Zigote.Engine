@@ -19,7 +19,6 @@ const abi = @import("zigote_abi");
 /// The wire types, in the order they should appear. A type absent from here is not checked on the
 /// C# side, so the test below fails if `abi.zig` declares one that is not listed.
 const wire_types = [_]type{
-    abi.ZgPaintCommand,
     abi.ZgGlyphRunQuad,
     abi.ZgEvent,
     abi.ZgSize,
@@ -38,6 +37,28 @@ const wire_types = [_]type{
     abi.ZgSceneMaterial,
     abi.ZgSceneVisibility,
     abi.ZgScenePrimitive,
+    // Paint command stream (see abi.zig).
+    abi.ZgPaintOp,
+    abi.ZgPaintOpHeader,
+    abi.ZgRgba,
+    abi.ZgXywh,
+    abi.ZgPaintRect,
+    abi.ZgPaintBorder,
+    abi.ZgPaintShadow,
+    abi.ZgPaintLiquidGlass,
+    abi.ZgPaintText,
+    abi.ZgPaintImage,
+    abi.ZgPaintClipStart,
+    abi.ZgPaintBare,
+    abi.ZgPaintPushOpacity,
+    abi.ZgPaintShaderEffect,
+    abi.ZgPaintTextLayout,
+    abi.ZgPaintGlyphRun,
+    abi.ZgPaintRenderTextureBegin,
+    abi.ZgPaintBlur,
+    abi.ZgPaintBezier,
+    abi.ZgPaintPolygon,
+    abi.ZgPaintTransformPush,
 };
 
 fn typeName(comptime T: type) []const u8 {
@@ -136,9 +157,7 @@ test "the manifest is well-formed JSON with the sizes the compiler reports" {
     // contract documents. A change here is a deliberate ABI break, not a refactor.
     for (types.items) |t| {
         const name = t.object.get("name").?.string;
-        if (std.mem.eql(u8, name, "ZgPaintCommand")) {
-            try std.testing.expectEqual(@as(i64, 112), t.object.get("size").?.integer);
-        } else if (std.mem.eql(u8, name, "ZgEvent")) {
+        if (std.mem.eql(u8, name, "ZgEvent")) {
             try std.testing.expectEqual(@as(i64, 44), t.object.get("size").?.integer);
         } else if (std.mem.eql(u8, name, "ZgRenderSettings3D")) {
             try std.testing.expectEqual(@as(i64, 280), t.object.get("size").?.integer);

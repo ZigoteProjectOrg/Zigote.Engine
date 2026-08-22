@@ -101,7 +101,6 @@ const SpinLock = zg.core.sync.SpinLock;
 // read unchanged, and so `zig build ffi-manifest` has one place to reflect over.
 const abi = @import("zigote_abi");
 const ZgGlyphRunQuad = abi.ZgGlyphRunQuad;
-const ZgPaintCommand = abi.ZgPaintCommand;
 const ZgEvent = abi.ZgEvent;
 const ZgSize = abi.ZgSize;
 const ZgAbiInfo = abi.ZgAbiInfo;
@@ -291,31 +290,11 @@ pub const std_options: std.Options = .{
 
 // ── Wire types ────────────────────────────────────────────────────────────────
 
-/// Discriminant values for ZgPaintCommand.kind.
-pub const CMD_RECT: u8 = 0;
-pub const CMD_BORDER: u8 = 1;
-pub const CMD_TEXT: u8 = 2;
-pub const CMD_IMAGE: u8 = 3;
-pub const CMD_CLIP_START: u8 = 4;
-pub const CMD_CLIP_END: u8 = 5;
-pub const CMD_PUSH_OPACITY: u8 = 6;
-pub const CMD_POP_OPACITY: u8 = 7;
-pub const CMD_SHADOW: u8 = 8;
-pub const CMD_LIQUID_GLASS: u8 = 9;
-pub const CMD_SHADER_EFFECT: u8 = 10;
-pub const CMD_TEXT_LAYOUT: u8 = 11;
-pub const CMD_GLYPH_RUN: u8 = 12;
-pub const CMD_RENDER_TEXTURE_BEGIN: u8 = 13;
-pub const CMD_RENDER_TEXTURE_END: u8 = 14;
-pub const CMD_BLUR: u8 = 15;
-pub const CMD_BEZIER: u8 = 16;
-pub const CMD_POLYGON: u8 = 17;
+/// Paint op discriminants live in abi.ZgPaintOp.
 // 2-D transform stack: push a 2×3 affine (x' = a·x + c·y + tx; y' = b·x + d·y + ty) that
 // applies to every subsequent command until the matching pop. Coefficients ride existing
 // float slots (a=rect_x b=rect_y c=rect_w d=rect_h tx=radius ty=border_width) — no new
 // ZgPaintCommand fields, so the ABI stays at version 9 (same pattern as CMD_POLYGON).
-pub const CMD_TRANSFORM_PUSH: u8 = 18;
-pub const CMD_TRANSFORM_POP: u8 = 19;
 
 
 
@@ -2596,156 +2575,171 @@ export fn zigote_audio_decode_free(frames: usize) ZgStatus {
 /// Translate raw ZgPaintCommand array into a native PaintList.
 /// CMD_RENDER_TEXTURE_BEGIN/END route commands into RT sub-lists.
 /// CMD_BLUR records blur requests for processing in renderFrameV2Impl.
+/// Decode a tagged paint-command stream into the renderer's internal command list.
+///
+/// The wire format is `ZgPaintOpHeader` + a kind-specific record (see abi.zig). It replaced one
+/// flat 112-byte struct shared by all 20 kinds, in which `radius` was also an image u0 and a
+/// `@bitCast` shader id, `img_pixel_w` was also a text-shadow blur, `text_len` was also a glyph
+/// COUNT, and a text shadow's colour lived in the rectangle fields. Each of those is now a named
+/// field of its own record.
+///
+/// Unknown ops are skipped by `size` rather than ending the frame's paint, so a host that sends a
+/// command this build predates still gets everything else drawn.
 fn fillPaintList(
     state: *EngineState,
     list: *zg.PaintList,
-    commands: [*]const ZgPaintCommand,
-    count: u32,
+    stream: [*]const u8,
+    len: usize,
 ) !void {
     const alloc = state.allocator;
     list.clearRetainingCapacity(alloc);
+    if (len == 0) return;
+
+    const bytes = stream[0..len];
+    if (paintStreamBadRecord(bytes)) |bad| {
+        const h: *const abi.ZgPaintOpHeader = @ptrCast(@alignCast(&bytes[bad]));
+        std.log.err(
+            "paint stream: malformed record at byte {d} (kind {d}, size {d}) — frame's paint dropped",
+            .{ bad, h.kind, h.size },
+        );
+        return;
+    }
 
     // Route commands into the appropriate sub-list (main or RT)
     var list_stack: [8]*zg.PaintList = undefined;
     var stack_depth: usize = 0;
     var current: *zg.PaintList = list;
 
-    for (commands[0..count]) |*cmd| {
-        switch (cmd.kind) {
-            CMD_RECT => {
+    const rgba = struct {
+        fn c(v: abi.ZgRgba) zg.geometry.Color {
+            return zg.geometry.Color.rgba(
+                @intFromFloat(std.math.clamp(v.r * 255, 0, 255)),
+                @intFromFloat(std.math.clamp(v.g * 255, 0, 255)),
+                @intFromFloat(std.math.clamp(v.b * 255, 0, 255)),
+                @intFromFloat(std.math.clamp(v.a * 255, 0, 255)),
+            );
+        }
+    }.c;
+    const xywh = struct {
+        fn r(v: abi.ZgXywh) zg.Rect {
+            return .{ .x = v.x, .y = v.y, .width = v.w, .height = v.h };
+        }
+    }.r;
+
+    var off: usize = 0;
+    while (off + @sizeOf(abi.ZgPaintOpHeader) <= len) {
+        const header: *const abi.ZgPaintOpHeader = @ptrCast(@alignCast(&bytes[off]));
+        const rec = bytes[off..][0..header.size];
+        defer off += header.size;
+
+        switch (header.kind) {
+            @intFromEnum(abi.ZgPaintOp.rect) => {
+                if (rec.len < @sizeOf(abi.ZgPaintRect)) continue;
+                const op: *const abi.ZgPaintRect = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .rect = .{
-                    .bounds = .{ .x = cmd.rect_x, .y = cmd.rect_y, .width = cmd.rect_w, .height = cmd.rect_h },
-                    .color = zg.geometry.Color.rgba(
-                        @intFromFloat(std.math.clamp(cmd.color_r * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_g * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_b * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_a * 255, 0, 255)),
-                    ),
-                    .radius = cmd.radius,
+                    .bounds = xywh(op.bounds),
+                    .color = rgba(op.color),
+                    .radius = op.radius,
                 } });
             },
-            CMD_BORDER => {
+            @intFromEnum(abi.ZgPaintOp.border) => {
+                if (rec.len < @sizeOf(abi.ZgPaintBorder)) continue;
+                const op: *const abi.ZgPaintBorder = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .border = .{
-                    .bounds = .{ .x = cmd.rect_x, .y = cmd.rect_y, .width = cmd.rect_w, .height = cmd.rect_h },
-                    .color = zg.geometry.Color.rgba(
-                        @intFromFloat(std.math.clamp(cmd.color_r * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_g * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_b * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_a * 255, 0, 255)),
-                    ),
-                    .radius = cmd.radius,
-                    .width = cmd.border_width,
+                    .bounds = xywh(op.bounds),
+                    .color = rgba(op.color),
+                    .radius = op.radius,
+                    .width = op.width,
                 } });
             },
-            CMD_SHADOW => {
+            @intFromEnum(abi.ZgPaintOp.shadow) => {
+                if (rec.len < @sizeOf(abi.ZgPaintShadow)) continue;
+                const op: *const abi.ZgPaintShadow = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .shadow = .{
-                    .bounds = .{ .x = cmd.rect_x, .y = cmd.rect_y, .width = cmd.rect_w, .height = cmd.rect_h },
-                    .color = zg.geometry.Color.rgba(
-                        @intFromFloat(std.math.clamp(cmd.color_r * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_g * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_b * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_a * 255, 0, 255)),
-                    ),
-                    .radius = cmd.radius,
-                    .blur_radius = cmd.border_width,
-                    .spread = cmd.baseline_x,
+                    .bounds = xywh(op.bounds),
+                    .color = rgba(op.color),
+                    .radius = op.radius,
+                    .blur_radius = op.blur_radius,
+                    .spread = op.spread,
                 } });
             },
-            CMD_LIQUID_GLASS => {
+            @intFromEnum(abi.ZgPaintOp.liquid_glass) => {
+                if (rec.len < @sizeOf(abi.ZgPaintLiquidGlass)) continue;
+                const op: *const abi.ZgPaintLiquidGlass = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .liquid_glass = .{
-                    .bounds = .{ .x = cmd.rect_x, .y = cmd.rect_y, .width = cmd.rect_w, .height = cmd.rect_h },
-                    .color = zg.geometry.Color.rgba(
-                        @intFromFloat(std.math.clamp(cmd.color_r * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_g * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_b * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_a * 255, 0, 255)),
-                    ),
-                    .radius = cmd.radius,
-                    .thickness = cmd.border_width,
-                    .glow_x = cmd.baseline_x,
-                    .glow_y = cmd.baseline_y,
-                    .pinch = cmd.font_size,
-                    // Glass never carries text metrics, so line_height is free to be the
-                    // adaptive-luminance knob (see PaintList.AddLiquidGlass).
-                    .adapt = cmd.line_height,
+                    .bounds = xywh(op.bounds),
+                    .color = rgba(op.color),
+                    .radius = op.radius,
+                    .thickness = op.thickness,
+                    .glow_x = op.glow_x,
+                    .glow_y = op.glow_y,
+                    .pinch = op.pinch,
+                    .adapt = op.adapt,
                 } });
             },
-            CMD_TEXT => {
-                if (cmd.text_ptr == null or cmd.text_len == 0) continue;
-                const text_slice = cmd.text_ptr[0..cmd.text_len];
-                const fw: text_mod.FontWeight = @enumFromInt(cmd.font_weight);
-                const fs: text_mod.FontStyle = if (cmd.font_style == 1) .italic else .normal;
-                // Text commands never carry image pixels, so the pixels side-channel doubles as the
-                // optional font-family name (UTF-8). null → renderer uses the default UI face.
+            @intFromEnum(abi.ZgPaintOp.text) => {
+                if (rec.len < @sizeOf(abi.ZgPaintText)) continue;
+                const op: *const abi.ZgPaintText = @ptrCast(@alignCast(rec.ptr));
+                if (op.text_ptr == null or op.text_len == 0) continue;
+                const text_slice = op.text_ptr[0..op.text_len];
+                const fw: text_mod.FontWeight = @enumFromInt(@as(u16, @truncate(op.font_weight)));
+                const fs: text_mod.FontStyle = if (op.font_style == 1) .italic else .normal;
                 const font_family: ?[]const u8 =
-                    if (cmd.pixels_ptr != null and cmd.pixels_len > 0)
-                        cmd.pixels_ptr[0..cmd.pixels_len]
+                    if (op.family_ptr != null and op.family_len > 0)
+                        op.family_ptr[0..op.family_len]
                     else
                         null;
-                // Text shadow rides in slots CMD_TEXT never used (rect = color, radius /
-                // border_width = offset, img_pixel_w = blur bitcast). Present iff alpha > 0;
-                // drawn as a second blurred text run underneath the real one.
-                if (cmd.rect_h > 0) {
+                // The drop shadow is a second, blurred run underneath the real one. It used to be
+                // signalled by a positive alpha smuggled through rect_h.
+                if (op.is_shadow != 0) {
                     try current.appendOwnedText(alloc, .{
-                        .baseline_x = cmd.baseline_x + cmd.radius,
-                        .baseline_y = cmd.baseline_y + cmd.border_width,
+                        .baseline_x = op.baseline_x + op.shadow_dx,
+                        .baseline_y = op.baseline_y + op.shadow_dy,
                         .text = text_slice,
-                        .color = zg.geometry.Color.rgba(
-                            @intFromFloat(std.math.clamp(cmd.rect_x * 255, 0, 255)),
-                            @intFromFloat(std.math.clamp(cmd.rect_y * 255, 0, 255)),
-                            @intFromFloat(std.math.clamp(cmd.rect_w * 255, 0, 255)),
-                            @intFromFloat(std.math.clamp(cmd.rect_h * 255, 0, 255)),
-                        ),
-                        .size = cmd.font_size,
-                        .line_height = cmd.line_height,
+                        .color = rgba(op.color),
+                        .size = op.font_size,
+                        .line_height = op.line_height,
                         .font_family = font_family,
                         .font_weight = fw,
                         .font_style = fs,
-                        .letter_spacing = cmd.letter_spacing,
-                        .word_spacing = cmd.word_spacing,
-                        .blur = @bitCast(cmd.img_pixel_w),
+                        .letter_spacing = op.letter_spacing,
+                        .word_spacing = op.word_spacing,
+                        .blur = op.shadow_blur,
+                    });
+                } else {
+                    try current.appendOwnedText(alloc, .{
+                        .baseline_x = op.baseline_x,
+                        .baseline_y = op.baseline_y,
+                        .text = text_slice,
+                        .color = rgba(op.color),
+                        .size = op.font_size,
+                        .line_height = op.line_height,
+                        .font_family = font_family,
+                        .font_weight = fw,
+                        .font_style = fs,
+                        .letter_spacing = op.letter_spacing,
+                        .word_spacing = op.word_spacing,
                     });
                 }
-                try current.appendOwnedText(alloc, .{
-                    .baseline_x = cmd.baseline_x,
-                    .baseline_y = cmd.baseline_y,
-                    .text = text_slice,
-                    .color = zg.geometry.Color.rgba(
-                        @intFromFloat(std.math.clamp(cmd.color_r * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_g * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_b * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_a * 255, 0, 255)),
-                    ),
-                    .size = cmd.font_size,
-                    .line_height = cmd.line_height,
-                    .font_family = font_family,
-                    .font_weight = fw,
-                    .font_style = fs,
-                    .letter_spacing = cmd.letter_spacing,
-                    .word_spacing = cmd.word_spacing,
-                });
             },
-            CMD_IMAGE => {
-                const cache_key: ?u64 = if (cmd.has_cache_key != 0)
-                    (@as(u64, cmd.cache_key_hi) << 32) | @as(u64, cmd.cache_key_lo)
-                else
-                    null;
+            @intFromEnum(abi.ZgPaintOp.image) => {
+                if (rec.len < @sizeOf(abi.ZgPaintImage)) continue;
+                const op: *const abi.ZgPaintImage = @ptrCast(@alignCast(rec.ptr));
+                const cache_key: ?u64 = if (op.has_cache_key != 0) op.cache_key else null;
 
                 var pixels: []const u8 = &.{};
-                var w = cmd.img_pixel_w;
-                var h = cmd.img_pixel_h;
+                var w = op.pixel_w;
+                var h = op.pixel_h;
                 var stride: u32 = 0;
                 var bgra = false;
 
                 const render3d_magic: u64 = 0x3D3D3D3D3D3D3D3D;
 
-                if (cmd.pixels_ptr != null and cmd.pixels_len > 0) {
-                    pixels = cmd.pixels_ptr[0..cmd.pixels_len];
+                if (op.pixels_ptr != null and op.pixels_len > 0) {
+                    pixels = op.pixels_ptr[0..op.pixels_len];
                 } else if (cache_key) |key| {
                     // Locked: a worker thread may be inserting a freshly decoded image right now,
-                    // and a rehash under a reader would hand back a dangling slice. The pixels a
-                    // hit yields stay valid for the frame — releases are deferred to end-of-frame,
-                    // which runs on this thread.
+                    // and a rehash under a reader would hand back a dangling slice.
                     state.image_lock.lock();
                     const found = state.image_registry.get(key);
                     state.image_lock.unlock();
@@ -2759,12 +2753,9 @@ fn fillPaintList(
                         stride = cached_img.stride;
                         bgra = cached_img.bgra;
                     } else if (key == render3d_magic) {
-                        // 3D offscreen texture — lives in gpu_ui.image_cache, not
-                        // image_registry. Pass through with empty pixels; the wgpu
-                        // renderer will find the GPU texture by its magic cache key.
+                        // 3D offscreen texture — lives in gpu_ui.image_cache, not image_registry.
                     } else if (state.render_textures.contains(key)) {
-                        // RT texture — will be registered in image_cache by renderFrameV2Impl.
-                        // Pass through with empty pixels; renderer finds it via cache_key.
+                        // RT texture — registered in image_cache by renderFrameV2Impl.
                     } else {
                         continue;
                     }
@@ -2773,58 +2764,50 @@ fn fillPaintList(
                 }
 
                 try current.append(alloc, .{ .image = .{
-                    .bounds = .{ .x = cmd.rect_x, .y = cmd.rect_y, .width = cmd.rect_w, .height = cmd.rect_h },
+                    .bounds = xywh(op.bounds),
                     .width = w,
                     .height = h,
                     .pixels = pixels,
                     .stride = stride,
                     .bgra = bgra,
                     .cache_key = cache_key,
-                    .u0 = cmd.radius,
-                    .v0 = cmd.border_width,
-                    .u1 = cmd.baseline_x,
-                    .v1 = cmd.baseline_y,
+                    .u0 = op.u0,
+                    .v0 = op.v0,
+                    .u1 = op.u1,
+                    .v1 = op.v1,
                 } });
             },
-            CMD_CLIP_START => {
-                // radius rides the shared Radius field (offset 56) — always 0 before rounded
-                // clips existed, so old paint streams parse identically. No ABI change.
+            @intFromEnum(abi.ZgPaintOp.clip_start) => {
+                if (rec.len < @sizeOf(abi.ZgPaintClipStart)) continue;
+                const op: *const abi.ZgPaintClipStart = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .clip_start = .{
-                    .rect = .{
-                        .x = cmd.rect_x,
-                        .y = cmd.rect_y,
-                        .width = cmd.rect_w,
-                        .height = cmd.rect_h,
-                    },
-                    .radius = @max(0, cmd.radius),
+                    .rect = xywh(op.bounds),
+                    .radius = @max(0, op.radius),
                 } });
             },
-            CMD_CLIP_END => {
-                try current.append(alloc, .clip_end);
-            },
-            CMD_PUSH_OPACITY => {
+            @intFromEnum(abi.ZgPaintOp.clip_end) => try current.append(alloc, .clip_end),
+            @intFromEnum(abi.ZgPaintOp.push_opacity) => {
+                if (rec.len < @sizeOf(abi.ZgPaintPushOpacity)) continue;
+                const op: *const abi.ZgPaintPushOpacity = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .push_opacity = .{
-                    .bounds = .{ .x = cmd.rect_x, .y = cmd.rect_y, .width = cmd.rect_w, .height = cmd.rect_h },
-                    .alpha = cmd.color_a,
+                    .bounds = xywh(op.bounds),
+                    .alpha = op.alpha,
                 } });
             },
-            CMD_POP_OPACITY => {
-                try current.append(alloc, .pop_opacity);
-            },
-            CMD_SHADER_EFFECT => {
-                const shader_id: u32 = @bitCast(cmd.radius);
-                // Optional @group(1) texture: same registry resolve as CMD_IMAGE, so the
-                // renderer can materialize the GPU entry even for a texture never drawn as an
-                // image (a LUT, a mask). Same locking rationale as there.
+            @intFromEnum(abi.ZgPaintOp.pop_opacity) => try current.append(alloc, .pop_opacity),
+            @intFromEnum(abi.ZgPaintOp.shader_effect) => {
+                if (rec.len < @sizeOf(abi.ZgPaintShaderEffect)) continue;
+                const op: *const abi.ZgPaintShaderEffect = @ptrCast(@alignCast(rec.ptr));
+                // Optional @group(1) texture: same registry resolve as an image op, so the
+                // renderer can materialize a texture never drawn as an image (a LUT, a mask).
                 var image_key: ?u64 = null;
                 var image_pixels: []const u8 = &.{};
                 var image_w: u32 = 0;
                 var image_h: u32 = 0;
-                if (cmd.has_cache_key != 0) {
-                    const key = (@as(u64, cmd.cache_key_hi) << 32) | @as(u64, cmd.cache_key_lo);
-                    image_key = key;
+                if (op.has_cache_key != 0) {
+                    image_key = op.cache_key;
                     state.image_lock.lock();
-                    const found = state.image_registry.get(key);
+                    const found = state.image_registry.get(op.cache_key);
                     state.image_lock.unlock();
                     if (found) |img| {
                         image_pixels = img.pixels;
@@ -2833,54 +2816,43 @@ fn fillPaintList(
                     }
                 }
                 try current.append(alloc, .{ .shader_effect = .{
-                    .bounds = .{ .x = cmd.rect_x, .y = cmd.rect_y, .width = cmd.rect_w, .height = cmd.rect_h },
-                    .shader_id = shader_id,
-                    .params = .{
-                        cmd.color_r,      cmd.color_g,    cmd.color_b,    cmd.color_a,
-                        cmd.border_width, cmd.baseline_x, cmd.baseline_y, cmd.font_size,
-                    },
+                    .bounds = xywh(op.bounds),
+                    .shader_id = op.shader_id,
+                    .params = op.params,
                     .image_key = image_key,
                     .image_width = image_w,
                     .image_height = image_h,
                     .image_pixels = image_pixels,
-                    .chains_backdrop = cmd.chains_backdrop != 0,
+                    .chains_backdrop = op.chains_backdrop != 0,
                 } });
             },
-            CMD_TEXT_LAYOUT => {
-                const handle = (@as(u64, cmd.cache_key_hi) << 32) | @as(u64, cmd.cache_key_lo);
-                if (handle == 0) continue;
+            @intFromEnum(abi.ZgPaintOp.text_layout) => {
+                if (rec.len < @sizeOf(abi.ZgPaintTextLayout)) continue;
+                const op: *const abi.ZgPaintTextLayout = @ptrCast(@alignCast(rec.ptr));
+                if (op.layout == 0) continue;
                 try current.append(alloc, .{ .text_layout = .{
-                    .handle = handle,
-                    .draw_x = cmd.baseline_x,
-                    .draw_y = cmd.baseline_y,
-                    .color = zg.geometry.Color.rgba(
-                        @intFromFloat(std.math.clamp(cmd.color_r * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_g * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_b * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_a * 255, 0, 255)),
-                    ),
+                    .handle = op.layout,
+                    .draw_x = op.draw_x,
+                    .draw_y = op.draw_y,
+                    .color = rgba(op.color),
                 } });
             },
-            CMD_GLYPH_RUN => {
-                const handle = (@as(u64, cmd.cache_key_hi) << 32) | @as(u64, cmd.cache_key_lo);
-                if (cmd.text_ptr == null or cmd.text_len == 0) continue;
-                const quad_count = @as(usize, cmd.text_len);
-                const quads_src: [*]const zg.paint.GlyphRunQuad = @ptrCast(@alignCast(cmd.text_ptr));
+            @intFromEnum(abi.ZgPaintOp.glyph_run) => {
+                if (rec.len < @sizeOf(abi.ZgPaintGlyphRun)) continue;
+                const op: *const abi.ZgPaintGlyphRun = @ptrCast(@alignCast(rec.ptr));
+                if (op.quads_ptr == null or op.quad_count == 0) continue;
+                const quads_src: [*]const zg.paint.GlyphRunQuad = @ptrCast(@alignCast(op.quads_ptr));
                 try current.appendOwnedGlyphRun(alloc, .{
-                    .atlas_handle = handle,
-                    .tint = zg.geometry.Color.rgba(
-                        @intFromFloat(std.math.clamp(cmd.color_r * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_g * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_b * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_a * 255, 0, 255)),
-                    ),
-                    .quads = quads_src[0..quad_count],
+                    .atlas_handle = op.atlas,
+                    .tint = rgba(op.color),
+                    .quads = quads_src[0..op.quad_count],
                 });
             },
-            CMD_RENDER_TEXTURE_BEGIN => {
-                if (cmd.has_cache_key == 0) continue;
-                const rt_handle = (@as(u64, cmd.cache_key_hi) << 32) | @as(u64, cmd.cache_key_lo);
-                if (state.render_textures.getPtr(rt_handle)) |rt| {
+            @intFromEnum(abi.ZgPaintOp.render_texture_begin) => {
+                if (rec.len < @sizeOf(abi.ZgPaintRenderTextureBegin)) continue;
+                const op: *const abi.ZgPaintRenderTextureBegin = @ptrCast(@alignCast(rec.ptr));
+                if (op.rt_handle == 0) continue;
+                if (state.render_textures.getPtr(op.rt_handle)) |rt| {
                     rt.pending_paint.clearRetainingCapacity(alloc);
                     if (stack_depth < list_stack.len) {
                         list_stack[stack_depth] = current;
@@ -2890,70 +2862,76 @@ fn fillPaintList(
                         std.log.warn("zigote: RT nesting too deep, clamping at {d}", .{list_stack.len});
                     }
                 } else {
-                    std.log.warn("zigote: CMD_RENDER_TEXTURE_BEGIN: unknown RT handle 0x{x}", .{rt_handle});
+                    std.log.warn("zigote: render_texture_begin: unknown RT handle 0x{x}", .{op.rt_handle});
                 }
             },
-            CMD_RENDER_TEXTURE_END => {
+            @intFromEnum(abi.ZgPaintOp.render_texture_end) => {
                 if (stack_depth > 0) {
                     stack_depth -= 1;
                     current = list_stack[stack_depth];
                 }
             },
-            CMD_BLUR => {
-                if (cmd.has_cache_key == 0) continue;
-                const src_handle = (@as(u64, cmd.cache_key_hi) << 32) | @as(u64, cmd.cache_key_lo);
+            @intFromEnum(abi.ZgPaintOp.blur) => {
+                if (rec.len < @sizeOf(abi.ZgPaintBlur)) continue;
+                const op: *const abi.ZgPaintBlur = @ptrCast(@alignCast(rec.ptr));
+                if (op.src_handle == 0) continue;
                 try state.blur_requests.append(alloc, .{
-                    .src_handle = src_handle,
-                    .sigma = cmd.radius,
+                    .src_handle = op.src_handle,
+                    .sigma = op.sigma,
                 });
             },
-            CMD_BEZIER => {
-                // Four control points packed into rect / radius / baseline slots; width in font_size.
+            @intFromEnum(abi.ZgPaintOp.bezier) => {
+                if (rec.len < @sizeOf(abi.ZgPaintBezier)) continue;
+                const op: *const abi.ZgPaintBezier = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .bezier = .{
-                    .x0 = cmd.rect_x,
-                    .y0 = cmd.rect_y,
-                    .x1 = cmd.rect_w,
-                    .y1 = cmd.rect_h,
-                    .x2 = cmd.radius,
-                    .y2 = cmd.border_width,
-                    .x3 = cmd.baseline_x,
-                    .y3 = cmd.baseline_y,
-                    .color = zg.geometry.Color.rgba(
-                        @intFromFloat(std.math.clamp(cmd.color_r * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_g * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_b * 255, 0, 255)),
-                        @intFromFloat(std.math.clamp(cmd.color_a * 255, 0, 255)),
-                    ),
-                    .width = cmd.font_size,
+                    .x0 = op.x0,
+                    .y0 = op.y0,
+                    .x1 = op.x1,
+                    .y1 = op.y1,
+                    .x2 = op.x2,
+                    .y2 = op.y2,
+                    .x3 = op.x3,
+                    .y3 = op.y3,
+                    .color = rgba(op.color),
+                    .width = op.width,
                 } });
             },
-            CMD_POLYGON => {
-                // Points (x,y f32 pairs) ride the pixels side-channel; need at least 3 (24 bytes).
-                if (cmd.pixels_ptr == null or cmd.pixels_len < 24) continue;
-                const bytes = cmd.pixels_ptr[0..cmd.pixels_len];
-                try current.appendOwnedPolygon(alloc, bytes, zg.geometry.Color.rgba(
-                    @intFromFloat(std.math.clamp(cmd.color_r * 255, 0, 255)),
-                    @intFromFloat(std.math.clamp(cmd.color_g * 255, 0, 255)),
-                    @intFromFloat(std.math.clamp(cmd.color_b * 255, 0, 255)),
-                    @intFromFloat(std.math.clamp(cmd.color_a * 255, 0, 255)),
-                ));
+            @intFromEnum(abi.ZgPaintOp.polygon) => {
+                if (rec.len < @sizeOf(abi.ZgPaintPolygon)) continue;
+                const op: *const abi.ZgPaintPolygon = @ptrCast(@alignCast(rec.ptr));
+                // Points are (x,y) f32 pairs; a polygon needs at least 3 (24 bytes).
+                if (op.points_ptr == null or op.points_len < 24) continue;
+                try current.appendOwnedPolygon(alloc, op.points_ptr[0..op.points_len], rgba(op.color));
             },
-            CMD_TRANSFORM_PUSH => {
+            @intFromEnum(abi.ZgPaintOp.transform_push) => {
+                if (rec.len < @sizeOf(abi.ZgPaintTransformPush)) continue;
+                const op: *const abi.ZgPaintTransformPush = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .transform_push = .{
-                    .a = cmd.rect_x,
-                    .b = cmd.rect_y,
-                    .c = cmd.rect_w,
-                    .d = cmd.rect_h,
-                    .tx = cmd.radius,
-                    .ty = cmd.border_width,
+                    .a = op.a,
+                    .b = op.b,
+                    .c = op.c,
+                    .d = op.d,
+                    .tx = op.tx,
+                    .ty = op.ty,
                 } });
             },
-            CMD_TRANSFORM_POP => {
-                try current.append(alloc, .transform_pop);
-            },
-            else => {},
+            @intFromEnum(abi.ZgPaintOp.transform_pop) => try current.append(alloc, .transform_pop),
+            else => {}, // unknown op: skipped by size
         }
     }
+}
+
+/// The offset of the first malformed paint record, or null. Same rules and same reasoning as
+/// `sceneStreamBadRecord`; pure so it can be tested without an engine.
+fn paintStreamBadRecord(bytes: []const u8) ?usize {
+    var off: usize = 0;
+    while (off + @sizeOf(abi.ZgPaintOpHeader) <= bytes.len) {
+        const header: *const abi.ZgPaintOpHeader = @ptrCast(@alignCast(&bytes[off]));
+        const size = header.size;
+        if (size < @sizeOf(abi.ZgPaintOpHeader) or size % 8 != 0 or off + size > bytes.len) return off;
+        off += size;
+    }
+    return null;
 }
 
 export fn zigote_register_shader(id: u32, wgsl_ptr: [*]const u8, wgsl_len: usize) ZgResult {
@@ -6248,7 +6226,7 @@ export fn zigote_physics_raycast_closest(ox: f32,
 export fn zigote_get_renderer_abi_info(out_info: *ZgAbiInfo) ZgStatus {
     out_info.* = .{
         .abi_version = 100,
-        .paint_command_size = @sizeOf(ZgPaintCommand),
+        .paint_op_header_size = @sizeOf(abi.ZgPaintOpHeader),
         .event_size = @sizeOf(ZgEvent),
         .handle_size = @sizeOf(usize),
         .render_settings_3d_size = @sizeOf(ZgRenderSettings3D),
@@ -6328,13 +6306,13 @@ export fn zigote_submit_frame_damage(rects: [*c]const f32, count: u32) ZgStatus 
 /// zigote_window_create for a secondary one — secondary windows used to have their own
 /// zigote_window_submit_paint/_overlay/_render trio, a second frame API the caller had to pick
 /// between. See docs/v2-design.md §2.2.
-export fn zigote_submit_paint_commands(window: u64, commands: [*]const ZgPaintCommand, count: u32) ZgStatus {
+export fn zigote_submit_paint_commands(window: u64, stream: [*]const u8, len: usize) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
     const list = if (window == 0)
         &state.paint_list
     else
         &(windowFromHandle(state, window) orelse return .invalid_handle).paint_list;
-    fillPaintList(state, list, commands, count) catch |err| {
+    fillPaintList(state, list, stream, len) catch |err| {
         std.log.err("zigote_submit_paint_commands failed: {}", .{err});
         return .out_of_memory;
     };
@@ -6343,13 +6321,13 @@ export fn zigote_submit_paint_commands(window: u64, commands: [*]const ZgPaintCo
 
 /// Like zigote_submit_paint_commands but for the overlay pass.
 /// The overlay layer (popups, tooltips), drawn after the root list. `window` as above.
-export fn zigote_submit_overlay_commands(window: u64, commands: [*]const ZgPaintCommand, count: u32) ZgStatus {
+export fn zigote_submit_overlay_commands(window: u64, stream: [*]const u8, len: usize) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
     const list = if (window == 0)
         &state.overlay_paint_list
     else
         &(windowFromHandle(state, window) orelse return .invalid_handle).overlay_paint_list;
-    fillPaintList(state, list, commands, count) catch |err| {
+    fillPaintList(state, list, stream, len) catch |err| {
         std.log.err("zigote_submit_overlay_commands failed: {}", .{err});
         return .out_of_memory;
     };
