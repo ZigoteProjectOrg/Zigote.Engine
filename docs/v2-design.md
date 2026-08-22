@@ -571,3 +571,80 @@ order-dependent flakes in the Reactive and World areas (they pass in isolation).
 pre-existing by running the full suite against the engine with the changes stashed. Not addressed
 here — it is unrelated to the engine — but worth fixing separately, because it makes the suite a
 weak gate for exactly this kind of work.
+
+---
+
+## 11. Measured results
+
+Same machine (Radeon 780M / RADV, Zig 0.16, .NET 10). "Before" is the pre-refactor tree
+(`2c2279f` / engine `9fe3962`) built and run from a worktree, so both sides are measured the same
+way rather than compared against remembered numbers.
+
+### GPU memory — the one real win
+
+Same scene, 640×480, from the engine's own `ZIGOTE_GPU_MEM` diagnostic:
+
+| | before | after |
+|---|---:|---:|
+| HDR targets (scene + refraction + bloom chain) | 7.8 MB | **5.5 MB** |
+| 3D targets, total | 147.6 MB | **145.2 MB** |
+
+The difference is exactly one full-res `rgba16float` — the bloom chain's level 0, which was
+allocated and never read. It is linear in pixel count, so **~16.6 MB at 1080p**, on every 3D app
+including both mobile heads.
+
+This is also a small cautionary tale. The first before/after run reported an *identical* 147.6 MB,
+because `targetMemoryBytes` estimated the bloom chain with a hardcoded `4/3` constant that was only
+true while level 0 existed. The allocation had changed; the diagnostic had not. Had I trusted it,
+I would have concluded the change did nothing.
+
+### Frame time — unchanged, as expected
+
+3D scene, 300 frames, five runs each, median of medians:
+
+| | before | after |
+|---|---:|---:|
+| ms/frame | 7.81 | 7.87 |
+
+Statistically identical. That is the correct outcome: the removed bloom level was never *read*, so
+no GPU work went with it, and nothing else in this series touched per-frame work on the 3D path.
+
+### 2D paint throughput (new measurement, no "before")
+
+`ZIGOTE_SMOKE_PAINT`, vsync off — the benchmark did not exist before, so there is nothing to compare
+against; these are the numbers future work is measured against.
+
+| commands | total | C# build | native transcode | native render |
+|---:|---:|---:|---:|---:|
+| 2 000 | 1.03 ms | 0.23 | 0.10 | 0.70 |
+| 8 000 | 3.38 ms | 0.92 | 0.39 | 2.07 |
+| 20 000 | 8.39 ms | 2.66 | 1.12 | 4.61 |
+
+~0.42 µs/command. A heavy 2 000-command UI frame is ~1 ms, under 5 % of a 60 Hz budget.
+
+### Structure
+
+| | before | after |
+|---|---:|---:|
+| Exported symbols | 295 | 289 |
+| `zig build test` assertions (test blocks) | 70 | **91** |
+| `ffi/ecs.zig` | 556 | **464** |
+| `Native/ZgStructs.cs` (hand-mirrored layout) | 506 | **381** |
+| `Gpu3d.init` | 1417 | **1011** |
+
+Engine diff over the series: **73 files, +4964 / −5264**.
+
+The first-party Zig line count went *up* slightly (32 031 → 32 865), and that is worth stating
+plainly rather than hiding behind the deletion figure. This was not primarily a deletion exercise:
+roughly 1 500 lines of dead or duplicated code went (the render graph, the backend vtable, 55
+ECS forwarder pairs, three spinlocks, four alias files, a dead shader, texture staging, `zpool`),
+and rather more arrived as things that did not exist before — a generational handle table, the wire
+contract, a shader validator, an FFI manifest generator, an ECS stub, the scene command stream, and
+21 new tests.
+
+### What did not get faster
+
+Nothing in §3's original list, because — as §10 records — those costs were already avoided by
+dirty-gating, cache keys and the idle-frame early return. The wins here are memory, safety
+(generational handles, validated ABI layout, stub parity), and coverage (headless shader
+validation, all-command golden, config matrix), not throughput.
