@@ -192,7 +192,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   let H = normalize(L + vec3<f32>(0.0, 0.0, 1.0));
   let spec = pow(max(dot(normal, H), 0.0), SPEC_POWER);
   let fres = edge * edge;
-  let tg = clamp((thickness - 3.0) * 0.25, 0.0, 1.0);
+  // Gated from one pixel, not three: a hairline bevel (the Adwaita panes run 2.5-3.5 logical
+  // pixels) is exactly the edge that needs its catch of light to read as an edge at all, and
+  // on a 1x display a gate at three left it unlit. A full slab still lights fully.
+  let tg = clamp((thickness - 1.0) * 0.25, 0.0, 1.0);
   rgb += vec3<f32>(spec * SPEC_GAIN + fres * RIM_GAIN) * tg;
   rgb *= 1.0 - CONTACT * fres * tg;
 
