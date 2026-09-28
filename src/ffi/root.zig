@@ -18,6 +18,11 @@
 ///   zigote_measure_text()
 const std = @import("std");
 const sdl3 = @import("sdl3");
+const wayland_layer = @import("wayland_layer.zig");
+const wayland_toplevel = @import("wayland_toplevel.zig");
+const wayland_desktop = @import("wayland_desktop.zig");
+const wayland_lock = @import("wayland_lock.zig");
+const wayland_vkbd = @import("wayland_vkbd.zig");
 const wgpu = @import("wgpu");
 const zg = @import("zigote");
 // Real Jolt wrapper when `-Dphysics3d=true` (default); a no-op stub with the same public surface
@@ -475,6 +480,10 @@ const SecondaryWindow = struct {
     frame_index: u32,
     /// Logical-to-pixel scale for this window, stored by zigote_frame_begin.
     pending_scale: f32 = 1.0,
+    /// Set when the window is a wlr-layer-shell surface (panel, dock…) rather than a toplevel.
+    layer: ?*wayland_layer.LayerSurface = null,
+    /// Set when the window is an ext-session-lock surface.
+    lock_surface: ?*wayland_lock.LockSurface = null,
 
     fn deinit(self: *SecondaryWindow, alloc: std.mem.Allocator) void {
         self.overlay_paint_list.deinit(alloc);
@@ -482,6 +491,8 @@ const SecondaryWindow = struct {
         self.gpu_ui.deinit();
         self.surface.unconfigure();
         self.surface.release();
+        if (self.layer) |l| l.destroy(alloc); // role objects go before SDL drops the wl_surface
+        if (self.lock_surface) |l| l.destroy(alloc);
         if (self.metal_view) |mv| mv.deinit();
         self.window.deinit();
     }
@@ -4587,23 +4598,56 @@ fn createSecondaryWindowImpl(
     width: u32,
     height: u32,
     title_c: [*c]const u8,
+    layer: ?wayland_layer.Options,
+    lock_output: ?*wayland_layer.Proxy,
 ) !*SecondaryWindow {
     const title_slice: [:0]const u8 = if (title_c != null) std.mem.span(title_c) else "Zigote";
+    const custom_role = layer != null or lock_output != null;
 
-    var window = try sdl3.video.Window.init(
-        title_slice,
-        width,
-        height,
-        // Same alpha channel the main window asked for, or a secondary window (devtools, Settings)
-        // would sit next to it with square corners: the per-frame CSD rounding clips only on a
-        // window the compositor actually composites (zigote_window_is_transparent).
-        .{
-            .resizable = true,
-            .high_pixel_density = true,
-            .transparent = pending_transparent_window,
-        },
-    );
+    // Same alpha channel the main window asked for, or a secondary window (devtools, Settings)
+    // would sit next to it with square corners: the per-frame CSD rounding clips only on a
+    // window the compositor actually composites (zigote_window_is_transparent). A layer
+    // surface is always composited and always wants alpha (a dock is a floating card).
+    var window, const window_props = try sdl3.video.Window.initWithProperties(.{
+        .title = title_slice,
+        // A layer surface may stretch along an anchored axis (size 0); SDL still wants a real
+        // initial size, and the compositor's configure replaces it below.
+        .width = @max(width, 1),
+        .height = @max(height, 1),
+        .resizable = true,
+        .high_pixel_density = true,
+        .transparent = pending_transparent_window or custom_role,
+        // Leave the wl_surface role-less so wayland_layer / wayland_lock can give it its role.
+        .wayland_surface_role_custom = if (custom_role) true else null,
+        .wayland_create_egl_window = if (custom_role) false else null,
+    });
+    window_props.deinit();
     errdefer window.deinit();
+
+    var layer_surface: ?*wayland_layer.LayerSurface = null;
+    errdefer if (layer_surface) |l| l.destroy(state.allocator);
+    if (layer) |opts| {
+        const props = sdl3.c.SDL_GetWindowProperties(window.value);
+        const wl_display = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, null) orelse return error.LayerShellUnavailable;
+        const wl_surface = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, null) orelse return error.LayerShellUnavailable;
+        const l = try wayland_layer.LayerSurface.create(state.allocator, wl_display, wl_surface, opts);
+        layer_surface = l;
+        l.user = window.value;
+        l.on_configure = &onLayerConfigure;
+        onLayerConfigure(l);
+    }
+    var lock_surface: ?*wayland_lock.LockSurface = null;
+    errdefer if (lock_surface) |l| l.destroy(state.allocator);
+    if (lock_output) |output| {
+        const lock = session_lock orelse return error.SessionLockUnavailable;
+        const props = sdl3.c.SDL_GetWindowProperties(window.value);
+        const wl_surface = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, null) orelse return error.SessionLockUnavailable;
+        const l = try lock.createSurface(wl_surface, output);
+        lock_surface = l;
+        l.user = window.value;
+        l.on_configure = &onLockConfigure;
+        onLockConfigure(l);
+    }
 
     const metal_view: ?sdl3.MetalView = if (@import("builtin").os.tag == .macos or @import("builtin").os.tag == .ios)
         (sdl3.MetalView.init(window) orelse return error.MetalViewUnavailable)
@@ -4634,7 +4678,7 @@ fn createSecondaryWindowImpl(
         .width = @intCast(pixel_size[0]),
         .height = @intCast(pixel_size[1]),
         .present_mode = .fifo,
-        .alpha_mode = if (pending_transparent_window)
+        .alpha_mode = if (pending_transparent_window or custom_role)
             pickAlphaMode(&capabilities, true)
         else if (capabilities.alpha_mode_count > 0)
             capabilities.alpha_modes[0]
@@ -4664,7 +4708,7 @@ fn createSecondaryWindowImpl(
 
     // Clear to alpha 0 so the rounded-corner cutouts show the desktop (see the same line in
     // zigote_init) — only where SDL granted transparency and the surface premultiplies.
-    gpu_ui.transparent_clear = pending_transparent_window and
+    gpu_ui.transparent_clear = (pending_transparent_window or custom_role) and
         config.alpha_mode == .premultiplied and
         sdl3.c.SDL_GetWindowFlags(window.value) & sdl3.c.SDL_WINDOW_TRANSPARENT != 0;
 
@@ -4680,9 +4724,24 @@ fn createSecondaryWindowImpl(
         .paint_list = .{},
         .overlay_paint_list = .{},
         .frame_index = 0,
+        .layer = layer_surface,
+        .lock_surface = lock_surface,
     };
     win.ffi_handle = try state.windows.add(win);
     return win;
+}
+
+fn onLockConfigure(l: *wayland_lock.LockSurface) void {
+    const window: *sdl3.c.SDL_Window = @ptrCast(@alignCast(l.user orelse return));
+    _ = sdl3.c.SDL_SetWindowSize(window, @intCast(@max(l.width, 1)), @intCast(@max(l.height, 1)));
+}
+
+/// The compositor (re)configured a layer surface: size the SDL window to match, so the normal
+/// resize event reaches C# and the swapchain follows. Runs on the main thread, inside SDL's
+/// Wayland dispatch.
+fn onLayerConfigure(l: *wayland_layer.LayerSurface) void {
+    const window: *sdl3.c.SDL_Window = @ptrCast(@alignCast(l.user orelse return));
+    _ = sdl3.c.SDL_SetWindowSize(window, @intCast(@max(l.width, 1)), @intCast(@max(l.height, 1)));
 }
 
 /// Create a secondary UI-only OS window. out_window receives the opaque window handle to pass to
@@ -4692,13 +4751,326 @@ export fn zigote_window_create(width: u32,
     title: [*c]const u8,
     out_window: *u64,) ZgResult {
     const state = engineState() orelse return .err;
-    const win = createSecondaryWindowImpl(state, width, height, title) catch |err| {
+    const win = createSecondaryWindowImpl(state, width, height, title, null, null) catch |err| {
         std.log.err("zigote_window_create failed: {}", .{err});
         out_window.* = 0;
         return .err;
     };
     out_window.* = win.ffi_handle;
     return .ok;
+}
+
+/// Create a wlr-layer-shell window — a desktop-shell surface (panel, dock, launcher, lock) that
+/// the compositor places by anchor instead of as a toplevel. `layer`: 0 background, 1 bottom,
+/// 2 top, 3 overlay. `anchor`: bitmask top=1 bottom=2 left=4 right=8. `exclusive_zone`: pixels
+/// reserved along the anchored edge (0 none, -1 ignore other zones). `keyboard`: 0 none,
+/// 1 exclusive, 2 on demand. width/height are logical; 0 stretches between the anchors on that axis.
+///
+/// Where the compositor has no layer-shell (GNOME, X11, any other OS) this degrades to an
+/// ordinary secondary window — same size, a stretched axis becoming 1280 or 720 — so a shell can
+/// be developed anywhere; the out_is_layer flag says which one you got.
+export fn zigote_window_create_layer(width: u32,
+    height: u32,
+    title: [*c]const u8,
+    layer: u32,
+    anchor: u32,
+    exclusive_zone: i32,
+    keyboard: u32,
+    out_window: *u64,
+    out_is_layer: *u32,) ZgResult {
+    return createLayerImpl(width, height, title, layer, anchor, exclusive_zone, keyboard, 0, out_window, out_is_layer);
+}
+
+/// zigote_window_create_layer on a specific output (an id from zigote_output_get); 0 = let the
+/// compositor choose. An unknown id also falls back to the compositor's choice.
+export fn zigote_window_create_layer_on(width: u32,
+    height: u32,
+    title: [*c]const u8,
+    layer: u32,
+    anchor: u32,
+    exclusive_zone: i32,
+    keyboard: u32,
+    output_id: u64,
+    out_window: *u64,
+    out_is_layer: *u32,) ZgResult {
+    return createLayerImpl(width, height, title, layer, anchor, exclusive_zone, keyboard, output_id, out_window, out_is_layer);
+}
+
+fn createLayerImpl(width: u32, height: u32, title: [*c]const u8, layer: u32, anchor: u32, exclusive_zone: i32, keyboard: u32, output_id: u64, out_window: *u64, out_is_layer: *u32) ZgResult {
+    const state = engineState() orelse return .err;
+    out_is_layer.* = 0;
+    var opts: ?wayland_layer.Options = null;
+    if (builtin.os.tag == .linux and !builtin.abi.isAndroid()) {
+        const props = sdl3.c.SDL_GetWindowProperties(state.window.value);
+        if (sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, null)) |wl_display| {
+            if (wayland_layer.available(wl_display)) {
+                const output: ?*wayland_layer.Proxy = if (output_id != 0 and desktop != null)
+                    (if (desktop.?.findOutput(output_id)) |o| o.proxy else null)
+                else
+                    null;
+                opts = .{
+                    .output = output,
+                    .layer = @enumFromInt(@min(layer, 3)),
+                    .anchor = anchor & 0xF,
+                    .exclusive_zone = exclusive_zone,
+                    .keyboard = @enumFromInt(@min(keyboard, 2)),
+                    .width = width,
+                    .height = height,
+                };
+            } else std.log.info("zigote: compositor has no zwlr_layer_shell_v1; opening a plain window instead", .{});
+        }
+    }
+    const fallback_w: u32 = if (opts == null and width == 0) 1280 else width;
+    const fallback_h: u32 = if (opts == null and height == 0) 720 else height;
+    const win = createSecondaryWindowImpl(state, fallback_w, fallback_h, title, opts, null) catch |err| {
+        std.log.err("zigote_window_create_layer failed: {}", .{err});
+        out_window.* = 0;
+        return .err;
+    };
+    out_window.* = win.ffi_handle;
+    out_is_layer.* = if (win.layer != null) 1 else 0;
+    return .ok;
+}
+
+/// Resize a layer-shell window (see zigote_window_create_layer): the compositor answers with a
+/// configure that becomes an ordinary resize event. 0 on an axis keeps it stretched between its
+/// anchors. A no-op on a window that is not a layer surface — resize those with the normal calls.
+export fn zigote_window_layer_set_size(window_handle: u64, width: u32, height: u32) ZgStatus {
+    const state = engineState() orelse return .invalid_handle;
+    const win = windowFromHandle(state, window_handle) orelse return .invalid_handle;
+    const l = win.layer orelse return .ok;
+    l.setSize(width, height);
+    return .ok;
+}
+
+/// Set a layer-shell window's margins from its anchored edges (logical pixels). No-op on a toplevel.
+export fn zigote_window_layer_set_margin(window_handle: u64, top: i32, right: i32, bottom: i32, left: i32) ZgStatus {
+    const state = engineState() orelse return .invalid_handle;
+    const win = windowFromHandle(state, window_handle) orelse return .invalid_handle;
+    const l = win.layer orelse return .ok;
+    l.setMargin(top, right, bottom, left);
+    return .ok;
+}
+
+/// Restrict a layer-shell window's input to `count` rectangles given as x,y,w,h quadruples in
+/// logical pixels (surface-local); pointer events elsewhere pass through to whatever is below.
+/// count 0 restores full-surface input. No-op on a window that is not a layer surface.
+export fn zigote_window_layer_set_input_rects(window_handle: u64, rects: [*c]const i32, count: u32) ZgStatus {
+    const state = engineState() orelse return .invalid_handle;
+    const win = windowFromHandle(state, window_handle) orelse return .invalid_handle;
+    const l = win.layer orelse return .ok;
+    if (count == 0 or rects == null) {
+        l.setInputRects(&.{});
+    } else {
+        l.setInputRects(rects[0 .. @as(usize, count) * 4]);
+    }
+    return .ok;
+}
+
+// ── Virtual keyboard (an on-screen keyboard's way to type) ───────────────────
+
+var vkbd: ?*wayland_vkbd.VirtualKeyboard = null;
+
+/// Create the virtual keyboard on the seat; `unsupported` off Wayland or where the compositor
+/// offers no zwp_virtual_keyboard_manager_v1.
+export fn zigote_vkbd_start() ZgStatus {
+    const state = engineState() orelse return .invalid_handle;
+    if (vkbd != null) return .ok;
+    if (builtin.os.tag != .linux or builtin.abi.isAndroid()) return .unsupported;
+    const props = sdl3.c.SDL_GetWindowProperties(state.window.value);
+    const wl_display = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, null) orelse return .unsupported;
+    vkbd = wayland_vkbd.VirtualKeyboard.start(state.allocator, wl_display) catch |err| {
+        std.log.info("zigote: virtual keyboard unavailable: {}", .{err});
+        return .unsupported;
+    };
+    return .ok;
+}
+
+/// Press (1) or release (0) an evdev keycode.
+export fn zigote_vkbd_key(keycode: u32, pressed: u32) ZgStatus {
+    const k = vkbd orelse return .not_ready;
+    k.key(keycode, pressed != 0);
+    return .ok;
+}
+
+/// xkb modifier masks (Shift = 1, Control = 4, Alt = 8, Super = 64), as depressed/latched/locked.
+export fn zigote_vkbd_modifiers(depressed: u32, latched: u32, locked: u32, group: u32) ZgStatus {
+    const k = vkbd orelse return .not_ready;
+    k.modifiers(depressed, latched, locked, group);
+    return .ok;
+}
+
+// ── Session lock (ext-session-lock-v1) ───────────────────────────────────────
+
+var session_lock: ?*wayland_lock.Lock = null;
+
+/// Lock the session: the compositor blanks every output until zigote_session_unlock. Create a
+/// lock surface per output (zigote_window_create_lock_surface) to draw the lock screen on it.
+export fn zigote_session_lock() ZgStatus {
+    const state = engineState() orelse return .invalid_handle;
+    if (session_lock != null) return .ok;
+    if (builtin.os.tag != .linux or builtin.abi.isAndroid()) return .unsupported;
+    const props = sdl3.c.SDL_GetWindowProperties(state.window.value);
+    const wl_display = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, null) orelse return .unsupported;
+    session_lock = wayland_lock.Lock.start(state.allocator, wl_display) catch |err| {
+        std.log.err("zigote: session lock failed: {}", .{err});
+        return .unsupported;
+    };
+    return .ok;
+}
+
+/// 0 none, 1 pending, 2 locked, 3 finished (the compositor refused or another locker won).
+export fn zigote_session_lock_state() u32 {
+    const l = session_lock orelse return 0;
+    return @intFromEnum(l.state);
+}
+
+/// A lock surface on `output_id` (from zigote_output_get). The compositor sizes it to the output.
+export fn zigote_window_create_lock_surface(output_id: u64, title: [*c]const u8, out_window: *u64) ZgResult {
+    const state = engineState() orelse return .err;
+    out_window.* = 0;
+    const d = desktop orelse return .not_ready;
+    const output = d.findOutput(output_id) orelse return .invalid_argument;
+    if (session_lock == null) return .not_ready;
+    const win = createSecondaryWindowImpl(state, 1, 1, title, null, output.proxy) catch |err| {
+        std.log.err("zigote_window_create_lock_surface failed: {}", .{err});
+        return .err;
+    };
+    out_window.* = win.ffi_handle;
+    return .ok;
+}
+
+/// Unlock: the desktop comes back. Destroy the lock-surface windows afterwards.
+export fn zigote_session_unlock() ZgStatus {
+    const l = session_lock orelse return .not_ready;
+    l.unlock();
+    session_lock = null;
+    return .ok;
+}
+
+// ── Outputs and workspaces (a desktop shell's view of the desktop) ───────────
+
+var desktop: ?*wayland_desktop.Desktop = null;
+
+/// Start tracking outputs and (where the compositor has ext-workspace-v1) workspaces.
+export fn zigote_desktop_start() ZgStatus {
+    const state = engineState() orelse return .invalid_handle;
+    if (desktop != null) return .ok;
+    if (builtin.os.tag != .linux or builtin.abi.isAndroid()) return .unsupported;
+    const props = sdl3.c.SDL_GetWindowProperties(state.window.value);
+    const wl_display = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, null) orelse return .unsupported;
+    desktop = wayland_desktop.Desktop.start(state.allocator, wl_display) catch |err| {
+        std.log.info("zigote: desktop tracking unavailable: {}", .{err});
+        return .unsupported;
+    };
+    return .ok;
+}
+
+export fn zigote_outputs_generation() u32 {
+    const d = desktop orelse return 0;
+    return d.outputs_generation;
+}
+
+export fn zigote_outputs_count() u32 {
+    const d = desktop orelse return 0;
+    return @intCast(d.outputs.items.len);
+}
+
+/// Read output `index`: its id (stable while connected), connector name, logical size and scale.
+export fn zigote_output_get(index: u32, out_id: *u64, name: [*c]u8, name_cap: u32, out_name_len: *u32, out_w: *u32, out_h: *u32, out_scale: *f32) ZgStatus {
+    const d = desktop orelse return .not_ready;
+    if (index >= d.outputs.items.len) return .invalid_argument;
+    const o = d.outputs.items[index];
+    out_id.* = o.id;
+    const n: usize = @min(o.name_len, name_cap);
+    if (name != null and n > 0) @memcpy(name[0..n], o.name[0..n]);
+    out_name_len.* = @intCast(n);
+    out_w.* = o.w;
+    out_h.* = o.h;
+    out_scale.* = o.scale;
+    return .ok;
+}
+
+export fn zigote_workspaces_generation() u32 {
+    const d = desktop orelse return 0;
+    return d.workspaces_generation;
+}
+
+export fn zigote_workspaces_count() u32 {
+    const d = desktop orelse return 0;
+    return @intCast(d.workspaces.items.len);
+}
+
+/// Read workspace `index`. `state` bits: 1 active, 2 urgent, 4 hidden; `caps`: 1 activate.
+export fn zigote_workspace_get(index: u32, out_id: *u64, name: [*c]u8, name_cap: u32, out_name_len: *u32, out_state: *u32, out_caps: *u32) ZgStatus {
+    const d = desktop orelse return .not_ready;
+    if (index >= d.workspaces.items.len) return .invalid_argument;
+    const w = d.workspaces.items[index];
+    out_id.* = w.id;
+    const n: usize = @min(w.name_len, name_cap);
+    if (name != null and n > 0) @memcpy(name[0..n], w.name[0..n]);
+    out_name_len.* = @intCast(n);
+    out_state.* = w.state;
+    out_caps.* = w.caps;
+    return .ok;
+}
+
+export fn zigote_workspace_activate(id: u64) ZgStatus {
+    const d = desktop orelse return .not_ready;
+    return if (d.activateWorkspace(id)) .ok else .invalid_argument;
+}
+
+// ── Foreign toplevels (a desktop shell's view of every window) ───────────────
+
+var toplevels: ?*wayland_toplevel.Manager = null;
+
+/// Start tracking the compositor's toplevels (wlr-foreign-toplevel-management). `unsupported`
+/// where there is no Wayland display or the compositor does not offer the global to us.
+export fn zigote_toplevels_start() ZgStatus {
+    const state = engineState() orelse return .invalid_handle;
+    if (toplevels != null) return .ok;
+    if (builtin.os.tag != .linux or builtin.abi.isAndroid()) return .unsupported;
+    const props = sdl3.c.SDL_GetWindowProperties(state.window.value);
+    const wl_display = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, null) orelse return .unsupported;
+    toplevels = wayland_toplevel.Manager.start(state.allocator, wl_display) catch |err| {
+        std.log.info("zigote: foreign toplevels unavailable: {}", .{err});
+        return .unsupported;
+    };
+    return .ok;
+}
+
+/// Changes whenever any toplevel appears, changes or closes; poll this before re-reading the list.
+export fn zigote_toplevels_generation() u32 {
+    const m = toplevels orelse return 0;
+    return m.generation;
+}
+
+export fn zigote_toplevels_count() u32 {
+    const m = toplevels orelse return 0;
+    return @intCast(m.list.items.len);
+}
+
+/// Read toplevel `index`. `state` bits: 1 maximized, 2 minimized, 4 activated, 8 fullscreen.
+/// Title and app id are copied (not NUL-terminated) into the buffers; `*_len` gets the copied length.
+export fn zigote_toplevel_get(index: u32, out_id: *u64, out_state: *u32, title: [*c]u8, title_cap: u32, out_title_len: *u32, app_id: [*c]u8, app_id_cap: u32, out_app_id_len: *u32) ZgStatus {
+    const m = toplevels orelse return .not_ready;
+    if (index >= m.list.items.len) return .invalid_argument;
+    const t = m.list.items[index];
+    out_id.* = t.id;
+    out_state.* = t.state;
+    const tl: usize = @min(t.title_len, title_cap);
+    if (title != null and tl > 0) @memcpy(title[0..tl], t.title[0..tl]);
+    out_title_len.* = @intCast(tl);
+    const al: usize = @min(t.app_id_len, app_id_cap);
+    if (app_id != null and al > 0) @memcpy(app_id[0..al], t.app_id[0..al]);
+    out_app_id_len.* = @intCast(al);
+    return .ok;
+}
+
+/// action: 0 activate, 1 close, 2 minimize, 3 unminimize, 4 maximize, 5 unmaximize.
+export fn zigote_toplevel_action(id: u64, action: u32) ZgStatus {
+    const m = toplevels orelse return .not_ready;
+    return if (m.act(id, action)) .ok else .invalid_argument;
 }
 
 /// Destroy a secondary window and free all its GPU/window resources. The handle is dead after this.
@@ -4708,6 +5080,12 @@ export fn zigote_window_destroy(window_handle: u64) ZgStatus {
     _ = state.windows.remove(window_handle);
     win.deinit(state.allocator);
     state.allocator.destroy(win);
+    drainImageReleases(state);
+    // wgpu frees a released swapchain/texture/buffer only when the device is polled after its
+    // last submission completed. A shell with a hidden main window and static panels may not
+    // render another frame for minutes, so a closed window's ~19 MB stayed queued for
+    // destruction indefinitely. Waiting here is cheap: the window's last frame is already done.
+    _ = state.device.poll(true, null);
     return .ok;
 }
 
@@ -4884,6 +5262,10 @@ export fn zigote_window_native_parent(window_handle: u64, out_kind: *u32, out_pt
 fn renderSecondaryWindow(window_handle: u64) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
     const win = windowFromHandle(state, window_handle) orelse return .invalid_handle;
+    // Releases were drained only by the main window's frame; a shell hides that window and
+    // lives in secondary ones, so every released texture stayed queued — ~19 MB per rebuilt
+    // panel, forever. Drain here too.
+    drainImageReleases(state);
     wgpu_renderer.wgpu.renderFrame(
         win.surface,
         state.device,
@@ -5237,6 +5619,9 @@ fn drainImageReleases(state: *EngineState) void {
             // gpu_ui is render-thread-only, so this needs no image lock — and must not hold one:
             // releasing wgpu resources is not a short operation.
             _ = state.gpu_ui.releaseCachedImage(key);
+            // Every window uploads its own copy; a shell paints the same picture in several.
+            var it = state.windows.iterator();
+            while (it.next()) |win| _ = win.*.gpu_ui.releaseCachedImage(key);
         }
     }
 }
