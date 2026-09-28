@@ -22,7 +22,15 @@ pub const SpinLock = struct {
 
     pub fn lock(self: *SpinLock) void {
         var spins: u32 = 0;
-        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        while (true) {
+            // Test-and-test-and-set. The exchange is an RMW, which takes the cache line
+            // EXCLUSIVE on every attempt — spinning on it makes N waiters ping-pong the line
+            // between their caches and slows down the holder trying to release it. So only
+            // attempt the exchange when a plain (shared, monotonic) load says the lock looks
+            // free; while it is held, spin on the load, which keeps the line shared.
+            if (!self.locked.load(.monotonic) and
+                self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) == null) return;
+
             spins += 1;
             if (spins < spins_before_yield) {
                 std.atomic.spinLoopHint();
