@@ -11,7 +11,11 @@ fn addAppleSdkPaths(b: *std.Build, mod: *std.Build.Module) void {
     // Xcode 26 SDKs split some framework dependencies (e.g. UIKit's UIUtilities) into a separate
     // SubFrameworks directory that is on the default search path in Xcode but not for us.
     mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/SubFrameworks" }) });
-    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
+    // macOS libc headers come from Zig's libc discovery (or --libc). Adding them as
+    // -isystem puts SDK float.h ahead of Clang's wrapper and breaks libc++'s INFINITY.
+    // iOS cross builds still need the explicit path for module C imports.
+    if (mod.resolved_target.?.result.os.tag == .ios)
+        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
     // The linker prepends the sysroot to -L paths itself, so this one stays sysroot-relative
     // (an absolute path would be doubled into <sdk>/<sdk>/usr/lib).
     mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
