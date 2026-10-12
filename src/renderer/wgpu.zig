@@ -897,6 +897,23 @@ const UploadedFrameVertices = struct {
     shader_effect_bytes_len: usize = 0,
 };
 
+/// Set by `renderFrame` when the swapchain image could not be acquired (timeout, outdated, lost,
+/// occluded) and the frame was skipped without drawing. The caller clears it before the call.
+pub var surface_skipped: bool = false;
+
+/// Where the last `renderFrame` spent its wall time, in nanoseconds: waiting for the swapchain
+/// image, building + encoding + submitting the frame (the CPU work), and presenting. Zero until a
+/// caller installs `clock_ns`. CPU-side durations only — none of these is GPU execution time.
+pub var last_acquire_ns: u64 = 0;
+pub var last_encode_ns: u64 = 0;
+pub var last_present_ns: u64 = 0;
+/// Monotonic nanosecond clock, installed by the host layer (this module has no clock of its own).
+pub var clock_ns: ?*const fn () u64 = null;
+
+fn nowNs() u64 {
+    return if (clock_ns) |clock| clock() else 0;
+}
+
 pub fn renderFrame(
     surface: *wgpu.Surface,
     device: *wgpu.Device,
@@ -927,11 +944,17 @@ pub fn renderFrame(
         .status = .@"error",
     };
 
+    const t_start = nowNs();
     surface.getCurrentTexture(&surface_texture);
+    const t_acquired = nowNs();
+    last_acquire_ns = t_acquired -% t_start;
 
     switch (surface_texture.status) {
         .success_optimal, .success_suboptimal => {},
-        .timeout, .outdated, .lost, .occluded => return,
+        .timeout, .outdated, .lost, .occluded => {
+            surface_skipped = true;
+            return;
+        },
         .@"error" => return error.WgpuSurfaceTextureUnavailable,
         else => return error.WgpuSurfaceTextureUnavailable,
     }
@@ -1100,12 +1123,15 @@ pub fn renderFrame(
     defer command.release();
 
     const submission = queue.submitForIndex(&.{command});
+    const t_submitted = nowNs();
+    last_encode_ns = t_submitted -% t_acquired;
 
     if (surface.present() != .success) {
         return error.WgpuPresentFailed;
     }
 
     _ = device.poll(false, &submission);
+    last_present_ns = nowNs() -% t_submitted;
 }
 
 /// Append paint ops for a main (and optional overlay) paint list, rebuilding the whole frame if the

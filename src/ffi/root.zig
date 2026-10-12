@@ -4563,6 +4563,17 @@ export fn zigote_capture_ui_bmp(
     return if (captureTextureBmp(state, tex, path)) .ok else .err;
 }
 
+/// Dump the main window's persistent scene texture — the pixels partial repaint accumulates into
+/// and every frame composites from — to a BMP. Unlike zigote_capture_ui_bmp this re-renders
+/// nothing, so it shows what is actually retained, stale regions included. Fails until the first
+/// frame has allocated the texture.
+export fn zigote_capture_scene_bmp(path_ptr: [*c]const u8, path_len: usize) ZgResult {
+    const state = engineState() orelse return .err;
+    if (path_ptr == null) return .err;
+    const tex = state.gpu_ui.scene_texture orelse return .err;
+    return if (captureTextureBmp(state, tex, path_ptr[0..path_len])) .ok else .err;
+}
+
 /// Get the current surface pixel dimensions.
 export fn zigote_get_size(out_w: *u32, out_h: *u32) ZgStatus {
     const state = engineState() orelse {
@@ -7172,6 +7183,8 @@ fn passCompositePresent(ctx: *PassContext) anyerror!void {
             state.overlay_paint_list
         else
             null;
+        wgpu_renderer.wgpu.surface_skipped = false;
+        wgpu_renderer.wgpu.clock_ns = frameClockNs;
         try wgpu_renderer.wgpu.renderFrame(
             state.surface,
             state.device,
@@ -7186,6 +7199,7 @@ fn passCompositePresent(ctx: *PassContext) anyerror!void {
             state.pending_damage[0..state.pending_damage_count],
             true, // main window: keeps a persistent scene texture for partial repaint + glass backdrop
         );
+        if (wgpu_renderer.wgpu.surface_skipped) state.frame_dropped = true;
     }
 }
 
@@ -7427,6 +7441,29 @@ export fn zigote_frame_begin(window: u64, scene_w: u32, scene_h: u32, scale: f32
         return .ok;
     }
     return zigote_begin_frame(scene_w, scene_h, scale, delta_time);
+}
+
+fn frameClockNs() u64 {
+    return sdl3.c.SDL_GetTicksNS();
+}
+
+/// Where the main window's last UI-only frame spent its time, in nanoseconds: waiting to acquire
+/// the swapchain image, CPU work building/encoding/submitting the frame, and the present call.
+/// CPU-side wall durations; none is GPU execution time. Frames that render the 3D scene take the
+/// composite path and leave these untouched.
+export fn zigote_frame_timings(out_acquire_ns: *u64, out_encode_ns: *u64, out_present_ns: *u64) ZgStatus {
+    out_acquire_ns.* = wgpu_renderer.wgpu.last_acquire_ns;
+    out_encode_ns.* = wgpu_renderer.wgpu.last_encode_ns;
+    out_present_ns.* = wgpu_renderer.wgpu.last_present_ns;
+    return .ok;
+}
+
+/// Whether the main window's last rendered frame was skipped because its swapchain image was
+/// unavailable (timeout, outdated, lost, occluded). Nothing was drawn into the persistent scene
+/// texture on such a frame, so the caller must not treat its damage as repaired.
+export fn zigote_frame_was_dropped() bool {
+    const state = engineState() orelse return false;
+    return state.frame_dropped;
 }
 
 /// Execute the render graph and present; then clear per-frame state (see zigote_frame_begin).
