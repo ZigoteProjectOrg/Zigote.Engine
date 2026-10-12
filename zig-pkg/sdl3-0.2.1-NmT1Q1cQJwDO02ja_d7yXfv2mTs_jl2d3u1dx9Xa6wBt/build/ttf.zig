@@ -12,11 +12,11 @@ pub fn setup(
     extension_config: ExtensionConfig,
     options: Options,
     target: std.Build.ResolvedTarget,
-    optimizer: std.builtin.OptimizeMode,
+    optimizer: std.lang.Optimize,
 ) void {
     _ = optimizer;
 
-    const optimize: std.builtin.OptimizeMode = .ReleaseFast; // https://github.com/libsdl-org/SDL_ttf/issues/566 (ReleaseFast prevents UBSAN from running)
+    const optimize: std.lang.Optimize = .fast; // https://github.com/libsdl-org/SDL_ttf/issues/566 (ReleaseFast prevents UBSAN from running)
 
     const upstream = b.lazyDependency("sdl_ttf", .{}) orelse return;
 

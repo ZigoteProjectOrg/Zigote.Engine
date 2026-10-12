@@ -161,7 +161,7 @@ const Header = struct {
         try writer.writeAll("P7\n");
 
         for (header.comments) |comment|
-        try writer.print("#{s}\n", .{comment});
+            try writer.print("#{s}\n", .{comment});
 
         const fmtstr =
             \\WIDTH {d}
@@ -298,15 +298,15 @@ const Header = struct {
 };
 
 pub const PAM = struct {
-//! Portable AnyMap
-//! currently, this only supports a subset of PAMs where:
-//! - the tuple type is official (see `man 5 pam`) or easily inferred (and
-//!   by extension, depth is 4 or less)
-//! - all images in a sequence have the same dimensions and maxval (it is
-//!   technically possible to support animations with different maxvals and
-//!   tuple types as each `AnimationFrame` has its own `PixelStorage`, however,
-//!   this is likely not expected by users of the library.
-//! supported input pixel formats: `grayscale{1, 8, 16}, `grayscale{1, 8, 16}Alpha`, `rgb555`, `{rgb, bgr}{24, 48}`, `{bgr, rgb}a{32, 64}`
+    //! Portable AnyMap
+    //! currently, this only supports a subset of PAMs where:
+    //! - the tuple type is official (see `man 5 pam`) or easily inferred (and
+    //!   by extension, depth is 4 or less)
+    //! - all images in a sequence have the same dimensions and maxval (it is
+    //!   technically possible to support animations with different maxvals and
+    //!   tuple types as each `AnimationFrame` has its own `PixelStorage`, however,
+    //!   this is likely not expected by users of the library.
+    //! supported input pixel formats: `grayscale{1, 8, 16}, `grayscale{1, 8, 16}Alpha`, `rgb555`, `{rgb, bgr}{24, 48}`, `{bgr, rgb}a{32, 64}`
 
     pub const EncoderOptions = struct {
         /// Free-form comments to be added to the header.

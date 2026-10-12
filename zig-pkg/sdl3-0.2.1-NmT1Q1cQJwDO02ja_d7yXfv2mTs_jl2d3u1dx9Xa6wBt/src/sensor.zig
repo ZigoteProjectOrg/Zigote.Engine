@@ -73,13 +73,13 @@ pub const Type = enum(c.SDL_SensorType) {
     pub fn fromSdl(value: c.SDL_SensorType) ?Type {
         if (value == c.SDL_SENSOR_INVALID)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?Type) c.SDL_SensorType {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_SENSOR_INVALID;
     }
 };

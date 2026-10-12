@@ -104,7 +104,7 @@ pub const Direction = struct {
     /// Convert from an SDL value.
     pub fn fromSdl(value: c.SDL_HapticDirection) Direction {
         return .{
-            .direction_type = @enumFromInt(value.type),
+            .direction_type = @fromBackingInt(@intCast(value.type)),
             .dir = value.dir,
         };
     }
@@ -112,7 +112,7 @@ pub const Direction = struct {
     /// Convert to an SDL value.
     pub fn toSdl(self: Direction) c.SDL_HapticDirection {
         return .{
-            .type = @intFromEnum(self.direction_type),
+            .type = @backingInt(self.direction_type),
             .dir = self.dir,
         };
     }
@@ -249,7 +249,7 @@ pub const Effect = union(Effect.Type) {
         /// Convert from an SDL value.
         pub fn fromSdl(value: c.SDL_HapticCondition) Condition {
             return .{
-                .effect_type = @enumFromInt(value.type),
+                .effect_type = @fromBackingInt(@intCast(value.type)),
                 .common = .{
                     .length = Length.fromSdl(value.length),
                     .delay = @intCast(value.delay),
@@ -269,7 +269,7 @@ pub const Effect = union(Effect.Type) {
         /// Convert to an SDL value.
         pub fn toSdl(self: Condition) c.SDL_HapticCondition {
             return .{
-                .type = @intFromEnum(self.effect_type),
+                .type = @backingInt(self.effect_type),
                 .length = self.common.length.toSdl(),
                 .delay = @intCast(self.common.delay),
                 .button = @intCast(self.common.button),
@@ -587,7 +587,7 @@ pub const Effect = union(Effect.Type) {
         /// Convert from an SDL value.
         pub fn fromSdl(value: c.SDL_HapticPeriodic) Periodic {
             return .{
-                .effect_type = @enumFromInt(value.type),
+                .effect_type = @fromBackingInt(@intCast(value.type)),
                 .common = .{
                     .length = Length.fromSdl(value.length),
                     .delay = @intCast(value.delay),
@@ -611,7 +611,7 @@ pub const Effect = union(Effect.Type) {
         /// Convert to an SDL value.
         pub fn toSdl(self: Periodic) c.SDL_HapticPeriodic {
             return .{
-                .type = @intFromEnum(self.effect_type),
+                .type = @backingInt(self.effect_type),
                 .length = self.common.length.toSdl(),
                 .delay = @intCast(self.common.delay),
                 .button = @intCast(self.common.button),

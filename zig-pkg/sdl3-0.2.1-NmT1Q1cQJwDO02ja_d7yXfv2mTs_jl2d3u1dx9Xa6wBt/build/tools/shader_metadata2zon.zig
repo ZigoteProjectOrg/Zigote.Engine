@@ -5,13 +5,13 @@ const std = @import("std");
 const file_buffer_size = 4096;
 
 const usage =
-\\Usage: ./shader_metadata2zon <format> <input> <output>
-\\
-\\Options:
-\\  format: Either -g for graphics or -c for compute.
-\\  input: Input JSON metadata.
-\\  output: Output ZON metadata.
-\\
+    \\Usage: ./shader_metadata2zon <format> <input> <output>
+    \\
+    \\Options:
+    \\  format: Either -g for graphics or -c for compute.
+    \\  input: Input JSON metadata.
+    \\  output: Output ZON metadata.
+    \\
 ;
 
 fn die() noreturn {

@@ -26,12 +26,12 @@ pub const Capitalization = enum(c.SDL_Capitalization) {
 
     /// Get from an SDL value.
     pub fn fromSdl(value: c.SDL_Capitalization) Capitalization {
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: Capitalization) c.SDL_Capitalization {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -58,9 +58,9 @@ pub const TextInputProperties = struct {
     pub fn toSdl(self: TextInputProperties) !properties.Group {
         const ret = try properties.Group.init();
         if (self.input_type) |val|
-            try ret.set(c.SDL_PROP_TEXTINPUT_TYPE_NUMBER, .{ .number = @intFromEnum(val) });
+            try ret.set(c.SDL_PROP_TEXTINPUT_TYPE_NUMBER, .{ .number = @backingInt(val) });
         if (self.capitalization) |val|
-            try ret.set(c.SDL_PROP_TEXTINPUT_CAPITALIZATION_NUMBER, .{ .number = @intFromEnum(val) });
+            try ret.set(c.SDL_PROP_TEXTINPUT_CAPITALIZATION_NUMBER, .{ .number = @backingInt(val) });
         if (self.auto_correct) |val|
             try ret.set(c.SDL_PROP_TEXTINPUT_AUTOCORRECT_BOOLEAN, .{ .boolean = val });
         if (self.multi_line) |val|

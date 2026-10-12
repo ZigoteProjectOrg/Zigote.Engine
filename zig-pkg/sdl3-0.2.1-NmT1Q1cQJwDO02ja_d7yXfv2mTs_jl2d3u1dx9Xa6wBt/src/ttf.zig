@@ -460,9 +460,9 @@ pub const SubStringFlags = packed struct {
         flags: c.TTF_SubStringFlags,
     ) SubStringFlags {
         return .{
-            .direction = @enumFromInt(
+            .direction = @fromBackingInt(@intCast(
                 flags & c.TTF_SUBSTRING_DIRECTION_MASK,
-            ),
+            )),
             .text_start = (flags & c.TTF_SUBSTRING_TEXT_START != 0),
             .line_start = (flags & c.TTF_SUBSTRING_LINE_START != 0),
             .line_end = (flags & c.TTF_SUBSTRING_LINE_END != 0),
@@ -473,7 +473,7 @@ pub const SubStringFlags = packed struct {
     pub fn toSdl(
         self: SubStringFlags,
     ) c.TTF_SubStringFlags {
-        var result: c.TTF_SubStringFlags = @intFromEnum(
+        var result: c.TTF_SubStringFlags = @backingInt(
             self.direction,
         );
         if (self.text_start) result |= c.TTF_SUBSTRING_TEXT_START;
@@ -1109,7 +1109,7 @@ pub const Font = struct {
         self: Font,
         hinting: HintingFlags,
     ) void {
-        c.TTF_SetFontHinting(self.value, @intFromEnum(
+        c.TTF_SetFontHinting(self.value, @backingInt(
             hinting,
         ));
     }
@@ -1127,9 +1127,9 @@ pub const Font = struct {
     pub fn getHinting(
         self: Font,
     ) HintingFlags {
-        return @enumFromInt(c.TTF_GetFontHinting(
+        return @fromBackingInt(@intCast(c.TTF_GetFontHinting(
             self.value,
-        ));
+        )));
     }
 
     /// Query the number of faces of a font.
@@ -1233,7 +1233,7 @@ pub const Font = struct {
         self: Font,
         @"align": HorizontalAlignment,
     ) void {
-        c.TTF_SetFontWrapAlignment(self.value, @intFromEnum(
+        c.TTF_SetFontWrapAlignment(self.value, @backingInt(
             @"align",
         ));
     }
@@ -1251,9 +1251,9 @@ pub const Font = struct {
     pub fn getWrapAlignment(
         self: Font,
     ) HorizontalAlignment {
-        return @enumFromInt(c.TTF_GetFontWrapAlignment(
+        return @fromBackingInt(@intCast(c.TTF_GetFontWrapAlignment(
             self.value,
-        ));
+        )));
     }
 
     /// Query the total height of a font.
@@ -1529,7 +1529,7 @@ pub const Font = struct {
         direction: Direction,
     ) !void {
         return errors.wrapCallBool(
-            c.TTF_SetFontDirection(self.value, @intFromEnum(
+            c.TTF_SetFontDirection(self.value, @backingInt(
                 direction,
             )),
         );
@@ -1551,9 +1551,9 @@ pub const Font = struct {
     pub fn getDirection(
         self: Font,
     ) Direction {
-        return @enumFromInt(c.TTF_GetFontDirection(
+        return @fromBackingInt(@intCast(c.TTF_GetFontDirection(
             self.value,
-        ));
+        )));
     }
 
     /// Set the script to be used for text shaping by a font.
@@ -1672,9 +1672,9 @@ pub const Font = struct {
         ));
         return .{
             .{ .value = surf },
-            @enumFromInt(
+            @fromBackingInt(@intCast(
                 image_type,
-            ),
+            )),
         };
     }
 
@@ -1707,9 +1707,9 @@ pub const Font = struct {
         ));
         return .{
             .{ .value = surf },
-            @enumFromInt(
+            @fromBackingInt(@intCast(
                 image_type,
-            ),
+            )),
         };
     }
 
@@ -2675,7 +2675,7 @@ pub const GpuTextEngine = struct {
         self: GpuTextEngine,
         winding: GpuTextEngineWinding,
     ) void {
-        c.TTF_SetGPUTextEngineWinding(self.value, @intFromEnum(
+        c.TTF_SetGPUTextEngineWinding(self.value, @backingInt(
             winding,
         ));
     }
@@ -2700,9 +2700,9 @@ pub const GpuTextEngine = struct {
             ),
             c.TTF_GPU_TEXTENGINE_WINDING_INVALID,
         );
-        return @enumFromInt(
+        return @fromBackingInt(@intCast(
             winding,
-        );
+        ));
     }
 };
 
@@ -2793,9 +2793,9 @@ pub const GpuAtlasDrawSequence = struct {
             .indices = sdl_seq.indices[0..@intCast(
                 sdl_seq.num_indices,
             )],
-            .image_type = @enumFromInt(
+            .image_type = @fromBackingInt(@intCast(
                 sdl_seq.image_type,
-            ),
+            )),
         };
     }
 };
@@ -3035,7 +3035,7 @@ pub const Text = struct {
         direction: Direction,
     ) !void {
         return errors.wrapCallBool(
-            c.TTF_SetTextDirection(self.value, @intFromEnum(
+            c.TTF_SetTextDirection(self.value, @backingInt(
                 direction,
             )),
         );
@@ -3057,9 +3057,9 @@ pub const Text = struct {
     pub fn getDirection(
         self: Text,
     ) Direction {
-        return @enumFromInt(c.TTF_GetTextDirection(
+        return @fromBackingInt(@intCast(c.TTF_GetTextDirection(
             self.value,
-        ));
+        )));
     }
 
     /// Set the script to be used for text shaping a text object.

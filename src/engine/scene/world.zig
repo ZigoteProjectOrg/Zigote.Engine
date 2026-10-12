@@ -13,17 +13,17 @@ pub const Component = components_mod.Component;
 /// The game world. Owns all scene nodes and all loaded assets.
 pub const World = struct {
     allocator: std.mem.Allocator,
-    roots: std.ArrayListUnmanaged(*SceneNode) = .{ .items = &.{}, .capacity = 0 },
+    roots: std.ArrayListUnmanaged(*SceneNode) = .empty,
     entity_gen: entity_mod.EntityGen = .{},
-    meshes: std.ArrayListUnmanaged(resources_mod.Mesh) = .{ .items = &.{}, .capacity = 0 },
-    materials: std.ArrayListUnmanaged(resources_mod.Material) = .{ .items = &.{}, .capacity = 0 },
+    meshes: std.ArrayListUnmanaged(resources_mod.Mesh) = .empty,
+    materials: std.ArrayListUnmanaged(resources_mod.Material) = .empty,
     // Recyclable mesh/material slots. Handles are append-only array indices (see addMesh/addMaterial),
     // so a removed asset must NOT orderedRemove — that shifts every later handle and corrupts live
     // references. Instead its slot is tombstoned (contents freed, replaced with an empty sentinel) and
     // its index parked here for the next addMesh/addMaterial to reuse. Keeps memory bounded across
     // repeated add/remove without ever invalidating an outstanding handle.
-    free_meshes: std.ArrayListUnmanaged(components_mod.MeshHandle) = .{ .items = &.{}, .capacity = 0 },
-    free_materials: std.ArrayListUnmanaged(components_mod.MaterialHandle) = .{ .items = &.{}, .capacity = 0 },
+    free_meshes: std.ArrayListUnmanaged(components_mod.MeshHandle) = .empty,
+    free_materials: std.ArrayListUnmanaged(components_mod.MaterialHandle) = .empty,
     active_camera: ?*SceneNode = null,
     active_camera_2d: ?*SceneNode = null,
 

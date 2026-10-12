@@ -59,8 +59,8 @@ pub fn init(
 
     const is_wasm = builtin.cpu.arch.isWasm();
     const use_safe_allocator = !is_wasm and switch (builtin.mode) {
-        .Debug, .ReleaseSafe => true,
-        .ReleaseFast, .ReleaseSmall => !builtin.link_libc and builtin.single_threaded, // Also not ideal.
+        .debug, .safe => true,
+        .fast, .small => !builtin.link_libc and builtin.single_threaded, // Also not ideal.
     };
     allocated.safe_allocator = if (use_safe_allocator) std.heap.DebugAllocator(.{}).init else null;
     errdefer if (allocated.safe_allocator) |*safe_allocator| safe_allocator.deinit();
@@ -68,13 +68,13 @@ pub fn init(
     const gpa = if (use_safe_allocator)
         allocated.safe_allocator.?.allocator()
     else if (builtin.link_libc)
-            std.heap.c_allocator
-        else if (is_wasm)
-                std.heap.wasm_allocator
-            else if (!builtin.single_threaded)
-                    std.heap.smp_allocator
-                else
-                    comptime unreachable;
+        std.heap.c_allocator
+    else if (is_wasm)
+        std.heap.wasm_allocator
+    else if (!builtin.single_threaded)
+        std.heap.smp_allocator
+    else
+        comptime unreachable;
 
     const arena_backing_allocator = if (is_wasm) gpa else std.heap.page_allocator;
 

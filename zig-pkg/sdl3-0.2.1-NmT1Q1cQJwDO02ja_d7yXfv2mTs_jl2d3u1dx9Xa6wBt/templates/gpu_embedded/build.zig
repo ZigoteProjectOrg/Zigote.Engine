@@ -97,7 +97,7 @@ pub fn build(
     const options = b.addOptions();
 
     const shader_format = b.option(ShaderFormat, "shader_format", "Shader format to use") orelse .zig;
-    const gpu_debug = b.option(bool, "gpu_debug", "Enable GPU debugging functionality") orelse (optimize == .Debug);
+    const gpu_debug = b.option(bool, "gpu_debug", "Enable GPU debugging functionality") orelse (optimize == .debug);
     options.addOption(bool, "gpu_debug", gpu_debug);
 
     const shadercross = sdl3_build.shadercross.cli(sdl3.builder, null, true, true) orelse return;

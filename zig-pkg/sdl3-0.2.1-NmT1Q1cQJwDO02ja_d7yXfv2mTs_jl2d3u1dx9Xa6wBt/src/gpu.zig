@@ -48,13 +48,13 @@ pub const BlendFactor = enum(c.SDL_GPUBlendFactor) {
         if (val == c.SDL_GPU_BLENDFACTOR_INVALID) {
             return null;
         }
-        return @enumFromInt(val);
+        return @fromBackingInt(@intCast(val));
     }
 
     /// Convert a blend factor to an SDL value.
     pub fn toSdl(val: ?BlendFactor) c.SDL_GPUBlendFactor {
         if (val) |tmp| {
-            return @intFromEnum(tmp);
+            return @backingInt(tmp);
         }
         return c.SDL_GPU_BLENDFACTOR_INVALID;
     }
@@ -85,13 +85,13 @@ pub const BlendOperation = enum(c.SDL_GPUBlendOp) {
         if (val == c.SDL_GPU_BLENDOP_INVALID) {
             return null;
         }
-        return @enumFromInt(val);
+        return @fromBackingInt(@intCast(val));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(val: ?BlendOperation) c.SDL_GPUBlendOp {
         if (val) |tmp| {
-            return @intFromEnum(tmp);
+            return @backingInt(tmp);
         }
         return c.SDL_GPU_BLENDOP_INVALID;
     }
@@ -123,10 +123,10 @@ pub const BlitInfo = struct {
         return .{
             .source = BlitRegion.fromSdl(value.source),
             .destination = BlitRegion.fromSdl(value.destination),
-            .load_op = @enumFromInt(value.load_op),
+            .load_op = @fromBackingInt(@intCast(value.load_op)),
             .clear_color = value.clear_color,
             .flip_mode = surface.FlipMode.fromSdl(value.flip_mode),
-            .filter = @enumFromInt(value.filter),
+            .filter = @fromBackingInt(@intCast(value.filter)),
             .cycle = value.cycle,
         };
     }
@@ -136,10 +136,10 @@ pub const BlitInfo = struct {
         return .{
             .source = self.source.toSdl(),
             .destination = self.destination.toSdl(),
-            .load_op = @intFromEnum(self.load_op),
+            .load_op = @backingInt(self.load_op),
             .clear_color = self.clear_color,
             .flip_mode = surface.FlipMode.toSdl(self.flip_mode),
-            .filter = @intFromEnum(self.filter),
+            .filter = @backingInt(self.filter),
             .cycle = self.cycle,
         };
     }
@@ -1057,13 +1057,13 @@ pub const CompareOperation = enum(c.SDL_GPUCompareOp) {
         if (val == c.SDL_GPU_COMPAREOP_INVALID) {
             return null;
         }
-        return @enumFromInt(val);
+        return @fromBackingInt(@intCast(val));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(val: ?CompareOperation) c.SDL_GPUCompareOp {
         if (val) |tmp| {
-            return @intFromEnum(tmp);
+            return @backingInt(tmp);
         }
         return c.SDL_GPU_COMPAREOP_INVALID;
     }
@@ -1631,7 +1631,7 @@ pub const DepthStencilState = struct {
     /// Convert from an SDL value.
     pub fn fromSdl(value: c.SDL_GPUDepthStencilState) DepthStencilState {
         return .{
-            .compare = @enumFromInt(value.compare_op),
+            .compare = @fromBackingInt(@intCast(value.compare_op)),
             .back_stencil_state = StencilOperationState.fromSdl(value.back_stencil_state),
             .front_stencil_state = StencilOperationState.fromSdl(value.front_stencil_state),
             .compare_mask = value.compare_mask,
@@ -1645,7 +1645,7 @@ pub const DepthStencilState = struct {
     /// Convert to an SDL value.
     pub fn toSdl(self: DepthStencilState) c.SDL_GPUDepthStencilState {
         return .{
-            .compare_op = @intFromEnum(self.compare),
+            .compare_op = @backingInt(self.compare),
             .back_stencil_state = self.back_stencil_state.toSdl(),
             .front_stencil_state = self.front_stencil_state.toSdl(),
             .compare_mask = self.compare_mask,
@@ -1707,10 +1707,10 @@ pub const DepthStencilTargetInfo = struct {
         return .{
             .texture = .{ .value = value.texture.? },
             .clear_depth = value.clear_depth,
-            .load = @enumFromInt(value.load_op),
-            .store = @enumFromInt(value.store_op),
-            .stencil_load = @enumFromInt(value.stencil_load_op),
-            .stencil_store = @enumFromInt(value.stencil_store_op),
+            .load = @fromBackingInt(@intCast(value.load_op)),
+            .store = @fromBackingInt(@intCast(value.store_op)),
+            .stencil_load = @fromBackingInt(@intCast(value.stencil_load_op)),
+            .stencil_store = @fromBackingInt(@intCast(value.stencil_store_op)),
             .cycle = value.cycle,
             .clear_stencil = value.clear_stencil,
         };
@@ -1721,10 +1721,10 @@ pub const DepthStencilTargetInfo = struct {
         return .{
             .texture = self.texture.value,
             .clear_depth = self.clear_depth,
-            .load_op = @intFromEnum(self.load),
-            .store_op = @intFromEnum(self.store),
-            .stencil_load_op = @intFromEnum(self.stencil_load),
-            .stencil_store_op = @intFromEnum(self.stencil_store),
+            .load_op = @backingInt(self.load),
+            .store_op = @backingInt(self.store),
+            .stencil_load_op = @backingInt(self.stencil_load),
+            .stencil_store_op = @backingInt(self.stencil_store),
             .cycle = self.cycle,
             .clear_stencil = self.clear_stencil,
         };
@@ -2399,7 +2399,7 @@ pub const Device = extern struct {
         );
         if (ret == c.SDL_GPU_TEXTUREFORMAT_INVALID)
             try errors.set("Invalid texture format, did you claim the window?");
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Creates a GPU context.
@@ -2774,8 +2774,8 @@ pub const Device = extern struct {
         return errors.wrapCallBool(c.SDL_SetGPUSwapchainParameters(
             self.value,
             window.value,
-            @intFromEnum(swapchain_composition),
-            @intFromEnum(present_mode),
+            @backingInt(swapchain_composition),
+            @backingInt(present_mode),
         ));
     }
 
@@ -2827,8 +2827,8 @@ pub const Device = extern struct {
     ) bool {
         return c.SDL_GPUTextureSupportsFormat(
             self.value,
-            @intFromEnum(format),
-            @intFromEnum(texture_type),
+            @backingInt(format),
+            @backingInt(texture_type),
             usage.toSdl(),
         );
     }
@@ -2852,8 +2852,8 @@ pub const Device = extern struct {
     ) bool {
         return c.SDL_GPUTextureSupportsSampleCount(
             self.value,
-            @intFromEnum(format),
-            @intFromEnum(sample_count),
+            @backingInt(format),
+            @backingInt(sample_count),
         );
     }
 
@@ -2956,7 +2956,7 @@ pub const Device = extern struct {
         return c.SDL_WindowSupportsGPUPresentMode(
             self.value,
             window.value,
-            @intFromEnum(present_mode),
+            @backingInt(present_mode),
         );
     }
 
@@ -2983,7 +2983,7 @@ pub const Device = extern struct {
         return c.SDL_WindowSupportsGPUSwapchainComposition(
             self.value,
             window.value,
-            @intFromEnum(swapchain_composition),
+            @backingInt(swapchain_composition),
         );
     }
 };
@@ -3094,7 +3094,7 @@ pub const GraphicsPipelineCreateInfo = struct {
             .vertex_shader = .{ .value = value.vertex_shader.? },
             .fragment_shader = .{ .value = value.fragment_shader.? },
             .vertex_input_state = VertexInputState.fromSdl(value.vertex_input_state),
-            .primitive_type = @enumFromInt(value.primitive_type),
+            .primitive_type = @fromBackingInt(@intCast(value.primitive_type)),
             .rasterizer_state = RasterizerState.fromSdl(value.rasterizer_state),
             .multisample_state = MultisampleState.fromSdl(value.multisample_state),
             .depth_stencil_state = DepthStencilState.fromSdl(value.depth_stencil_state),
@@ -3110,7 +3110,7 @@ pub const GraphicsPipelineCreateInfo = struct {
             .vertex_shader = self.vertex_shader.value,
             .fragment_shader = self.fragment_shader.value,
             .vertex_input_state = self.vertex_input_state.toSdl(),
-            .primitive_type = @intFromEnum(self.primitive_type),
+            .primitive_type = @backingInt(self.primitive_type),
             .rasterizer_state = self.rasterizer_state.toSdl(),
             .multisample_state = self.multisample_state.toSdl(),
             .depth_stencil_state = self.depth_stencil_state.toSdl(),
@@ -3134,7 +3134,7 @@ pub const GraphicsPipelineTargetInfo = struct {
     pub fn fromSdl(value: c.SDL_GPUGraphicsPipelineTargetInfo) GraphicsPipelineTargetInfo {
         return .{
             .color_target_descriptions = @as([*]const ColorTargetDescription, @ptrCast(value.color_target_descriptions))[0..@intCast(value.num_color_targets)],
-            .depth_stencil_format = if (value.has_depth_stencil_target) @enumFromInt(value.depth_stencil_format) else null,
+            .depth_stencil_format = if (value.has_depth_stencil_target) @fromBackingInt(@intCast(value.depth_stencil_format)) else null,
         };
     }
 
@@ -3144,7 +3144,7 @@ pub const GraphicsPipelineTargetInfo = struct {
             .color_target_descriptions = @ptrCast(self.color_target_descriptions.ptr),
             .num_color_targets = @intCast(self.color_target_descriptions.len),
             .has_depth_stencil_target = self.depth_stencil_format != null,
-            .depth_stencil_format = if (self.depth_stencil_format) |val| @intFromEnum(val) else 0,
+            .depth_stencil_format = if (self.depth_stencil_format) |val| @backingInt(val) else 0,
         };
     }
 };
@@ -3287,7 +3287,7 @@ pub const MultisampleState = struct {
     /// Convert from an SDL value.
     pub fn fromSdl(value: c.SDL_GPUMultisampleState) MultisampleState {
         return .{
-            .sample_count = @enumFromInt(value.sample_count),
+            .sample_count = @fromBackingInt(@intCast(value.sample_count)),
             .sample_mask = value.sample_mask,
             .enable_mask = value.enable_mask,
             .enable_alpha_to_coverage = value.enable_alpha_to_coverage,
@@ -3297,7 +3297,7 @@ pub const MultisampleState = struct {
     /// Convert to an SDL value.
     pub fn toSdl(self: MultisampleState) c.SDL_GPUMultisampleState {
         return .{
-            .sample_count = @intFromEnum(self.sample_count),
+            .sample_count = @backingInt(self.sample_count),
             .sample_mask = self.sample_mask,
             .enable_mask = self.enable_mask,
             .enable_alpha_to_coverage = self.enable_alpha_to_coverage,
@@ -3392,9 +3392,9 @@ pub const RasterizerState = struct {
     /// Convert from an SDL value.
     pub fn fromSdl(value: c.SDL_GPURasterizerState) RasterizerState {
         return .{
-            .fill_mode = @enumFromInt(value.fill_mode),
-            .cull_mode = @enumFromInt(value.cull_mode),
-            .front_face = @enumFromInt(value.front_face),
+            .fill_mode = @fromBackingInt(@intCast(value.fill_mode)),
+            .cull_mode = @fromBackingInt(@intCast(value.cull_mode)),
+            .front_face = @fromBackingInt(@intCast(value.front_face)),
             .depth_bias_constant_factor = value.depth_bias_constant_factor,
             .depth_bias_clamp = value.depth_bias_clamp,
             .depth_bias_slope_factor = value.depth_bias_slope_factor,
@@ -3406,9 +3406,9 @@ pub const RasterizerState = struct {
     /// Convert to an SDL value.
     pub fn toSdl(self: RasterizerState) c.SDL_GPURasterizerState {
         return .{
-            .fill_mode = @intFromEnum(self.fill_mode),
-            .cull_mode = @intFromEnum(self.cull_mode),
-            .front_face = @intFromEnum(self.front_face),
+            .fill_mode = @backingInt(self.fill_mode),
+            .cull_mode = @backingInt(self.cull_mode),
+            .front_face = @backingInt(self.front_face),
             .depth_bias_constant_factor = self.depth_bias_constant_factor,
             .depth_bias_clamp = self.depth_bias_clamp,
             .depth_bias_slope_factor = self.depth_bias_slope_factor,
@@ -3547,7 +3547,7 @@ pub const RenderPass = extern struct {
         c.SDL_BindGPUIndexBuffer(
             self.value,
             @ptrCast(&binding),
-            @intFromEnum(index_element_size),
+            @backingInt(index_element_size),
         );
     }
 
@@ -3971,15 +3971,15 @@ pub const SamplerCreateInfo = struct {
     /// Convert from an SDL value.
     pub fn fromSdl(value: c.SDL_GPUSamplerCreateInfo) SamplerCreateInfo {
         return .{
-            .min_filter = @enumFromInt(value.min_filter),
-            .mag_filter = @enumFromInt(value.mag_filter),
-            .mipmap_mode = @enumFromInt(value.mipmap_mode),
-            .address_mode_u = @enumFromInt(value.address_mode_u),
-            .address_mode_v = @enumFromInt(value.address_mode_v),
-            .address_mode_w = @enumFromInt(value.address_mode_w),
+            .min_filter = @fromBackingInt(@intCast(value.min_filter)),
+            .mag_filter = @fromBackingInt(@intCast(value.mag_filter)),
+            .mipmap_mode = @fromBackingInt(@intCast(value.mipmap_mode)),
+            .address_mode_u = @fromBackingInt(@intCast(value.address_mode_u)),
+            .address_mode_v = @fromBackingInt(@intCast(value.address_mode_v)),
+            .address_mode_w = @fromBackingInt(@intCast(value.address_mode_w)),
             .mip_lod_bias = value.mip_lod_bias,
             .max_anisotropy = if (value.enable_anisotropy) value.max_anisotropy else null,
-            .compare = if (value.enable_compare) @enumFromInt(value.compare_op) else null,
+            .compare = if (value.enable_compare) @fromBackingInt(@intCast(value.compare_op)) else null,
             .min_lod = value.min_lod,
             .max_lod = value.max_lod,
             .props = if (value.props != 0) Properties.fromProperties(.{ .value = value.props }) else null,
@@ -3990,17 +3990,17 @@ pub const SamplerCreateInfo = struct {
     /// This makes a group allocation!
     pub fn toSdl(self: SamplerCreateInfo) !c.SDL_GPUSamplerCreateInfo {
         return .{
-            .min_filter = @intFromEnum(self.min_filter),
-            .mag_filter = @intFromEnum(self.mag_filter),
-            .mipmap_mode = @intFromEnum(self.mipmap_mode),
-            .address_mode_u = @intFromEnum(self.address_mode_u),
-            .address_mode_v = @intFromEnum(self.address_mode_v),
-            .address_mode_w = @intFromEnum(self.address_mode_w),
+            .min_filter = @backingInt(self.min_filter),
+            .mag_filter = @backingInt(self.mag_filter),
+            .mipmap_mode = @backingInt(self.mipmap_mode),
+            .address_mode_u = @backingInt(self.address_mode_u),
+            .address_mode_v = @backingInt(self.address_mode_v),
+            .address_mode_w = @backingInt(self.address_mode_w),
             .mip_lod_bias = self.mip_lod_bias,
             .enable_anisotropy = self.max_anisotropy != null,
             .max_anisotropy = if (self.max_anisotropy) |val| val else 0,
             .enable_compare = self.compare != null,
-            .compare_op = if (self.compare) |val| @intFromEnum(val) else 0,
+            .compare_op = if (self.compare) |val| @backingInt(val) else 0,
             .min_lod = self.min_lod,
             .max_lod = self.max_lod,
             .props = if (self.props) |val| (try val.toProperties()).value else 0,
@@ -4081,7 +4081,7 @@ pub const ShaderCreateInfo = struct {
             .code = value.code[0..value.code_size],
             .entry_point = std.mem.span(value.entrypoint),
             .format = ShaderFormatFlags.fromSdl(value.format).?,
-            .stage = @enumFromInt(value.stage),
+            .stage = @fromBackingInt(@intCast(value.stage)),
             .num_samplers = value.num_samplers,
             .num_storage_textures = value.num_storage_textures,
             .num_storage_buffers = value.num_storage_buffers,
@@ -4097,7 +4097,7 @@ pub const ShaderCreateInfo = struct {
             .code_size = self.code.len,
             .entrypoint = self.entry_point.ptr,
             .format = self.format.toSdl(),
-            .stage = @intFromEnum(self.stage),
+            .stage = @backingInt(self.stage),
             .num_samplers = self.num_samplers,
             .num_storage_textures = self.num_storage_textures,
             .num_storage_buffers = self.num_storage_buffers,
@@ -4221,13 +4221,13 @@ pub const StencilOperation = enum(c.SDL_GPUStencilOp) {
         if (val == c.SDL_GPU_STENCILOP_INVALID) {
             return null;
         }
-        return @enumFromInt(val);
+        return @fromBackingInt(@intCast(val));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(val: ?StencilOperation) c.SDL_GPUStencilOp {
         if (val) |tmp| {
-            return @intFromEnum(tmp);
+            return @backingInt(tmp);
         }
         return c.SDL_GPU_STENCILOP_INVALID;
     }
@@ -4470,14 +4470,14 @@ pub const TextureCreateInfo = struct {
     /// Convert from an SDL value.
     pub fn fromSdl(value: c.SDL_GPUTextureCreateInfo) TextureCreateInfo {
         return .{
-            .texture_type = @enumFromInt(value.type),
-            .format = @enumFromInt(value.format),
+            .texture_type = @fromBackingInt(@intCast(value.type)),
+            .format = @fromBackingInt(@intCast(value.format)),
             .usage = TextureUsageFlags.fromSdl(value.usage),
             .width = value.width,
             .height = value.height,
             .layer_count_or_depth = value.layer_count_or_depth,
             .num_levels = value.num_levels,
-            .sample_count = @enumFromInt(value.sample_count),
+            .sample_count = @fromBackingInt(@intCast(value.sample_count)),
             .props = if (value.props == 0) null else Properties.fromProperties(.{ .value = value.props }),
         };
     }
@@ -4486,14 +4486,14 @@ pub const TextureCreateInfo = struct {
     /// This makes a group allocation!
     pub fn toSdl(self: TextureCreateInfo) !c.SDL_GPUTextureCreateInfo {
         return .{
-            .type = @intFromEnum(self.texture_type),
-            .format = @intFromEnum(self.format),
+            .type = @backingInt(self.texture_type),
+            .format = @backingInt(self.format),
             .usage = self.usage.toSdl(),
             .width = self.width,
             .height = self.height,
             .layer_count_or_depth = self.layer_count_or_depth,
             .num_levels = self.num_levels,
-            .sample_count = @intFromEnum(self.sample_count),
+            .sample_count = @backingInt(self.sample_count),
             .props = if (self.props) |val| (try val.toProperties()).value else 0,
         };
     }
@@ -4684,12 +4684,12 @@ pub const TextureFormat = enum(c.SDL_GPUTextureFormat) {
         if (value == c.SDL_GPU_TEXTUREFORMAT_INVALID) {
             return null;
         }
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: TextureFormat) c.SDL_GPUTextureFormat {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Calculate the size in bytes of a texture format with dimensions.
@@ -4712,7 +4712,7 @@ pub const TextureFormat = enum(c.SDL_GPUTextureFormat) {
         depth_or_layer_count: u32,
     ) u32 {
         return c.SDL_CalculateGPUTextureFormatSize(
-            @intFromEnum(self),
+            @backingInt(self),
             width,
             height,
             depth_or_layer_count,
@@ -4765,7 +4765,7 @@ pub const TextureFormat = enum(c.SDL_GPUTextureFormat) {
         self: TextureFormat,
     ) u32 {
         return c.SDL_GPUTextureFormatTexelBlockSize(
-            @intFromEnum(self),
+            @backingInt(self),
         );
     }
 };
@@ -5070,7 +5070,7 @@ pub const TransferBufferCreateInfo = struct {
     /// Convert from an SDL value.
     pub fn fromSdl(value: c.SDL_GPUTransferBufferCreateInfo) TransferBufferCreateInfo {
         return .{
-            .usage = @enumFromInt(value.usage),
+            .usage = @fromBackingInt(@intCast(value.usage)),
             .size = value.size,
             .props = if (value.props == 0) null else Properties.fromProperties(.{ .value = value.props }),
         };
@@ -5080,7 +5080,7 @@ pub const TransferBufferCreateInfo = struct {
     /// This makes a group allocation!
     pub fn toSdl(self: TransferBufferCreateInfo) !c.SDL_GPUTransferBufferCreateInfo {
         return .{
-            .usage = @intFromEnum(self.usage),
+            .usage = @backingInt(self.usage),
             .size = self.size,
             .props = if (self.props) |val| (try val.toProperties()).value else 0,
         };
@@ -5240,13 +5240,13 @@ pub const VertexElementFormat = enum(c.SDL_GPUVertexElementFormat) {
         if (val == c.SDL_GPU_VERTEXELEMENTFORMAT_INVALID) {
             return null;
         }
-        return @enumFromInt(val);
+        return @fromBackingInt(@intCast(val));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(val: ?VertexElementFormat) c.SDL_GPUVertexElementFormat {
         if (val) |tmp| {
-            return @intFromEnum(tmp);
+            return @backingInt(tmp);
         }
         return c.SDL_GPU_VERTEXELEMENTFORMAT_INVALID;
     }

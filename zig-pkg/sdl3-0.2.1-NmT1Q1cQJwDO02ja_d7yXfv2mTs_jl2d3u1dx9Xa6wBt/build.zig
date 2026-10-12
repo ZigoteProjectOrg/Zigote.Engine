@@ -52,7 +52,7 @@ pub const SdlConfig = struct {
     /// Enable the true type font extension.
     ext_ttf: ?ttf.Options = null,
     /// How to link C SDL.
-    c_sdl_preferred_linkage: std.builtin.LinkMode = .static,
+    c_sdl_preferred_linkage: std.lang.LinkMode = .static,
     /// If to strip C SDL.
     c_sdl_strip: bool = false,
     /// If to sanitize C SDL.
@@ -76,11 +76,14 @@ pub const SdlConfig = struct {
 ///
 /// ## Return Value
 /// Returns the created SDL3 module.
+/// The SDK / NDK root (`-Dsysroot`), null when not given. Set once at the top of `build`.
+var sysroot: ?[]const u8 = null;
+
 pub fn prepareSdl(
     b: *std.Build,
     cfg: SdlConfig,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     public: bool,
 ) *std.Build.Module {
     const c_source_code = b.fmt(
@@ -116,14 +119,14 @@ pub fn prepareSdl(
     // headers (asm/, reached from linux/types.h) into a per-triple subdirectory — so the NDK
     // sysroot's include root alone is not enough to translate the SDL headers.
     if (target.result.abi.isAndroid()) {
-        if (b.sysroot) |sysroot| {
+        if (sysroot) |ndk| {
             const arch_dir = switch (target.result.cpu.arch) {
                 .aarch64 => "aarch64-linux-android",
                 .x86_64 => "x86_64-linux-android",
                 else => @panic("sdl3: unsupported Android arch"),
             };
-            translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
-            translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include", arch_dir }) });
+            translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk, "usr/include" }) });
+            translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk, "usr/include", arch_dir }) });
             // Two bionic-isms translate-c cannot parse, neutralized for the translation only
             // (the SDL C sources still compile with the real headers): the _FORTIFY_SOURCE
             // overload set redefines sprintf & co with different types, and the nullability
@@ -134,6 +137,10 @@ pub fn prepareSdl(
             translate_c.defineCMacro("_Null_unspecified", "");
         }
     }
+
+    // Windows: MinGW's _FORTIFY_SOURCE wrappers declare an extern inside a local scope, which
+    // translate-c mistranslates (ziglang/zig #23275). They exist only when the macro is > 0.
+    if (target.result.os.tag == .windows) translate_c.defineCMacro("_FORTIFY_SOURCE", "0");
 
     const c_module = translate_c.createModule();
 
@@ -178,6 +185,7 @@ pub fn prepareSdl(
         if (b.lazyDependency("sdl", .{
             .target = target,
             .optimize = optimize,
+            .sysroot = @as([]const u8, sysroot orelse ""),
             .preferred_linkage = cfg.c_sdl_preferred_linkage,
             .strip = cfg.c_sdl_strip,
             .sanitize_c = cfg.c_sdl_sanitize_c,
@@ -224,17 +232,16 @@ pub fn build(
     const optimize = b.standardOptimizeOption(.{});
 
     // C SDL options.
-    const c_sdl_preferred_linkage = b.option(std.builtin.LinkMode, "c_sdl_preferred_linkage", "Prefer building statically or dynamically linked libraries (default: static)") orelse .static;
-    const c_sdl_strip = b.option(bool, "c_sdl_strip", "Strip debug symbols (default: varies)") orelse (optimize == .ReleaseSmall);
+    const c_sdl_preferred_linkage = b.option(std.lang.LinkMode, "c_sdl_preferred_linkage", "Prefer building statically or dynamically linked libraries (default: static)") orelse .static;
+    const c_sdl_strip = b.option(bool, "c_sdl_strip", "Strip debug symbols (default: varies)") orelse (optimize == .small);
     const c_sdl_sanitize_c = b.option(std.zig.SanitizeC, "c_sdl_sanitize_c", "Detect C undefined behavior (default: trap)") orelse .trap;
     const c_sdl_lto = b.option(std.zig.LtoMode, "c_sdl_lto", "Perform link time optimization (default: false)") orelse .none;
     const c_sdl_emscripten_pthreads = b.option(bool, "c_sdl_emscripten_pthreads", "Build with pthreads support when targeting Emscripten (default: false)") orelse false;
     const c_sdl_install_build_config_h = b.option(bool, "c_sdl_install_build_config_h", "Additionally install 'SDL_build_config.h' when installing SDL (default: false)") orelse false;
     const sdl_system_include_path = b.option(std.Build.LazyPath, "sdl_system_include_path", "System include path for SDL");
-    const sdl_sysroot_path = b.option(std.Build.LazyPath, "sdl_sysroot_path", "System include path for SDL");
 
-    if (sdl_sysroot_path) |val| {
-        b.sysroot = val.getPath(b);
+    if (b.option([]const u8, "sysroot", "SDK / NDK root. Pass the same path as --sysroot: since zig 0.17 a build script cannot read that flag.")) |s| {
+        if (s.len > 0) sysroot = s;
     }
     const system_sdl = b.systemIntegrationOption("sdl", .{});
 
@@ -283,7 +290,7 @@ pub fn build(
         ext_ttf_opts.enable_harfbuzz = b.option(bool, "enable-harfbuzz", "Use HarfBuzz to improve text shaping") orelse true;
     }
 
-    var sdl_config = SdlConfig{
+    const sdl_config = SdlConfig{
         .c_sdl_emscripten_pthreads = c_sdl_emscripten_pthreads,
         .c_sdl_install_build_config_h = c_sdl_install_build_config_h,
         .c_sdl_lto = c_sdl_lto,
@@ -301,107 +308,8 @@ pub fn build(
         .sdl_system_include_path = sdl_system_include_path,
         .system_sdl = system_sdl,
     };
+    // Zigote fork: upstream also configured a second, every-extension module here for its docs,
+    // examples and tests. That requested every lazy dependency (dxc, spirv-cross, SDL_image, …) on
+    // each engine build; the engine uses none of them, so it is gone, with those dependencies.
     _ = prepareSdl(b, sdl_config, target, optimize, true);
-    sdl_config.ext_image = ext_image_opts;
-    sdl_config.ext_net = ext_net_opts;
-    sdl_config.ext_shadercross = ext_shadercross_opts;
-    sdl_config.ext_ttf = ext_ttf_opts;
-    const sdl3_full = prepareSdl(b, sdl_config, target, optimize, false);
-
-    setupDocs(b, sdl3_full);
-    setupExamples(b, sdl3_full, target, optimize);
-    setupTest(b, sdl3_full);
-}
-
-fn setupDocs(
-    b: *std.Build,
-    sdl3: *std.Build.Module,
-) void {
-    const sdl3_lib = b.addLibrary(.{
-        .root_module = sdl3,
-        .name = "sdl3",
-    });
-    const docs = b.addInstallDirectory(.{
-        .source_dir = sdl3_lib.getEmittedDocs(),
-        .install_dir = .{ .prefix = {} },
-        .install_subdir = "docs",
-    });
-    const docs_step = b.step("docs", "Generate library documentation");
-    docs_step.dependOn(&docs.step);
-}
-
-fn setupExample(
-    b: *std.Build,
-    sdl3: *std.Build.Module,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    name: []const u8,
-    examples_step: *std.Build.Step,
-) struct { *std.Build.Step.Compile, *std.Build.Step.InstallArtifact } {
-    const exe_module = b.createModule(.{
-        .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "sdl3", .module = sdl3 },
-        },
-    });
-    const exe = b.addExecutable(.{
-        .name = name,
-        .root_module = exe_module,
-    });
-    const example_install = b.addInstallArtifact(exe, .{});
-    examples_step.dependOn(&example_install.step);
-    return .{ exe, example_install };
-}
-
-fn runExample(
-    b: *std.Build,
-    example_compile: *std.Build.Step.Compile,
-    example_install: *std.Build.Step.InstallArtifact,
-    run_examples_step: *std.Build.Step,
-) void {
-    const run_art = b.addRunArtifact(example_compile);
-    run_art.step.dependOn(&example_install.step);
-    run_examples_step.dependOn(&run_art.step);
-}
-
-fn setupExamples(
-    b: *std.Build,
-    sdl3: *std.Build.Module,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) void {
-    const examples_step = b.step("examples", "Build all examples");
-    const run_example: ?[]const u8 = b.option([]const u8, "example", "The example name for running an example") orelse null;
-    const run_examples_step = b.step("run", "Run an example with -Dexample=<example_name> option");
-
-    for (examples) |example| {
-        const example_compile, const example_install = setupExample(
-            b,
-            sdl3,
-            target,
-            optimize,
-            example,
-            examples_step,
-        );
-        if (run_example) |run_example_name| {
-            if (std.mem.eql(u8, example, run_example_name)) {
-                runExample(b, example_compile, example_install, run_examples_step);
-            }
-        }
-    }
-}
-
-fn setupTest(
-    b: *std.Build,
-    sdl3: *std.Build.Module,
-) void {
-    const tst = b.addTest(.{
-        .name = "sdl3",
-        .root_module = sdl3,
-    });
-    const tst_run = b.addRunArtifact(tst);
-    const tst_step = b.step("test", "Run all tests");
-    tst_step.dependOn(&tst_run.step);
 }

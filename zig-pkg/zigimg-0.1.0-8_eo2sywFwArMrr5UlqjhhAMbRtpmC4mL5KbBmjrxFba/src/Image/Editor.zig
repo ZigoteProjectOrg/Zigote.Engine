@@ -41,13 +41,13 @@ pub fn crop(image: *const Image, allocator: std.mem.Allocator, crop_area: Box) E
 
     if (box.width == 0 or box.height == 0 or
         image.width == 0 or image.height == 0)
-        {
-            return Image{
-                .width = box.width,
-                .height = box.height,
-                .pixels = cropped_pixels,
-            };
-        }
+    {
+        return Image{
+            .width = box.width,
+            .height = box.height,
+            .pixels = cropped_pixels,
+        };
+    }
 
     const original_data = image.pixels.asBytes();
     const cropped_data = cropped_pixels.asBytes();

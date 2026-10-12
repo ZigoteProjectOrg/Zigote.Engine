@@ -74,7 +74,7 @@ fn parseHeader(reader: *std.Io.Reader) Image.ReadError!Header {
 
 fn isWhitespace(b: u8) bool {
     return switch (b) {
-    // Whitespace (blanks, TABs, CRs, LFs).
+        // Whitespace (blanks, TABs, CRs, LFs).
         '\n', '\r', ' ', '\t' => true,
         else => false,
     };
@@ -84,22 +84,22 @@ fn readNextByte(reader: *std.Io.Reader) Image.ReadError!u8 {
     while (true) {
         const read_byte = try reader.takeByte();
         switch (read_byte) {
-        // Before the whitespace character that delimits the raster, any characters
-        // from a "#" through the next carriage return or newline character, is a
-        // comment and is ignored. Note that this is rather unconventional, because
-        // a comment can actually be in the middle of what you might consider a token.
-        // Note also that this means if you have a comment right before the raster,
-        // the newline at the end of the comment is not sufficient to delimit the raster.
+            // Before the whitespace character that delimits the raster, any characters
+            // from a "#" through the next carriage return or newline character, is a
+            // comment and is ignored. Note that this is rather unconventional, because
+            // a comment can actually be in the middle of what you might consider a token.
+            // Note also that this means if you have a comment right before the raster,
+            // the newline at the end of the comment is not sufficient to delimit the raster.
             '#' => {
-            // eat up comment
+                // eat up comment
                 while (true) {
-                const comment_byte = try reader.takeByte();
-                switch (comment_byte) {
-                    '\r', '\n' => break,
-                    else => {},
+                    const comment_byte = try reader.takeByte();
+                    switch (comment_byte) {
+                        '\r', '\n' => break,
+                        else => {},
+                    }
                 }
-            }
-        },
+            },
             else => return read_byte,
         }
     }

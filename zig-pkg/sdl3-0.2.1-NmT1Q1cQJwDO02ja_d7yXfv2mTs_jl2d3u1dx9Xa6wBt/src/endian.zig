@@ -21,7 +21,7 @@ pub const ByteOrder = enum(c_int) {
 /// ## Version
 /// This function is available since SDL 3.2.0.
 pub inline fn byteOrder() ByteOrder {
-    return @enumFromInt(c.SDL_BYTEORDER);
+    return @fromBackingInt(@intCast(c.SDL_BYTEORDER));
 }
 
 /// A function that reports the target system's floating point word order.
@@ -32,7 +32,7 @@ pub inline fn byteOrder() ByteOrder {
 /// ## Version
 /// This function is available since SDL 3.2.0.
 pub inline fn floatWordOrder() ByteOrder {
-    return @enumFromInt(c.SDL_FLOATWORDORDER);
+    return @fromBackingInt(@intCast(c.SDL_FLOATWORDORDER));
 }
 
 /// Byte-swap an unsigned 16-bit number.

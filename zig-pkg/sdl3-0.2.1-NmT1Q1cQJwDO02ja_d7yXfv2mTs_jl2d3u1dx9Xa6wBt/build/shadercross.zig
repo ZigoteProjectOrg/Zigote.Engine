@@ -8,7 +8,7 @@ pub const Options = struct {};
 fn addDeps(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     system_include_path: ?std.Build.LazyPath,
     sdl_dep_lib: ?*std.Build.Step.Compile,
     link_cli: bool,
@@ -49,7 +49,7 @@ fn addDeps(
     const spirv_headers = b.lazyDependency("spirv_headers", .{}) orelse return null;
     const spirv_cross = b.lazyDependency("spirv_cross", .{
         .target = target,
-        .optimize = .ReleaseFast, // There is a C bug in spirv-cross upstream! Ignore undefined behavior for now.
+        .optimize = .fast, // There is a C bug in spirv-cross upstream! Ignore undefined behavior for now.
         .spv_cross_reflect = true,
         .spv_cross_cpp = false,
     }) orelse return null;
@@ -78,16 +78,16 @@ pub fn cli(
         .root_module = b.createModule(.{
             .link_libc = true,
             .target = b.graph.host,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
         }),
     });
     const sdl_dep_lib: ?*std.Build.Step.Compile = if (use_sdl_dep_lib) brk: {
-        const lib = (b.lazyDependency("sdl", .{ .target = b.graph.host, .optimize = .ReleaseFast }) orelse return null).artifact("SDL3");
+        const lib = (b.lazyDependency("sdl", .{ .target = b.graph.host, .optimize = .fast }) orelse return null).artifact("SDL3");
         if (system_include_path) |val|
             lib.root_module.addSystemIncludePath(val);
         break :brk lib;
     } else null;
-    addDeps(b, b.graph.host, .ReleaseFast, system_include_path, sdl_dep_lib, true, dxc_support, exe) orelse return null;
+    addDeps(b, b.graph.host, .fast, system_include_path, sdl_dep_lib, true, dxc_support, exe) orelse return null;
     return exe;
 }
 
@@ -96,7 +96,7 @@ pub fn setup(
     extension_config: ExtensionConfig,
     options: Options,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     dxc_support: bool,
 ) void {
     _ = options;

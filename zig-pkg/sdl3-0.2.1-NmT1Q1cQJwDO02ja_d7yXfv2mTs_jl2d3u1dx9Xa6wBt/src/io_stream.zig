@@ -9,13 +9,13 @@ const std = @import("std");
 /// ## Version
 /// This error is available since SDL 3.2.0.
 pub const Error = error{
-/// Read or write I/O error.
+    /// Read or write I/O error.
     Err,
-/// Non blocking I/O, not ready.
+    /// Non blocking I/O, not ready.
     NotReady,
-/// Tried to write a read-only buffer
+    /// Tried to write a read-only buffer
     ReadOnly,
-/// Tried to read a write-only buffer.
+    /// Tried to read a write-only buffer.
     WriteOnly,
 };
 
@@ -161,7 +161,7 @@ pub fn Interface(comptime UserData: type) type {
                 /// ## Return Value
                 /// The final offset in the data stream, or `-1` on error.
                 pub fn seek_c(user_data_c: ?*anyopaque, offset_c: i64, whence_c: c.SDL_IOWhence) callconv(.c) i64 {
-                    const ret = self.seek.?(@ptrCast(@alignCast(user_data_c)), @intCast(offset_c), @enumFromInt(whence_c)) catch return -1;
+                    const ret = self.seek.?(@ptrCast(@alignCast(user_data_c)), @intCast(offset_c), @fromBackingInt(@intCast(whence_c))) catch return -1;
                     return @intCast(ret);
                 }
 
@@ -1660,7 +1660,7 @@ pub const Stream = struct {
         return @intCast(try errors.wrapCall(i64, c.SDL_SeekIO(
             self.value,
             @intCast(offset),
-            @intFromEnum(whence),
+            @backingInt(whence),
         ), -1));
     }
 
@@ -2301,7 +2301,7 @@ test "Stream" {
         try std.testing.expectEqual(0, sdl_stream.seek(0, .set));
         try std.testing.expectEqual(7, try sdl_stream.readU8());
         try std.testing.expectEqual(3, try sdl_stream.readU8());
-        try std.testing.expectEqual(62, try sdl_stream.write(&([_]u8{0} ** 62)));
+        try std.testing.expectEqual(62, try sdl_stream.write(&@as([62]u8, @splat(0))));
         try std.testing.expectEqual(64, try sdl_stream.getSize());
         try std.testing.expectEqual(50, sdl_stream.seek(50, .set));
         try std.testing.expectEqual(41, sdl_stream.seek(23, .end));

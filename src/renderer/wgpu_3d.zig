@@ -326,7 +326,7 @@ fn createSolidTextureView(
     const texture_view = texture.createView(null) orelse return error.WgpuTextureViewUnavailable;
     errdefer texture_view.release();
 
-    var upload: [256]u8 = .{0} ** 256;
+    var upload: [256]u8 = @splat(0);
     upload[0] = rgba[0];
     upload[1] = rgba[1];
     upload[2] = rgba[2];
@@ -372,7 +372,7 @@ fn boxDownsampleRgba8(src: []const u8, src_w: u32, src_h: u32, dst: []u8, dst_w:
 // of `count` single draws. count==0 means the node draws nothing (an instanced node is never
 // rendered as a single fallback draw — see the geometry/shadow loops).
 const InstanceGpu = struct {
-    cpu: std.ArrayListUnmanaged(f32) = .{ .items = &.{}, .capacity = 0 },
+    cpu: std.ArrayListUnmanaged(f32) = .empty,
     gpu: ?*wgpu.Buffer = null,
     capacity: u32 = 0, // instances the gpu buffer can hold
     count: u32 = 0, // live instance count this frame
@@ -397,11 +397,11 @@ const InstanceGpu = struct {
 // on its own when to free GPU buffers.
 const InstancePool = HandleTable(InstanceGpu);
 
-// A blended renderable tagged with its squared distance to the camera so the
-// transparent pass can draw farthest-first.
+// Ordinary objects and individual instances share one camera-depth ordering per pass.
 const TransparentItem = struct {
     renderable: scene_mod.Renderable,
-    dist_sq: f32,
+    depth: f32,
+    instance_index: ?u32 = null,
 };
 
 // One opaque/masked draw, bucketed then sorted by (double_sided, material) so the draw loop can
@@ -874,7 +874,6 @@ fn createPostResources(device: *wgpu.Device, surface_format: wgpu.TextureFormat)
         .size = @sizeOf(TaaParams),
     }) orelse return error.BufferCreateFailed;
 
-
     return .{
         .bloom_down_first_buf = bloom_down_first_buf,
         .bloom_down_pipeline = bloom_down_pipeline,
@@ -921,7 +920,7 @@ pub const Gpu3d = struct {
     glass_pipeline_ds: *wgpu.RenderPipeline, // no-cull glass for double-sided windshields/panes
     // Same bind-group layout as `pipeline`, plus a second vertex buffer (step_mode=instance)
     // carrying a per-instance model matrix. One drawIndexed(idx, N) draws a whole batch.
-    instanced_pipeline: *wgpu.RenderPipeline,
+    instanced_pipelines: [3][2]*wgpu.RenderPipeline, // Material.Pass × double-sided
     // Wireframe variants of `pipeline` / `instanced_pipeline`: identical layout/shaders but with
     // line-list topology (and no back-face cull). Bound when settings.wireframe is set; they draw
     // the per-primitive edge index buffer. The mesh shader emits a flat colour for these.
@@ -1048,12 +1047,12 @@ pub const Gpu3d = struct {
     // Downsample scene_hdr → mip1 → … → mip(n-1); additive tent upsample back to mip1; tonemap
     // reads mip1. mip0 (full-res) is allocated but unused (kept so mip indices match resolution).
     bloom_chain_texture: ?*wgpu.Texture = null,
-    bloom_mip_views: [BLOOM_MIPS]?*wgpu.TextureView = .{null} ** BLOOM_MIPS,
+    bloom_mip_views: [BLOOM_MIPS]?*wgpu.TextureView = @splat(null),
     bloom_mip_count: u32 = 0,
     // bloom_down_bgs[i] samples the source for the pass writing mip i (scene_hdr for i=1, else
     // mip i-1). bloom_up_bgs[i] samples mip i for the pass adding into mip i-1.
-    bloom_down_bgs: [BLOOM_MIPS]?*wgpu.BindGroup = .{null} ** BLOOM_MIPS,
-    bloom_up_bgs: [BLOOM_MIPS]?*wgpu.BindGroup = .{null} ** BLOOM_MIPS,
+    bloom_down_bgs: [BLOOM_MIPS]?*wgpu.BindGroup = @splat(null),
+    bloom_up_bgs: [BLOOM_MIPS]?*wgpu.BindGroup = @splat(null),
     // SSAO G-buffer: view-space position (MSAA target + resolved single-sample) + AO result.
     msaa_pos_texture: ?*wgpu.Texture = null,
     msaa_pos_view: ?*wgpu.TextureView = null,
@@ -1100,13 +1099,13 @@ pub const Gpu3d = struct {
     // so the image never shimmers on a path where the resolve won't run (Task: jitter↔resolve).
     taa_path_supported: bool = true,
     // Projection matrix of the last world-3D layer, used to project SSAO/SSR samples.
-    last_proj: [16]f32 = [_]f32{0} ** 16,
-    last_view: [16]f32 = [_]f32{0} ** 16, // world→view of the last world-3D layer (for contact shadows)
+    last_proj: [16]f32 = @splat(0),
+    last_view: [16]f32 = @splat(0), // world→view of the last world-3D layer (for contact shadows)
     // TAA reprojection state (unjittered): current view-proj (becomes prev next frame),
     // previous view-proj, and current inverse view (view_pos → world).
-    cur_view_proj: [16]f32 = [_]f32{0} ** 16,
-    prev_view_proj: [16]f32 = [_]f32{0} ** 16,
-    inv_view: [16]f32 = [_]f32{0} ** 16,
+    cur_view_proj: [16]f32 = @splat(0),
+    prev_view_proj: [16]f32 = @splat(0),
+    inv_view: [16]f32 = @splat(0),
     taa_frame: u32 = 0,
     taa_valid: bool = false, // history populated (cleared on resize / first frame)
     // Post pipelines + layouts + param buffers (created once in init).
@@ -1151,32 +1150,32 @@ pub const Gpu3d = struct {
     // is guarded by a successful world.getMaterial (the null_material sentinel never reaches here), so
     // the handle is always < materials count → the array stays dense and bounded.
     material_gpu_cache: std.ArrayListUnmanaged(?MaterialGpu) = .empty,
-    render_list: std.ArrayListUnmanaged(scene_mod.Renderable) = .{ .items = &.{}, .capacity = 0 },
+    render_list: std.ArrayListUnmanaged(scene_mod.Renderable) = .empty,
     // The world-3D renderable set, collected ONCE per frame in beginScene and reused by both the
     // shadow pass (read-only) and the geometry pass (copied into render_list, then frustum-culled).
     // Avoids re-walking the whole scene tree 2× per frame for the identical set. (Renderable is two
     // pointers, so the per-frame copy into render_list is far cheaper than a second tree traversal.)
-    world3d_list: std.ArrayListUnmanaged(scene_mod.Renderable) = .{ .items = &.{}, .capacity = 0 },
+    world3d_list: std.ArrayListUnmanaged(scene_mod.Renderable) = .empty,
     // Frustum culling of the world-3D geometry pass (set via zigote_render_set_frustum_cull). On by
     // default; drops draws whose world-space bounding sphere is fully outside the camera frustum.
     frustum_cull: bool = true,
     // Scratch buffer for depth-sorting blended renderables each frame (back-to-front).
-    transparent_scratch: std.ArrayListUnmanaged(TransparentItem) = .{ .items = &.{}, .capacity = 0 },
+    transparent_scratch: std.ArrayListUnmanaged(TransparentItem) = .empty,
     // Glass renderables, deferred to a second pass (after copying the opaque scene) for refraction.
-    glass_scratch: std.ArrayListUnmanaged(TransparentItem) = .{ .items = &.{}, .capacity = 0 },
+    glass_scratch: std.ArrayListUnmanaged(TransparentItem) = .empty,
     // Reused per-frame light list (cleared, not freed, each frame) so collectLights doesn't
     // alloc+free on the steady path — the 3D scene renders every frame.
-    light_scratch: std.ArrayListUnmanaged(scene_mod.ActiveLight) = .{ .items = &.{}, .capacity = 0 },
+    light_scratch: std.ArrayListUnmanaged(scene_mod.ActiveLight) = .empty,
     // Instanced renderables collected during the opaque loop, drawn together with the
     // instanced pipeline afterwards.
-    instanced_scratch: std.ArrayListUnmanaged(scene_mod.Renderable) = .{ .items = &.{}, .capacity = 0 },
+    instanced_scratch: std.ArrayListUnmanaged(scene_mod.Renderable) = .empty,
     // Opaque draws for one layer, sorted by (double_sided, material) before drawing to minimise
     // pipeline/material-bind state changes (the model group still rebinds per object).
-    opaque_scratch: std.ArrayListUnmanaged(OpaqueItem) = .{ .items = &.{}, .capacity = 0 },
+    opaque_scratch: std.ArrayListUnmanaged(OpaqueItem) = .empty,
     // Shadow casters classified ONCE per frame (opaque vs alpha-masked), reused across every shadow
     // slice so the per-slice loop only frustum-tests + draws. Rebuilt in classifyShadowCasters.
-    shadow_casters_opaque: std.ArrayListUnmanaged(ShadowCaster) = .{ .items = &.{}, .capacity = 0 },
-    shadow_casters_masked: std.ArrayListUnmanaged(ShadowCaster) = .{ .items = &.{}, .capacity = 0 },
+    shadow_casters_opaque: std.ArrayListUnmanaged(ShadowCaster) = .empty,
+    shadow_casters_masked: std.ArrayListUnmanaged(ShadowCaster) = .empty,
     // Per-entity model UBO+bind-group, stored in a generational pool; the index map resolves
     // the entity-keyed FFI ops (invalidateEntity) to a handle.
 
@@ -1609,29 +1608,39 @@ pub const Gpu3d = struct {
             .attributes = &instance_attrs,
         };
         const instanced_vbufs = [_]wgpu.VertexBufferLayout{ vertex_buf_layout, instance_buf_layout };
-        const instanced_pipeline = device.createRenderPipeline(&.{
-            .label = wgpu.StringView.fromSlice("zigote 3d instanced pipeline"),
-            .layout = pipeline_layout,
-            .vertex = .{
-                .module = shader,
-                .entry_point = wgpu.StringView.fromSlice("vs_instanced"),
-                .buffer_count = instanced_vbufs.len,
-                .buffers = &instanced_vbufs,
-            },
-            .primitive = .{
-                .topology = .triangle_list,
-                .front_face = .ccw,
-                .cull_mode = .back,
-            },
-            .depth_stencil = &depth_stencil_state,
-            .multisample = .{ .count = MSAA_SAMPLES, .mask = 0xFFFFFFFF },
-            .fragment = &.{
-                .module = shader,
-                .entry_point = wgpu.StringView.fromSlice("fs_main"),
-                .target_count = opaque_targets.len,
-                .targets = &opaque_targets,
-            },
-        }) orelse return error.PipelineCreateFailed;
+        var instanced_pipelines: [3][2]*wgpu.RenderPipeline = undefined;
+        var created_instance_pipelines: usize = 0;
+        errdefer {
+            for (0..created_instance_pipelines) |i| instanced_pipelines[i / 2][i % 2].release();
+        }
+        for (&instanced_pipelines, 0..) |*variants, kind| {
+            for (variants, 0..) |*instance_pipeline, sided| {
+                instance_pipeline.* = device.createRenderPipeline(&.{
+                    .label = wgpu.StringView.fromSlice("zigote 3d instanced pipeline"),
+                    .layout = pipeline_layout,
+                    .vertex = .{
+                        .module = shader,
+                        .entry_point = wgpu.StringView.fromSlice("vs_instanced"),
+                        .buffer_count = instanced_vbufs.len,
+                        .buffers = &instanced_vbufs,
+                    },
+                    .primitive = .{
+                        .topology = .triangle_list,
+                        .front_face = .ccw,
+                        .cull_mode = if (sided == 0) .back else .none,
+                    },
+                    .depth_stencil = if (kind == @backingInt(resources_mod.Material.Pass.blend)) &transparent_depth_state else &depth_stencil_state,
+                    .multisample = .{ .count = MSAA_SAMPLES, .mask = 0xFFFFFFFF },
+                    .fragment = &.{
+                        .module = shader,
+                        .entry_point = wgpu.StringView.fromSlice("fs_main"),
+                        .target_count = opaque_targets.len,
+                        .targets = if (kind == @backingInt(resources_mod.Material.Pass.solid)) &opaque_targets else &transparent_targets,
+                    },
+                }) orelse return error.PipelineCreateFailed;
+                created_instance_pipelines += 1;
+            }
+        }
 
         // Wireframe pipelines: clones of `pipeline` / `instanced_pipeline` with line-list topology
         // and no back-face cull (a line has no winding). They draw the per-primitive edge index
@@ -2167,7 +2176,7 @@ pub const Gpu3d = struct {
             .transparent_pipeline_ds = transparent_pipeline_ds,
             .glass_pipeline = glass_pipeline,
             .glass_pipeline_ds = glass_pipeline_ds,
-            .instanced_pipeline = instanced_pipeline,
+            .instanced_pipelines = instanced_pipelines,
             .wireframe_pipeline = wireframe_pipeline,
             .wireframe_instanced_pipeline = wireframe_instanced_pipeline,
             .shadow_pipeline = shadow_pipeline,
@@ -2330,7 +2339,9 @@ pub const Gpu3d = struct {
         self.transparent_pipeline_ds.release();
         self.glass_pipeline.release();
         self.glass_pipeline_ds.release();
-        self.instanced_pipeline.release();
+        for (self.instanced_pipelines) |variants| {
+            for (variants) |pipeline| pipeline.release();
+        }
         self.wireframe_pipeline.release();
         self.wireframe_instanced_pipeline.release();
         self.shadow_pipeline.release();
@@ -4455,7 +4466,7 @@ pub const Gpu3d = struct {
                     .metallic_roughness = .{ 0, 0, 0, 0 },
                     .emissive = .{ 0, 0, 0, 0 },
                     // effect.z = alpha mode (mask), .w = alpha cutoff (bitcast) — read by the alpha shader.
-                    .effect = .{ 0, 0, @intFromEnum(m.alpha_mode), @bitCast(m.alpha_cutoff) },
+                    .effect = .{ 0, 0, @backingInt(m.alpha_mode), @bitCast(m.alpha_cutoff) },
                     .surface = .{ 0, 0, 0, 0 },
                 };
                 rec.model_off = self.pushModel(queue, model_data) orelse continue;
@@ -4622,31 +4633,41 @@ pub const Gpu3d = struct {
         self.instanced_scratch.clearRetainingCapacity();
         self.opaque_scratch.clearRetainingCapacity();
         for (renderables.items) |renderable| {
-            // Instanced nodes (asteroid belt etc.) draw in one batch after the opaque loop. A node with
-            // an instance entry is handled ONLY here — even with 0 live instances (an empty LOD bucket)
-            // it must never fall through to a single full-size draw at the node origin.
-            if (self.instanceFor(renderable.node.entity)) |inst| {
-                if (inst.count > 0) self.instanced_scratch.append(self.allocator, renderable) catch {};
-                continue;
-            }
             const mat_data = if (renderable.mesh_renderer.material != scene_mod.null_material)
                 world.getMaterial(renderable.mesh_renderer.material)
             else
                 null;
-            if (mat_data) |m| {
-                if (m.alpha_mode == .blend or m.alpha_mode == .glass) {
-                    // Blended → pass 2 (same pass). Glass → the post-copy refraction pass so it can
-                    // sample the opaque scene behind it. Both tagged with camera distance for sorting.
-                    const p = renderable.node.world_transform.position;
-                    const d = p.sub(cam_pos);
-                    const item = TransparentItem{ .renderable = renderable, .dist_sq = d.dot(d) };
-                    if (m.alpha_mode == .glass and layer == .world_3d) {
-                        self.glass_scratch.append(self.allocator, item) catch {};
-                    } else {
-                        self.transparent_scratch.append(self.allocator, item) catch {};
-                    }
+            const kind = if (mat_data) |m| m.renderPass() else .solid;
+            const inst = self.instanceFor(renderable.node.entity);
+            if (inst) |batch| {
+                // An empty LOD bucket must never fall through to an ordinary draw.
+                if (batch.count == 0 or !self.uploadInstances(queue, batch)) continue;
+                if (kind == .solid) {
+                    self.instanced_scratch.append(self.allocator, renderable) catch {};
                     continue;
                 }
+            }
+            if (kind != .solid) {
+                const mesh = world.getMesh(renderable.mesh_renderer.mesh) orelse continue;
+                const list = if (kind == .glass and layer == .world_3d) &self.glass_scratch else &self.transparent_scratch;
+                if (inst) |batch| {
+                    // Preserve source order in the CPU/GPU buffer. first_instance selects the
+                    // sorted record, allowing ordinary objects and other batches to interleave.
+                    for (0..batch.count) |index| {
+                        const model = Mat4.fromArray(batch.cpu.items[index * 16 ..][0..16].*);
+                        list.append(self.allocator, .{
+                            .renderable = renderable,
+                            .depth = scene_mod.draw_order.depth(view, model, mesh.bounds_center),
+                            .instance_index = @intCast(index),
+                        }) catch {};
+                    }
+                } else {
+                    list.append(self.allocator, .{
+                        .renderable = renderable,
+                        .depth = scene_mod.draw_order.depth(view, renderable.node.worldMatrix(), mesh.bounds_center),
+                    }) catch {};
+                }
+                continue;
             }
             self.opaque_scratch.append(self.allocator, .{
                 .renderable = renderable,
@@ -4696,13 +4717,13 @@ pub const Gpu3d = struct {
 
         // Instanced pass — one drawIndexed(idx, N) per instanced node (shared mesh + material).
         if (self.instanced_scratch.items.len > 0) {
-            pass.setPipeline(if (wf) self.wireframe_instanced_pipeline else self.instanced_pipeline);
             for (self.instanced_scratch.items) |renderable| {
                 const mat_data = if (renderable.mesh_renderer.material != scene_mod.null_material)
                     world.getMaterial(renderable.mesh_renderer.material)
                 else
                     null;
-                self.drawRenderableInstanced(world, queue, pass, renderable, mat_data);
+                pass.setPipeline(if (wf) self.wireframe_instanced_pipeline else self.instanced_pipelines[@backingInt(resources_mod.Material.Pass.solid)][if (mat_data != null and mat_data.?.double_sided) @as(usize, 1) else 0]);
+                self.drawRenderableInstanced(world, queue, pass, renderable, mat_data, null);
             }
         }
 
@@ -4711,14 +4732,16 @@ pub const Gpu3d = struct {
         if (self.transparent_scratch.items.len > 0) {
             std.mem.sort(TransparentItem, self.transparent_scratch.items, {}, struct {
                 fn farther(_: void, a: TransparentItem, b: TransparentItem) bool {
-                    return a.dist_sq > b.dist_sq;
+                    return a.depth > b.depth;
                 }
             }.farther);
 
             var trans_cur: ?*wgpu.RenderPipeline = null;
             for (self.transparent_scratch.items) |item| {
                 const mat_data = world.getMaterial(item.renderable.mesh_renderer.material);
-                const want = if (wf)
+                const want = if (item.instance_index != null)
+                    (if (wf) self.wireframe_instanced_pipeline else self.instanced_pipelines[@backingInt(resources_mod.Material.Pass.blend)][if (mat_data != null and mat_data.?.double_sided) @as(usize, 1) else 0])
+                else if (wf)
                     self.wireframe_pipeline
                 else if (mat_data != null and mat_data.?.double_sided)
                     self.transparent_pipeline_ds
@@ -4728,7 +4751,11 @@ pub const Gpu3d = struct {
                     pass.setPipeline(want);
                     trans_cur = want;
                 }
-                self.drawRenderable(world, queue, pass, item.renderable, mat_data);
+                if (item.instance_index) |index| {
+                    self.drawRenderableInstanced(world, queue, pass, item.renderable, mat_data, index);
+                } else {
+                    self.drawRenderable(world, queue, pass, item.renderable, mat_data);
+                }
             }
         }
 
@@ -4752,7 +4779,7 @@ pub const Gpu3d = struct {
             );
             std.mem.sort(TransparentItem, self.glass_scratch.items, {}, struct {
                 fn farther(_: void, a: TransparentItem, b: TransparentItem) bool {
-                    return a.dist_sq > b.dist_sq;
+                    return a.depth > b.depth;
                 }
             }.farther);
             const glass_color_attachments = [_]wgpu.ColorAttachment{
@@ -4778,7 +4805,9 @@ pub const Gpu3d = struct {
             var glass_cur: ?*wgpu.RenderPipeline = null;
             for (self.glass_scratch.items) |item| {
                 const mat_data = world.getMaterial(item.renderable.mesh_renderer.material);
-                const want = if (wf)
+                const want = if (item.instance_index != null)
+                    (if (wf) self.wireframe_instanced_pipeline else self.instanced_pipelines[@backingInt(resources_mod.Material.Pass.glass)][if (mat_data != null and mat_data.?.double_sided) @as(usize, 1) else 0])
+                else if (wf)
                     self.wireframe_pipeline
                 else if (mat_data != null and mat_data.?.double_sided)
                     self.glass_pipeline_ds
@@ -4788,7 +4817,11 @@ pub const Gpu3d = struct {
                     glass_pass.setPipeline(want);
                     glass_cur = want;
                 }
-                self.drawRenderable(world, queue, glass_pass, item.renderable, mat_data);
+                if (item.instance_index) |index| {
+                    self.drawRenderableInstanced(world, queue, glass_pass, item.renderable, mat_data, index);
+                } else {
+                    self.drawRenderable(world, queue, glass_pass, item.renderable, mat_data);
+                }
             }
             glass_pass.end();
         }
@@ -4839,42 +4872,17 @@ pub const Gpu3d = struct {
         }
 
         const model_matrix = renderable.node.worldMatrix();
-        const base_color = if (mat_data) |m| m.base_color_factor.toArray() else [4]f32{ 0.8, 0.8, 0.8, 1.0 };
-        const metallic = if (mat_data) |m| m.metallic_factor else 0.0;
-        const roughness = if (mat_data) |m| m.roughness_factor else 0.5;
-        const emissive = if (mat_data) |m| m.emissive_factor.toArray() else [3]f32{ 0, 0, 0 };
-        // Extended PBR: clearcoat factor/roughness ride in metallic_roughness.zw, specular in
-        // emissive.w. Defaults (0/0/1) reproduce a plain dielectric/metal with no coat.
-        const clearcoat = if (mat_data) |m| m.clearcoat_factor else 0.0;
-        const clearcoat_rough = if (mat_data) |m| m.clearcoat_roughness else 0.0;
-        const specular = if (mat_data) |m| m.specular_factor else 1.0;
-        const effect = if (mat_data) |m| @intFromEnum(m.effect) else 0;
-        // Alpha mode (0=opaque, 1=mask, 2=blend) + cutoff ride in effect.z/.w. The shader uses
-        // it to `discard` masked texels (foliage/decals) and to give blended surfaces a
-        // Fresnel glass response (opaque/reflective at grazing angles).
-        const alpha_code: u32 = if (mat_data) |m| @intFromEnum(m.alpha_mode) else 0;
-        const cutoff_bits: u32 = if (mat_data) |m| @bitCast(m.alpha_cutoff) else @bitCast(@as(f32, 0.5));
-        // Compare FFI handles, not addresses: the host's "selected node" is a generational table
-        // index now, and a node's address is not derivable from it (nor unique over time).
-        const is_selected: u32 = if (self.selected_node_ptr != 0 and
-            renderable.node.ffi_handle == self.selected_node_ptr) 1 else 0;
-        // Extended surface params (surface vec4): IOR + transmission + ORM occlusion strength.
-        // Legacy glass (alpha mode glass, transmission never set) is treated as fully transmissive.
-        const ior = if (mat_data) |m| m.ior else 1.5;
-        const transmission = if (mat_data) |m|
-            (if (m.alpha_mode == .glass and m.transmission <= 0.0) 1.0 else m.transmission)
-        else
-            0.0;
-        const occlusion = if (mat_data) |m| m.occlusion_strength else 0.0;
-
+        const fallback = resources_mod.Material{ .base_color_factor = .{ .x = 0.8, .y = 0.8, .z = 0.8, .w = 1 } };
+        const shading = (mat_data orelse &fallback).shading(self.selected_node_ptr != 0 and
+            renderable.node.ffi_handle == self.selected_node_ptr);
         const model_data = ModelUniforms{
             .model = model_matrix.toArray(),
             .normal_mat = renderable.node.normalMatrix().toArray(),
-            .base_color = base_color,
-            .metallic_roughness = .{ metallic, roughness, clearcoat, clearcoat_rough },
-            .emissive = .{ emissive[0], emissive[1], emissive[2], specular },
-            .effect = .{ effect, is_selected, alpha_code, cutoff_bits },
-            .surface = .{ ior, transmission, occlusion, 0 },
+            .base_color = shading.base_color,
+            .metallic_roughness = shading.metallic_roughness,
+            .emissive = shading.emissive,
+            .effect = shading.effect,
+            .surface = shading.surface,
         };
 
         const model_off = self.pushModel(queue, model_data) orelse return;
@@ -4910,38 +4918,25 @@ pub const Gpu3d = struct {
         pass: *wgpu.RenderPassEncoder,
         renderable: scene_mod.Renderable,
         mat_data: ?*const resources_mod.Material,
+        instance_index: ?u32,
     ) void {
         const mr = renderable.mesh_renderer;
         const mesh_data = world.getMesh(mr.mesh) orelse return;
         const inst = self.instanceFor(renderable.node.entity) orelse return;
-        if (inst.count == 0) return;
+        if (inst.count == 0 or inst.gpu == null) return;
 
-        const base_color = if (mat_data) |m| m.base_color_factor.toArray() else [4]f32{ 0.8, 0.8, 0.8, 1.0 };
-        const metallic = if (mat_data) |m| m.metallic_factor else 0.0;
-        const roughness = if (mat_data) |m| m.roughness_factor else 0.5;
-        const emissive = if (mat_data) |m| m.emissive_factor.toArray() else [3]f32{ 0, 0, 0 };
-        const clearcoat = if (mat_data) |m| m.clearcoat_factor else 0.0;
-        const clearcoat_rough = if (mat_data) |m| m.clearcoat_roughness else 0.0;
-        const specular = if (mat_data) |m| m.specular_factor else 1.0;
-        const effect = if (mat_data) |m| @intFromEnum(m.effect) else 0;
-        const alpha_code: u32 = if (mat_data) |m| @intFromEnum(m.alpha_mode) else 0;
-        const cutoff_bits: u32 = if (mat_data) |m| @bitCast(m.alpha_cutoff) else @bitCast(@as(f32, 0.5));
-        const ior = if (mat_data) |m| m.ior else 1.5;
-        const transmission = if (mat_data) |m|
-            (if (m.alpha_mode == .glass and m.transmission <= 0.0) 1.0 else m.transmission)
-        else
-            0.0;
-        const occlusion = if (mat_data) |m| m.occlusion_strength else 0.0;
-
+        const fallback = resources_mod.Material{ .base_color_factor = .{ .x = 0.8, .y = 0.8, .z = 0.8, .w = 1 } };
+        const shading = (mat_data orelse &fallback).shading(self.selected_node_ptr != 0 and
+            renderable.node.ffi_handle == self.selected_node_ptr);
         const ident = Mat4.identity.toArray();
         const model_data = ModelUniforms{
             .model = ident,
             .normal_mat = ident,
-            .base_color = base_color,
-            .metallic_roughness = .{ metallic, roughness, clearcoat, clearcoat_rough },
-            .emissive = .{ emissive[0], emissive[1], emissive[2], specular },
-            .effect = .{ effect, 0, alpha_code, cutoff_bits },
-            .surface = .{ ior, transmission, occlusion, 0 },
+            .base_color = shading.base_color,
+            .metallic_roughness = shading.metallic_roughness,
+            .emissive = shading.emissive,
+            .effect = shading.effect,
+            .surface = shading.surface,
         };
         const model_off = self.pushModel(queue, model_data) orelse return;
         pass.setBindGroup(1, self.model_ring_bg.?, 1, @as([*]const u32, @ptrCast(&model_off)));
@@ -4952,6 +4947,30 @@ pub const Gpu3d = struct {
             self.default_material.bind_group;
         pass.setBindGroup(2, material_bg, 0, null);
 
+        const needed_bytes: u64 = @as(u64, inst.count) * 64;
+        const draw_count: u32 = if (instance_index != null) 1 else inst.count;
+        const first_instance = instance_index orelse 0;
+
+        for (mesh_data.primitives, 0..) |*prim, prim_idx| {
+            const buffers = self.mesh_cache.getOrUpload(queue, mr.mesh, @intCast(prim_idx), prim) orelse continue;
+
+            pass.setVertexBuffer(0, buffers.vertex_buf, 0, wgpu.WGPU_WHOLE_SIZE);
+            pass.setVertexBuffer(1, inst.gpu.?, 0, needed_bytes);
+            if (self.settings.wireframe != 0.0) {
+                const lb = self.mesh_cache.ensureLineBuffer(queue, mr.mesh, @intCast(prim_idx), prim) orelse continue;
+                pass.setIndexBuffer(lb.buf, .uint32, 0, wgpu.WGPU_WHOLE_SIZE);
+                pass.drawIndexed(lb.count, draw_count, 0, 0, first_instance);
+            } else {
+                pass.setIndexBuffer(buffers.index_buf, .uint32, 0, wgpu.WGPU_WHOLE_SIZE);
+                pass.drawIndexed(buffers.index_count, draw_count, 0, 0, first_instance);
+            }
+            self.stats.draw_calls += 1;
+            self.stats.triangles += (buffers.index_count / 3) * draw_count;
+        }
+    }
+
+    /// Upload once when classifying the batch, before its opaque or sorted transparent draws.
+    fn uploadInstances(self: *Gpu3d, queue: *wgpu.Queue, inst: *InstanceGpu) bool {
         // Ensure / grow the GPU instance buffer, then upload this frame's matrices. Grow with
         // headroom (next power of two): the per-frame LOD/cull count fluctuates, so sizing the
         // buffer to the exact count would reallocate it almost every frame as the running max
@@ -4968,29 +4987,14 @@ pub const Gpu3d = struct {
             }) orelse {
                 inst.gpu = null;
                 inst.capacity = 0;
-                return;
+                return false;
             };
             inst.capacity = new_cap;
         }
         const data_bytes = std.mem.sliceAsBytes(inst.cpu.items);
         queue.writeBuffer(inst.gpu.?, 0, data_bytes.ptr, @min(data_bytes.len, needed_bytes));
 
-        for (mesh_data.primitives, 0..) |*prim, prim_idx| {
-            const buffers = self.mesh_cache.getOrUpload(queue, mr.mesh, @intCast(prim_idx), prim) orelse continue;
-
-            pass.setVertexBuffer(0, buffers.vertex_buf, 0, wgpu.WGPU_WHOLE_SIZE);
-            pass.setVertexBuffer(1, inst.gpu.?, 0, needed_bytes);
-            if (self.settings.wireframe != 0.0) {
-                const lb = self.mesh_cache.ensureLineBuffer(queue, mr.mesh, @intCast(prim_idx), prim) orelse continue;
-                pass.setIndexBuffer(lb.buf, .uint32, 0, wgpu.WGPU_WHOLE_SIZE);
-                pass.drawIndexed(lb.count, inst.count, 0, 0, 0);
-            } else {
-                pass.setIndexBuffer(buffers.index_buf, .uint32, 0, wgpu.WGPU_WHOLE_SIZE);
-                pass.drawIndexed(buffers.index_count, inst.count, 0, 0, 0);
-            }
-            self.stats.draw_calls += 1;
-            self.stats.triangles += (buffers.index_count / 3) * inst.count;
-        }
+        return true;
     }
 
     /// Invalidate GPU buffers for an entity when it is removed.
@@ -5015,7 +5019,7 @@ pub const Gpu3d = struct {
     }
 
     /// Submit (or update) the per-instance model matrices for a node's mesh. `ptr` points at
-    /// count*16 column-major f32 matrix values. count==0 reverts the node to a normal draw.
+    /// count*16 column-major f32 matrix values. count==0 keeps an empty instance batch.
     /// Stored CPU-side here; uploaded to the GPU during the next render.
     // ptr is a nullable C pointer: C# passes null when count == 0 (clearing instancing for a node,
     // e.g. an empty LOD bucket). Coercing a null [*c] to a non-null [*] would panic, so accept [*c]

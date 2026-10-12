@@ -327,7 +327,7 @@ pub const Surface = extern struct {
             @intCast(top_height),
             @intCast(bottom_height),
             if (scale_amount) |val| val else 0,
-            @bitCast(@intFromEnum(scale_mode)),
+            @bitCast(@backingInt(scale_mode)),
             dest.value,
             if (area_to_copy_to != null) &area_to_copy_to_sdl else null,
         );
@@ -362,7 +362,7 @@ pub const Surface = extern struct {
             if (area_to_copy_from != null) &area_to_copy_from_sdl else null,
             dest.value,
             if (area_to_copy_to != null) &area_to_copy_to_sdl else null,
-            @bitCast(@intFromEnum(scale_mode)),
+            @bitCast(@backingInt(scale_mode)),
         );
         return errors.wrapCallBool(ret);
     }
@@ -430,7 +430,7 @@ pub const Surface = extern struct {
             self.value,
             if (area_to_copy_from != null) &area_to_copy_from_sdl else null,
             scale_amount,
-            @bitCast(@intFromEnum(scale_mode)),
+            @bitCast(@backingInt(scale_mode)),
             dest.value,
             if (area_to_copy_to != null) &area_to_copy_to_sdl else null,
         );
@@ -500,7 +500,7 @@ pub const Surface = extern struct {
             if (area_to_copy_from != null) &area_to_copy_from_sdl else null,
             dest.value,
             if (area_to_copy_to != null) &area_to_copy_to_sdl else null,
-            @bitCast(@intFromEnum(scale_mode)),
+            @bitCast(@backingInt(scale_mode)),
         );
         return errors.wrapCallBool(ret);
     }
@@ -564,7 +564,7 @@ pub const Surface = extern struct {
     ) !Surface {
         const ret = c.SDL_ConvertSurface(
             self.value,
-            @intFromEnum(format),
+            @backingInt(format),
         );
         return Surface{ .value = try errors.wrapCallNull(*c.SDL_Surface, ret) };
     }
@@ -601,9 +601,9 @@ pub const Surface = extern struct {
     ) !Surface {
         const ret = c.SDL_ConvertSurfaceAndColorspace(
             self.value,
-            @intFromEnum(format),
+            @backingInt(format),
             if (palette) |palette_val| palette_val.value else null,
-            @intFromEnum(colorspace),
+            @backingInt(colorspace),
             if (color_properties) |val| val.value else 0,
         );
         return Surface{ .value = try errors.wrapCallNull(*c.SDL_Surface, ret) };
@@ -1239,7 +1239,7 @@ pub const Surface = extern struct {
         const ret = c.SDL_CreateSurface(
             @intCast(width),
             @intCast(height),
-            @intFromEnum(format),
+            @backingInt(format),
         );
         return Surface{ .value = try errors.wrapCallNull(*c.SDL_Surface, ret) };
     }
@@ -1277,7 +1277,7 @@ pub const Surface = extern struct {
         const ret = c.SDL_CreateSurfaceFrom(
             @intCast(width),
             @intCast(height),
-            @intFromEnum(format),
+            @backingInt(format),
             if (pixel_data) |val| @constCast(val.ptr) else null,
             if (pixel_data) |val| @intCast(val.len / height) else 0,
         );
@@ -1877,7 +1877,7 @@ pub const Surface = extern struct {
             self.value,
             @intCast(width),
             @intCast(height),
-            @bitCast(@intFromEnum(scale_mode)),
+            @bitCast(@backingInt(scale_mode)),
         );
         return Surface{ .value = try errors.wrapCallNull(*c.SDL_Surface, ret) };
     }
@@ -2045,7 +2045,7 @@ pub const Surface = extern struct {
     ) !void {
         const ret = c.SDL_SetSurfaceColorspace(
             self.value,
-            @intFromEnum(colorspace),
+            @backingInt(colorspace),
         );
         return errors.wrapCallBool(ret);
     }
@@ -2150,7 +2150,7 @@ pub const Surface = extern struct {
             &area_to_copy_from_sdl,
             dst.value,
             &area_to_copy_to_sdl,
-            @bitCast(@intFromEnum(scale_mode)),
+            @bitCast(@backingInt(scale_mode)),
         ));
     }
 
@@ -2271,10 +2271,10 @@ pub fn convertPixels(
     const ret = c.SDL_ConvertPixels(
         @intCast(width),
         @intCast(height),
-        @intFromEnum(src_format),
+        @backingInt(src_format),
         src.ptr,
         @intCast(src.len / height),
-        @intFromEnum(dst_format),
+        @backingInt(dst_format),
         dst.ptr,
         @intCast(dst.len / height),
     );
@@ -2316,13 +2316,13 @@ pub fn convertPixelsAndColorspace(
     const ret = c.SDL_ConvertPixelsAndColorspace(
         @intCast(width),
         @intCast(height),
-        @intFromEnum(src_format),
-        @intFromEnum(src_colorspace),
+        @backingInt(src_format),
+        @backingInt(src_colorspace),
         if (src_properties) |val| val.value else 0,
         src.ptr,
         @intCast(src.len / height),
-        @intFromEnum(dst_format),
-        @intFromEnum(dst_colorspace),
+        @backingInt(dst_format),
+        @backingInt(dst_colorspace),
         if (dst_properties) |val| val.value else 0,
         dst.ptr,
         @intCast(dst.len / height),
@@ -2362,10 +2362,10 @@ pub fn premultiplyAlpha(
     const ret = c.SDL_PremultiplyAlpha(
         @intCast(width),
         @intCast(height),
-        @intFromEnum(src_format),
+        @backingInt(src_format),
         src.ptr,
         @intCast(src.len / height),
-        @intFromEnum(dst_format),
+        @backingInt(dst_format),
         dst.ptr,
         @intCast(dst.len / height),
         linear,

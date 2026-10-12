@@ -39,7 +39,6 @@ const zaudio = @import("zaudio");
 /// `onDecoderRead` — is a memmove of up to `max_encoded`. A pure spin would burn that whole
 /// memmove out of the frame budget; yielding hands the core to the thread actually holding the
 /// lock, which is the one that can end the wait.
-
 /// How long a waiter naps before looking again. Irrelevant next to network latency, and it keeps
 /// an idle decode thread off the CPU.
 const poll_ms: u64 = 5;
@@ -118,7 +117,7 @@ pub const NetStream = struct {
     write_frames: std.atomic.Value(u64) = .init(0),
     read_frames: std.atomic.Value(u64) = .init(0),
 
-    state: std.atomic.Value(u32) = .init(@intFromEnum(State.connecting)),
+    state: std.atomic.Value(u32) = .init(@backingInt(State.connecting)),
     /// Frames handed to the mixer, silence included — the cursor a player displays.
     delivered: std.atomic.Value(u64) = .init(0),
 
@@ -216,7 +215,7 @@ pub fn finish(self: *NetStream) void {
 }
 
 pub fn state(self: *NetStream) State {
-    return @enumFromInt(self.state.load(.acquire));
+    return @fromBackingInt(@intCast(self.state.load(.acquire)));
 }
 
 /// Decoded audio held ahead of the mixer. What a "Buffering…" indicator shows, and what tells a
@@ -230,7 +229,7 @@ pub fn bufferedSeconds(self: *NetStream) f32 {
 // ── decode thread ───────────────────────────────────────────────────────────────
 
 fn setState(self: *NetStream, value: State) void {
-    self.state.store(@intFromEnum(value), .release);
+    self.state.store(@backingInt(value), .release);
 }
 
 fn decodeLoop(self: *NetStream) void {
@@ -447,7 +446,7 @@ fn onRead(
     const available = w -| r;
 
     if (available == 0) {
-        const current: State = @enumFromInt(self.state.load(.acquire));
+        const current: State = @fromBackingInt(@intCast(self.state.load(.acquire)));
         if (current == .ended or current == .failed) {
             frames_read.* = 0;
             return .at_end;
@@ -603,7 +602,7 @@ test "a discard read consumes frames without an output buffer" {
 
     // Straight into the ring, so the test needs no decoder and no real container.
     const frames: u64 = 256;
-    writeRing(self, &[_]f32{0.5} ** @intCast(frames * channels));
+    writeRing(self, &@as([frames * channels]f32, @splat(0.5)));
 
     var read: u64 = 0;
     try std.testing.expectEqual(zaudio.Result.success, onRead(ds, null, frames, &read));

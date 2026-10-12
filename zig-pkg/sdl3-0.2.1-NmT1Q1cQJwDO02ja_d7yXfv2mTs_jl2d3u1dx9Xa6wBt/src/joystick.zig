@@ -163,14 +163,14 @@ pub const ConnectionState = enum(c.SDL_JoystickConnectionState) {
         }
         if (value == c.SDL_JOYSTICK_CONNECTION_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: errors.Error!?ConnectionState) c.SDL_JoystickConnectionState {
         if (self) |val| {
             if (val) |num| {
-                return @intFromEnum(num);
+                return @backingInt(num);
             }
             return c.SDL_JOYSTICK_CONNECTION_UNKNOWN;
         } else |_| return c.SDL_JOYSTICK_CONNECTION_INVALID;
@@ -704,7 +704,7 @@ pub const Joystick = struct {
             self.value,
             @intCast(hat_index),
         );
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Get the instance ID of an opened joystick.
@@ -896,7 +896,7 @@ pub const Joystick = struct {
             self.value,
             &percent,
         );
-        return .{ @enumFromInt(try errors.wrapCall(c_int, ret, c.SDL_POWERSTATE_ERROR)), if (percent == -1) null else @intCast(percent) };
+        return .{ @fromBackingInt(@intCast(try errors.wrapCall(c_int, ret, c.SDL_POWERSTATE_ERROR))), if (percent == -1) null else @intCast(percent) };
     }
 
     /// Get the USB product ID of an opened joystick, if available.
@@ -1160,7 +1160,7 @@ pub const Joystick = struct {
     ) !void {
         const ret = c.SDL_SendJoystickVirtualSensorData(
             self.value,
-            @intFromEnum(sensor_type),
+            @backingInt(sensor_type),
             @intCast(sensor_timestamp_nanoseconds),
             data.ptr,
             @intCast(data.len),
@@ -1326,7 +1326,7 @@ pub const Joystick = struct {
         const ret = c.SDL_SetJoystickVirtualHat(
             self.value,
             @intCast(hat_index),
-            @intFromEnum(value),
+            @backingInt(value),
         );
         return errors.wrapCallBool(ret);
     }
@@ -1398,13 +1398,13 @@ pub const Type = enum(c.SDL_JoystickType) {
     pub fn fromSdl(value: c.SDL_JoystickType) ?Type {
         if (value == c.SDL_JOYSTICK_TYPE_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?Type) c.SDL_JoystickType {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_JOYSTICK_TYPE_UNKNOWN;
     }
 };

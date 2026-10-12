@@ -30,7 +30,7 @@ fn fileCallback(
                 user.last_folder = "[dialog error]";
             }
         }
-        showMenu(@alignCast(@ptrCast(user_data))) catch {};
+        showMenu(@ptrCast(@alignCast(user_data))) catch {};
         return;
     }
 

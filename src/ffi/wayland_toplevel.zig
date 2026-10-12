@@ -234,8 +234,8 @@ pub const Manager = struct {
     fn onParent(_: ?*anyopaque, _: *Proxy, _: ?*Proxy) callconv(.c) void {}
 
     const handle_listener = [_]?*const anyopaque{
-        @ptrCast(&onTitle),  @ptrCast(&onAppId), @ptrCast(&onOutput), @ptrCast(&onOutput),
-        @ptrCast(&onState),  @ptrCast(&onDone),  @ptrCast(&onClosed), @ptrCast(&onParent),
+        @ptrCast(&onTitle), @ptrCast(&onAppId), @ptrCast(&onOutput), @ptrCast(&onOutput),
+        @ptrCast(&onState), @ptrCast(&onDone),  @ptrCast(&onClosed), @ptrCast(&onParent),
     };
 };
 

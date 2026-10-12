@@ -11,6 +11,6 @@ pub const shape_instanced_shader_source = prelude.roundedClip(0) ++ prelude.colo
 // Samples a backdrop texture (captured before glass pass) at refracted UV offsets
 // to create the real "looking through glass" effect. Ported from the
 // reference implementation (whynotmake.it / Tim Lehmann, 2025).
-pub const liquid_glass_shader_source = @embedFile("shaders/liquid_glass_shader_source.wgsl");
+pub const liquid_glass_shader_source = prelude.corner ++ @embedFile("shaders/liquid_glass_shader_source.wgsl");
 
 pub const image_shader_source = prelude.roundedClip(1) ++ @embedFile("shaders/image_shader_source.wgsl");

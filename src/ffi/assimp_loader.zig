@@ -15,12 +15,7 @@ const Vertex = zg.resources.Vertex;
 const Mat4 = zg.Mat4;
 const Vec3 = zg.Vec3;
 
-const c = @cImport({
-    @cInclude("assimp/cimport.h");
-    @cInclude("assimp/scene.h");
-    @cInclude("assimp/postprocess.h");
-    @cInclude("assimp/material.h");
-});
+const c = @import("assimp_c");
 
 // .zmesh interchange format — lives in engine/resources/zmesh_format.zig (Assimp-free) so
 // the parser stays available in `-Denable3d=false` builds that compile this importer out.
@@ -187,8 +182,8 @@ fn searchWorldAi(node: *const c.aiNode, parent: c.aiMatrix4x4, name: []const u8)
 const Geo = struct { verts: []Vertex, idx: []u32 };
 
 const Accum = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .{ .items = &.{}, .capacity = 0 },
-    idx: std.ArrayListUnmanaged(u32) = .{ .items = &.{}, .capacity = 0 },
+    verts: std.ArrayListUnmanaged(Vertex) = .empty,
+    idx: std.ArrayListUnmanaged(u32) = .empty,
     used: bool = false,
 };
 
@@ -230,7 +225,7 @@ fn convertLocal(ctx: *Ctx, m: *const c.aiMesh) !?Geo {
         verts[i] = v;
     }
 
-    var idx: std.ArrayListUnmanaged(u32) = .{ .items = &.{}, .capacity = 0 };
+    var idx: std.ArrayListUnmanaged(u32) = .empty;
     // aiProcess_Triangulate makes every face a triangle, so this reserves the exact index count up
     // front — the append loop below never grows-and-copies. (A hint: appends still work if it's short.)
     idx.ensureTotalCapacity(ctx.arena, @as(usize, m.mNumFaces) * 3) catch {};
@@ -304,7 +299,7 @@ fn walkStatic(ctx: *Ctx, node: *const c.aiNode, parent_world: Mat4, groups: []Ac
 }
 
 fn emitMeshNodes(ctx: *Ctx, groups: []Accum, materials: []const JMaterial) ![]const JMeshNode {
-    var out: std.ArrayListUnmanaged(JMeshNode) = .{ .items = &.{}, .capacity = 0 };
+    var out: std.ArrayListUnmanaged(JMeshNode) = .empty;
     for (groups, 0..) |*g, mi| {
         if (!g.used or g.verts.items.len == 0) continue;
         const cache_path = matCachePath(ctx, mi) catch continue;
@@ -330,7 +325,7 @@ fn buildNode(ctx: *Ctx, node: *const c.aiNode) anyerror!JNode {
     var position: c.aiVector3D = undefined;
     c.aiDecomposeMatrix(&node.mTransformation, &scaling, &rotation, &position);
 
-    var meshes: std.ArrayListUnmanaged(JMeshRef) = .{ .items = &.{}, .capacity = 0 };
+    var meshes: std.ArrayListUnmanaged(JMeshRef) = .empty;
     for (0..node.mNumMeshes) |i| {
         const mi: usize = @intCast(node.mMeshes[i]);
         const m = meshAt(ctx.scene, mi);
@@ -342,7 +337,7 @@ fn buildNode(ctx: *Ctx, node: *const c.aiNode) anyerror!JNode {
         try meshes.append(ctx.arena, .{ .cache = cache_path, .material = @intCast(m.mMaterialIndex) });
     }
 
-    var children: std.ArrayListUnmanaged(JNode) = .{ .items = &.{}, .capacity = 0 };
+    var children: std.ArrayListUnmanaged(JNode) = .empty;
     for (0..node.mNumChildren) |ci| {
         try children.append(ctx.arena, try buildNode(ctx, nodeChild(node, ci)));
     }
@@ -445,7 +440,7 @@ fn buildMaterial(ctx: *Ctx, mat: *const c.aiMaterial) JMaterial {
 }
 
 fn buildMaterials(ctx: *Ctx) ![]const JMaterial {
-    var out: std.ArrayListUnmanaged(JMaterial) = .{ .items = &.{}, .capacity = 0 };
+    var out: std.ArrayListUnmanaged(JMaterial) = .empty;
     for (0..ctx.scene.mNumMaterials) |i| {
         const mat: *const c.aiMaterial = @ptrCast(ctx.scene.mMaterials[i]);
         try out.append(ctx.arena, buildMaterial(ctx, mat));
@@ -496,7 +491,7 @@ fn writeEmbedded(ctx: *Ctx, idx: usize, tex: *const c.aiTexture) ?[]const u8 {
 // ── Lights ──────────────────────────────────────────────────────────────────
 
 fn buildLights(ctx: *Ctx) ![]const JLight {
-    var out: std.ArrayListUnmanaged(JLight) = .{ .items = &.{}, .capacity = 0 };
+    var out: std.ArrayListUnmanaged(JLight) = .empty;
     var id: c.aiMatrix4x4 = undefined;
     c.aiIdentityMatrix4(&id);
 
@@ -574,12 +569,12 @@ fn quatChannel(ctx: *Ctx, node: []const u8, keys: [*c]c.aiQuatKey, count: c_uint
 }
 
 fn buildAnimations(ctx: *Ctx) ![]const JAnimation {
-    var out: std.ArrayListUnmanaged(JAnimation) = .{ .items = &.{}, .capacity = 0 };
+    var out: std.ArrayListUnmanaged(JAnimation) = .empty;
     for (0..ctx.scene.mNumAnimations) |ai| {
         const a: *const c.aiAnimation = @ptrCast(ctx.scene.mAnimations[ai]);
         const tps: f64 = if (a.mTicksPerSecond != 0) a.mTicksPerSecond else 1.0;
 
-        var channels: std.ArrayListUnmanaged(JChannel) = .{ .items = &.{}, .capacity = 0 };
+        var channels: std.ArrayListUnmanaged(JChannel) = .empty;
         for (0..a.mNumChannels) |ci| {
             const ch: *const c.aiNodeAnim = @ptrCast(a.mChannels[ci]);
             const nname = ctx.arena.dupe(u8, aiStr(&ch.mNodeName)) catch continue;
@@ -658,7 +653,7 @@ pub fn importModelJson(path_z: [*:0]const u8, cache_dir_z: [*:0]const u8) ?[*:0]
     const path = std.mem.span(path_z);
     const cache_dir = std.mem.span(cache_dir_z); // caller (C#) guarantees this directory exists
 
-    var warnings: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 };
+    var warnings: std.ArrayListUnmanaged([]const u8) = .empty;
     var ctx = Ctx{
         .arena = arena,
         .io = io,
@@ -675,7 +670,7 @@ pub fn importModelJson(path_z: [*:0]const u8, cache_dir_z: [*:0]const u8) ?[*:0]
     var nodes: []const JNode = &.{};
     var mesh_nodes: []const JMeshNode = &.{};
     if (animated) {
-        var roots: std.ArrayListUnmanaged(JNode) = .{ .items = &.{}, .capacity = 0 };
+        var roots: std.ArrayListUnmanaged(JNode) = .empty;
         const root = buildNode(&ctx, @as(*const c.aiNode, @ptrCast(scene.mRootNode))) catch return null;
         roots.append(arena, root) catch return null;
         nodes = roots.toOwnedSlice(arena) catch return null;

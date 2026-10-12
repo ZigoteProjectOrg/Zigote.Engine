@@ -80,13 +80,13 @@ pub const Mode = enum(c.SDL_BlendMode) {
     pub fn fromSdl(val: c.SDL_BlendMode) ?Mode {
         if (val == c.SDL_BLENDMODE_INVALID)
             return null;
-        return @enumFromInt(val);
+        return @fromBackingInt(@intCast(val));
     }
 
     /// Convert to SDL.
     pub fn toSdl(val: ?Mode) c.SDL_BlendMode {
         if (val) |id| {
-            return @intFromEnum(id);
+            return @backingInt(id);
         }
         return c.SDL_BLENDMODE_INVALID;
     }
@@ -160,12 +160,12 @@ pub const Mode = enum(c.SDL_BlendMode) {
         alphaOp: Operation,
     ) ?Mode {
         const ret = c.SDL_ComposeCustomBlendMode(
-            @intFromEnum(srcRgb),
-            @intFromEnum(dstRgb),
-            @intFromEnum(rgbOp),
-            @intFromEnum(srcAlpha),
-            @intFromEnum(dstAlpha),
-            @intFromEnum(alphaOp),
+            @backingInt(srcRgb),
+            @backingInt(dstRgb),
+            @backingInt(rgbOp),
+            @backingInt(srcAlpha),
+            @backingInt(dstAlpha),
+            @backingInt(alphaOp),
         );
         return fromSdl(ret);
     }

@@ -26,7 +26,7 @@ pub fn convert(allocator: std.mem.Allocator, source: *const color.PixelStorage, 
     const conversion_id = conversionId(std.meta.activeTag(source.*), destination_format);
 
     switch (conversion_id) {
-    // Indexed small -> large
+        // Indexed small -> large
         conversionId(.indexed1, .indexed2) => IndexedSmallToLarge(.indexed1, .indexed2).convert(source, &destination),
         conversionId(.indexed1, .indexed4) => IndexedSmallToLarge(.indexed1, .indexed4).convert(source, &destination),
         conversionId(.indexed1, .indexed8) => IndexedSmallToLarge(.indexed1, .indexed8).convert(source, &destination),
@@ -748,18 +748,11 @@ pub fn convert(allocator: std.mem.Allocator, source: *const color.PixelStorage, 
 }
 
 fn conversionId(source_format: PixelFormat, destination_format: PixelFormat) u64 {
-    return @as(u64, @intFromEnum(source_format)) | @as(u64, @intFromEnum(destination_format)) << 32;
+    return @as(u64, @backingInt(source_format)) | @as(u64, @backingInt(destination_format)) << 32;
 }
 
 fn getFieldNameFromPixelFormat(comptime source_format: PixelFormat) []const u8 {
-    const enum_fields = std.meta.fields(PixelFormat);
-    inline for (enum_fields) |field| {
-        if (field.value == @intFromEnum(source_format)) {
-            return field.name;
-        }
-    }
-
-    return "";
+    return @tagName(source_format);
 }
 
 // ========================
@@ -782,19 +775,19 @@ fn rgbaToRgba(comptime T: type, rgba: anytype) T {
 }
 
 fn grayscaleToGrayscale(comptime T: type, gray: anytype) T {
-    const scaleValue = color.ScaleValue(std.meta.fieldInfo(T, .value).type);
+    const scaleValue = color.ScaleValue(@FieldType(T, "value"));
     return .{ .value = scaleValue(gray.value) };
 }
 
 fn grayscaleAlphaToGrayscale(comptime T: type, gray: anytype) T {
     const toF32 = color.ScaleValue(f32);
-    const scaleValue = color.ScaleValue(std.meta.fieldInfo(T, .value).type);
+    const scaleValue = color.ScaleValue(@FieldType(T, "value"));
     return .{ .value = scaleValue(toF32(gray.value) * toF32(gray.alpha)) };
 }
 
 fn grayscaleAlphaToGrayscaleAlpha(comptime T: type, gray: anytype) T {
-    const scaleValue = color.ScaleValue(std.meta.fieldInfo(T, .value).type);
-    const scaleAlpha = color.ScaleValue(std.meta.fieldInfo(T, .alpha).type);
+    const scaleValue = color.ScaleValue(@FieldType(T, "value"));
+    const scaleAlpha = color.ScaleValue(@FieldType(T, "alpha"));
     return .{
         .value = scaleValue(gray.value),
         .alpha = scaleAlpha(gray.alpha),
@@ -1101,7 +1094,7 @@ fn RgbColorToGrayscale(comptime source_format: PixelFormat, comptime destination
             var destination_pixels = @field(destination, getFieldNameFromPixelFormat(destination_format));
             const DestinationType = @TypeOf(destination_pixels[0]);
 
-            const scaleValue = color.ScaleValue(std.meta.fieldInfo(DestinationType, .value).type);
+            const scaleValue = color.ScaleValue(@FieldType(DestinationType, "value"));
 
             for (0..source_rgb.len) |index| {
                 const source_float4 = source_rgb[index].to.float4();
@@ -1125,8 +1118,8 @@ fn RgbColorToGrayscaleAlpha(comptime source_format: PixelFormat, comptime destin
             var destination_pixels = @field(destination, getFieldNameFromPixelFormat(destination_format));
             const DestinationType = @TypeOf(destination_pixels[0]);
 
-            const scaleValue = color.ScaleValue(std.meta.fieldInfo(DestinationType, .value).type);
-            const scaleAlpha = color.ScaleValue(std.meta.fieldInfo(DestinationType, .alpha).type);
+            const scaleValue = color.ScaleValue(@FieldType(DestinationType, "value"));
+            const scaleAlpha = color.ScaleValue(@FieldType(DestinationType, "alpha"));
 
             for (0..source_rgb.len) |index| {
                 const source_float4 = source_rgb[index].to.float4();
@@ -1482,7 +1475,7 @@ fn colorf32ToGrayscale(comptime destination_format: PixelFormat, source: *const 
     var destination_pixels = @field(destination, getFieldNameFromPixelFormat(destination_format));
     const DestinationType = @TypeOf(destination_pixels[0]);
 
-    const scaleValue = color.ScaleValue(std.meta.fieldInfo(DestinationType, .value).type);
+    const scaleValue = color.ScaleValue(@FieldType(DestinationType, "value"));
 
     for (0..source_pixels.len) |index| {
         const source_float4 = source_pixels[index].to.float4();
@@ -1503,8 +1496,8 @@ fn colorf32ToGrayscaleAlpha(comptime destination_format: PixelFormat, source: *c
     var destination_pixels = @field(destination, getFieldNameFromPixelFormat(destination_format));
     const DestinationType = @TypeOf(destination_pixels[0]);
 
-    const scaleValue = color.ScaleValue(std.meta.fieldInfo(DestinationType, .value).type);
-    const scaleAlpha = color.ScaleValue(std.meta.fieldInfo(DestinationType, .alpha).type);
+    const scaleValue = color.ScaleValue(@FieldType(DestinationType, "value"));
+    const scaleAlpha = color.ScaleValue(@FieldType(DestinationType, "alpha"));
 
     for (0..source_pixels.len) |index| {
         const source_float4 = source_pixels[index].to.float4();

@@ -5,7 +5,7 @@ comptime {
     _ = sdl3.main_callbacks;
 }
 
-const gpu_debug = @import("builtin").mode == .Debug;
+const gpu_debug = @import("builtin").mode == .debug;
 
 // Disable main hack.
 pub const _start = void;

@@ -90,7 +90,7 @@ pub const Id = packed struct {
         );
         if (ret == c.SDL_CAMERA_POSITION_UNKNOWN)
             return null;
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Get the list of native formats/sizes a camera supports.
@@ -295,7 +295,7 @@ pub const Camera = extern struct {
         const ret = c.SDL_GetCameraPermissionState(
             self.value,
         );
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Get the properties associated with an opened camera.
@@ -423,8 +423,8 @@ pub const Specification = struct {
     /// Convert from an SDL value.
     pub fn fromSdl(data: c.SDL_CameraSpec) Specification {
         return .{
-            .format = if (data.format == c.SDL_PIXELFORMAT_UNKNOWN) null else @enumFromInt(data.format),
-            .colorspace = if (data.colorspace == c.SDL_COLORSPACE_UNKNOWN) null else @enumFromInt(data.colorspace),
+            .format = if (data.format == c.SDL_PIXELFORMAT_UNKNOWN) null else @fromBackingInt(@intCast(data.format)),
+            .colorspace = if (data.colorspace == c.SDL_COLORSPACE_UNKNOWN) null else @fromBackingInt(@intCast(data.colorspace)),
             .width = @intCast(data.width),
             .height = @intCast(data.height),
             .framerate_numerator = @intCast(data.framerate_numerator),
@@ -435,8 +435,8 @@ pub const Specification = struct {
     /// Convert to an SDL value.
     pub fn toSdl(self: Specification) c.SDL_CameraSpec {
         return .{
-            .format = if (self.format) |val| @intFromEnum(val) else c.SDL_PIXELFORMAT_UNKNOWN,
-            .colorspace = if (self.colorspace) |val| @intFromEnum(val) else c.SDL_COLORSPACE_UNKNOWN,
+            .format = if (self.format) |val| @backingInt(val) else c.SDL_PIXELFORMAT_UNKNOWN,
+            .colorspace = if (self.colorspace) |val| @backingInt(val) else c.SDL_COLORSPACE_UNKNOWN,
             .width = @intCast(self.width),
             .height = @intCast(self.height),
             .framerate_numerator = @intCast(self.framerate_numerator),

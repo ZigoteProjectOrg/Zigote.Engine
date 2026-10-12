@@ -10,7 +10,7 @@ pub const flecs_version = std.SemanticVersion{
 };
 
 const flecs_is_sanitize = build_options.debug_mode == .sanitize or
-    (build_options.debug_mode == .depends_on_build and builtin.mode == .Debug);
+    (build_options.debug_mode == .depends_on_build and builtin.mode == .debug);
 const flecs_is_debug = flecs_is_sanitize or build_options.debug_mode == .debug;
 const os_alloc = build_options.use_os_alloc;
 
@@ -692,7 +692,7 @@ pub const query_t = extern struct {
 };
 
 pub fn array(comptime T: type, comptime len: comptime_int) [len]T {
-    return [_]T{.{}} ** len;
+    return @splat(.{});
 }
 
 pub const observer_t = extern struct {
@@ -1111,7 +1111,7 @@ pub const iter_t = extern struct {
 pub const query_desc_t = extern struct {
     _canary: i32 = 0,
 
-    terms: [FLECS_TERM_COUNT_MAX]term_t = [_]term_t{.{}} ** FLECS_TERM_COUNT_MAX,
+    terms: [FLECS_TERM_COUNT_MAX]term_t = @splat(.{}),
     expr: ?[*:0]const u8 = null,
 
     cache_kind: query_cache_kind_t = .QueryCacheDefault,
@@ -1142,7 +1142,7 @@ pub const observer_desc_t = extern struct {
 
     query: query_desc_t = .{},
 
-    events: [FLECS_EVENT_DESC_MAX]entity_t = [_]entity_t{0} ** FLECS_EVENT_DESC_MAX,
+    events: [FLECS_EVENT_DESC_MAX]entity_t = @splat(0),
 
     yield_existing: bool = false,
     global_observer: bool = false,
@@ -2769,7 +2769,7 @@ pub const log_enable_timedelta = ecs_log_enable_timedelta;
 extern fn ecs_log_enable_timedelta(enabled: bool) bool;
 
 pub fn log_last_error() LogErrorCode {
-    return @enumFromInt(ecs_log_last_error());
+    return @fromBackingInt(@intCast(ecs_log_last_error()));
 }
 
 extern fn ecs_log_last_error() c_int;
@@ -3059,7 +3059,7 @@ pub fn new_entity(world: *world_t, name: [*:0]const u8) entity_t {
 pub fn new_prefab(world: *world_t, name: [*:0]const u8) entity_t {
     return entity_init(world, &.{
         .name = name,
-        .add = @ptrCast(&[_]id_t{EcsPrefab} ++ [_]id_t{0} ** (FLECS_ID_DESC_MAX - 1)),
+        .add = @ptrCast(&([_]id_t{EcsPrefab} ++ @as([FLECS_ID_DESC_MAX - 1]id_t, @splat(0)))),
     });
 }
 

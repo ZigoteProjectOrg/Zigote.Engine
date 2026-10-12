@@ -44,7 +44,7 @@ pub fn debugPrint(
     if (category_str) |val| {
         std.debug.print("[{s}:{s}] {s}\n", .{ val, priority_str, message });
     } else {
-        std.debug.print("[Custom_{d}:{s}] {s}\n", .{ @intFromEnum(category), priority_str, message });
+        std.debug.print("[Custom_{d}:{s}] {s}\n", .{ @backingInt(category), priority_str, message });
     }
 }
 
@@ -147,10 +147,10 @@ pub fn zigLog(
     } else {
         const fmt = "[Custom_{d}:{s}] {s}";
         switch (pri) {
-            .err, .critical => logger.err(fmt, .{ @intFromEnum(category), priority_str, message }),
-            .warn => logger.warn(fmt, .{ @intFromEnum(category), priority_str, message }),
-            .info => logger.info(fmt, .{ @intFromEnum(category), priority_str, message }),
-            else => logger.debug(fmt, .{ @intFromEnum(category), priority_str, message }),
+            .err, .critical => logger.err(fmt, .{ @backingInt(category), priority_str, message }),
+            .warn => logger.warn(fmt, .{ @backingInt(category), priority_str, message }),
+            .info => logger.info(fmt, .{ @backingInt(category), priority_str, message }),
+            else => logger.debug(fmt, .{ @backingInt(category), priority_str, message }),
         }
     }
 }

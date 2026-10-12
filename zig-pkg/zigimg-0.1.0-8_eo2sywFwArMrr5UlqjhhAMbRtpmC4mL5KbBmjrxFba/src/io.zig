@@ -167,7 +167,7 @@ pub const WriteStream = union(enum) {
 // to least significant order.
 //Also regardless of endianess, the buffer always aligns bits to the low end
 // of the byte.
-pub fn BitReader(comptime endian: std.builtin.Endian) type {
+pub fn BitReader(comptime endian: std.lang.Endian) type {
     return struct {
         reader: *std.Io.Reader,
         bits: u8 = 0,
@@ -389,7 +389,7 @@ test "BitReader: api coverage" {
     try expectError(error.EndOfStream, bit_stream_le.readBitsNoEof(u1, 1));
 }
 
-pub fn BitWriter(comptime endian: std.builtin.Endian) type {
+pub fn BitWriter(comptime endian: std.lang.Endian) type {
     return struct {
         writer: *std.Io.Writer,
         bits: u8 = 0,

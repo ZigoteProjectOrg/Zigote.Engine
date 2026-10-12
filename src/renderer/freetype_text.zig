@@ -2,17 +2,11 @@ const std = @import("std");
 const wgpu = @import("wgpu");
 const zg = @import("../root.zig");
 const bidi = @import("bidi.zig");
+const prelude = @import("shader_prelude.zig");
 
-const ft = @cImport({
-    @cInclude("ft2build.h");
-    @cInclude("freetype/freetype.h");
-    @cInclude("freetype/tttables.h");
-    @cInclude("freetype/ftoutln.h");
-});
+const ft = @import("freetype_c");
 
-const hb = @cImport({
-    @cInclude("hb.h");
-});
+const hb = @import("harfbuzz_c");
 
 extern fn hb_ft_font_create_referenced(ft_face: ft.FT_Face) ?*hb.hb_font_t;
 extern fn hb_ft_font_set_funcs(font: ?*hb.hb_font_t) void;
@@ -2754,7 +2748,7 @@ fn clusterEndsAt(glyphs: []const ShapedGlyph, i: usize) bool {
 /// The FaceStyle a paint command carries (paint.Text stores weight/style as enums).
 fn styleOf(text: zg.paint.Text) FaceStyle {
     return .{
-        .weight = @intFromEnum(text.font_weight),
+        .weight = @backingInt(text.font_weight),
         .italic = text.font_style == .italic,
     };
 }
@@ -2857,27 +2851,12 @@ fn colorToU8(color: zg.Color) [4]u8 {
     return .{ color.r, color.g, color.b, color.a };
 }
 
-pub const text_shader_source =
+// `srgb_decode` and the rounded clip come from the shared prelude, the same fragments the shape
+// and image shaders use — the text shader used to carry its own copies and missed the colour
+// decode when shapes gained it.
+pub const text_shader_source = prelude.color ++ prelude.roundedClip(1) ++
     \\@group(0) @binding(0) var text_tex: texture_2d<f32>;
     \\@group(0) @binding(1) var text_sampler: sampler;
-    \\
-    \\// Per-batch rounded clip — see shape_shader_source.wgsl. Slot 0 (all zeros) = disabled, so
-    \\// unclipped text multiplies coverage by exactly 1.0 and stays byte-identical.
-    \\struct RoundedClip {
-    \\  rect: vec4<f32>,
-    \\  radius: vec4<f32>,
-    \\};
-    \\
-    \\@group(1) @binding(0) var<uniform> rounded_clip: RoundedClip;
-    \\
-    \\fn rounded_clip_coverage(frag_pos: vec2<f32>) -> f32 {
-    \\  if (rounded_clip.radius.x <= 0.0) {
-    \\    return 1.0;
-    \\  }
-    \\  let q = abs(frag_pos - rounded_clip.rect.xy) - rounded_clip.rect.zw + vec2<f32>(rounded_clip.radius.x);
-    \\  let dist = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - rounded_clip.radius.x;
-    \\  return clamp(0.5 - dist, 0.0, 1.0);
-    \\}
     \\
     \\struct VertexOut {
     \\  @builtin(position) position: vec4<f32>,
@@ -2900,18 +2879,23 @@ pub const text_shader_source =
     \\
     \\@fragment
     \\fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    \\  // Coverage gamma: the swapchain is sRGB, so straight alpha blending happens in non-linear
-    \\  // space, and the error is asymmetric — light-on-dark text loses its antialiased edges and
-    \\  // reads thin and washy, while dark-on-light text gains ink and reads smudged. One fixed
-    \\  // exponent can't serve both themes, so it follows the text's own luminance: bright glyphs
-    \\  // boost coverage (~1/1.2), dark glyphs thin it slightly (~1.08), mid-tones blend. pow
-    \\  // leaves 0 and 1 fixed either way, so solid pixels never fatten and holes never fill.
-    \\  // Quad origins are pixel-snapped at emit, so the linear filter only ever smooths genuine
-    \\  // sub-glyph detail, not placement error.
+    \\  // The swapchain is *_srgb: it encodes on write and blends in LINEAR space. Two consequences:
+    \\  //  1. Colours arrive sRGB-encoded (theme values) and must be decoded, exactly like shapes,
+    \\  //     or they are encoded twice and wash out toward white (#525862 -> #9b9fa6).
+    \\  //  2. Linear blending is asymmetric for text. Light ink on dark gains weight; dark ink on
+    \\  //     light loses it — half-covered edges and translucent ink (the Label tokens: black at
+    \\  //     85%) come out far lighter than their alpha says (#686868 where ~#252525 was meant).
+    \\  // So alpha follows the ink's own luminance. Dark ink is remapped so the result matches a
+    \\  // gamma-space blend over a light backdrop (1 - (1-a)^2.2); bright ink keeps a mild coverage
+    \\  // boost (~1/1.2) that holds thin strokes together at 1x. Mid-tones mix the two. Both curves
+    \\  // fix 0 and 1, so solid pixels never fatten and holes never fill. Quad origins are
+    \\  // pixel-snapped at emit, so the linear filter only smooths genuine sub-glyph detail.
     \\  let lum = dot(in.color.rgb, vec3<f32>(0.299, 0.587, 0.114));
-    \\  let exponent = mix(1.08, 1.0 / 1.2, lum);
-    \\  let coverage = pow(textureSample(text_tex, text_sampler, in.uv).r, exponent);
-    \\  return vec4<f32>(in.color.rgb, in.color.a * coverage * rounded_clip_coverage(in.position.xy));
+    \\  let coverage = textureSample(text_tex, text_sampler, in.uv).r;
+    \\  let dark_ink = 1.0 - pow(1.0 - in.color.a * coverage, 2.2);
+    \\  let light_ink = in.color.a * pow(coverage, 1.0 / 1.2);
+    \\  let alpha = mix(dark_ink, light_ink, lum);
+    \\  return vec4<f32>(srgb_decode(in.color.rgb), alpha * rounded_clip_coverage(in.position.xy));
     \\}
 ;
 
@@ -3196,7 +3180,7 @@ test "routeFor keeps Latin on the primary face and sends CJK to a fallback" {
     var renderer = try FreeTypeTextRenderer.initCpu(allocator, &.{}, "primary");
     defer renderer.deinit();
 
-    const cjk_z = try allocator.dupeZ(u8, cjk);
+    const cjk_z = try allocator.dupeSentinel(u8, cjk, 0);
     defer allocator.free(cjk_z);
 
     // Relative to the build's working directory, which is this package's root.

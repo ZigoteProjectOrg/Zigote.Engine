@@ -99,7 +99,7 @@ pub fn match(self: *Self, prev_pos: u16, curr_pos: u16, min_len: u16) u16 {
         i = min_len;
     }
     while (i < max_len) : (i += 1)
-    if (prev_lh[i] != curr_lh[i]) break;
+        if (prev_lh[i] != curr_lh[i]) break;
     return if (i >= consts.match.min_length) @intCast(i) else 0;
 }
 

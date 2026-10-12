@@ -112,30 +112,30 @@ pub const Button = extern struct {
     /// This datatype is available since SDL 3.2.0.
     pub const Flags = packed struct(u32) { // Need to be packed to fit into data struct exactly.
         mark_default_with_return_key: bool = false,
-    mark_default_with_escape_key: bool = false,
-    _: u30 = 0,
+        mark_default_with_escape_key: bool = false,
+        _: u30 = 0,
 
-    // Button flag tests.
+        // Button flag tests.
         comptime {
-        std.debug.assert(@sizeOf(c.SDL_MessageBoxButtonFlags) == @sizeOf(Flags));
-        std.debug.assert(c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT == @as(c.SDL_MessageBoxButtonFlags, @bitCast(Flags{ .mark_default_with_return_key = true })));
-        std.debug.assert(c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT == @as(c.SDL_MessageBoxButtonFlags, @bitCast(Flags{ .mark_default_with_escape_key = true })));
-    }
+            std.debug.assert(@sizeOf(c.SDL_MessageBoxButtonFlags) == @sizeOf(Flags));
+            std.debug.assert(c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT == @as(c.SDL_MessageBoxButtonFlags, @bitCast(Flags{ .mark_default_with_return_key = true })));
+            std.debug.assert(c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT == @as(c.SDL_MessageBoxButtonFlags, @bitCast(Flags{ .mark_default_with_escape_key = true })));
+        }
 
-    /// Convert from an SDL value.
+        /// Convert from an SDL value.
         pub fn fromSdl(flags: c.SDL_MessageBoxButtonFlags) Flags {
-        return .{
-            .mark_default_with_return_key = (flags & c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT) != 0,
-            .mark_default_with_escape_key = (flags & c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT) != 0,
-        };
-    }
+            return .{
+                .mark_default_with_return_key = (flags & c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT) != 0,
+                .mark_default_with_escape_key = (flags & c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT) != 0,
+            };
+        }
 
-    /// Convert to an SDL value.
+        /// Convert to an SDL value.
         pub fn toSdl(self: Flags) c.SDL_MessageBoxButtonFlags {
-        return (if (self.mark_default_with_return_key) @as(c.SDL_MessageBoxButtonFlags, c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT) else 0) |
-            (if (self.mark_default_with_escape_key) @as(c.SDL_MessageBoxButtonFlags, c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT) else 0) |
-            0;
-    }
+            return (if (self.mark_default_with_return_key) @as(c.SDL_MessageBoxButtonFlags, c.SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT) else 0) |
+                (if (self.mark_default_with_escape_key) @as(c.SDL_MessageBoxButtonFlags, c.SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT) else 0) |
+                0;
+        }
     };
 
     /// Convert from an SDL value.

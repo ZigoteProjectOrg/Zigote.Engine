@@ -158,7 +158,7 @@ pub const Renderer = struct {
             if (self.render_surface) |val|
                 try ret.set(c.SDL_PROP_RENDERER_CREATE_SURFACE_POINTER, .{ .pointer = if (val.value) |val2| val2.value else null });
             if (self.output_colorspace) |val|
-                try ret.set(c.SDL_PROP_RENDERER_CREATE_OUTPUT_COLORSPACE_NUMBER, .{ .number = @intFromEnum(val) });
+                try ret.set(c.SDL_PROP_RENDERER_CREATE_OUTPUT_COLORSPACE_NUMBER, .{ .number = @backingInt(val) });
             if (self.present_vsync) |val|
                 try ret.set(c.SDL_PROP_RENDERER_CREATE_PRESENT_VSYNC_NUMBER, .{ .number = @intCast(video.VSync.toSdl(val.value)) });
             // GPU properties exist in later SDL version.
@@ -427,7 +427,7 @@ pub const Renderer = struct {
         return .{ .value = try errors.wrapCallNull(*c.SDL_Texture, c.SDL_CreateTexture(
             self.value,
             pixels.Format.toSdl(format),
-            @intFromEnum(access),
+            @backingInt(access),
             @intCast(width),
             @intCast(height),
         )) };
@@ -689,7 +689,7 @@ pub const Renderer = struct {
     ) !surface.ScaleMode {
         var ret: c.SDL_ScaleMode = undefined;
         try errors.wrapCallBool(c.SDL_GetDefaultTextureScaleMode(self.value, &ret));
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Get the blend mode used for drawing operations.
@@ -1551,8 +1551,9 @@ pub const Renderer = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) !void {
-        var fallback = std.heap.stackFallback(options.renderer_debug_text_stack_size, sdl3.allocator);
-        const allocator = fallback.get();
+        var fallback_buf: [options.renderer_debug_text_stack_size]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buf, sdl3.allocator);
+        const allocator = fallback.allocator();
         const msg = try std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
         defer allocator.free(msg);
         const ret = c.SDL_RenderDebugText(
@@ -2162,7 +2163,7 @@ pub const Renderer = struct {
         self: Renderer,
         scale_mode: surface.ScaleMode,
     ) !void {
-        return errors.wrapCallBool(c.SDL_SetDefaultTextureScaleMode(self.value, @intFromEnum(scale_mode)));
+        return errors.wrapCallBool(c.SDL_SetDefaultTextureScaleMode(self.value, @backingInt(scale_mode)));
     }
 
     /// Set the blend mode used for drawing operations (Fill and Line).
@@ -2316,7 +2317,7 @@ pub const Renderer = struct {
             self.value,
             @intCast(width),
             @intCast(height),
-            if (presentation_mode) |val| @intFromEnum(val) else c.SDL_LOGICAL_PRESENTATION_DISABLED,
+            if (presentation_mode) |val| @backingInt(val) else c.SDL_LOGICAL_PRESENTATION_DISABLED,
         );
         return errors.wrapCallBool(ret);
     }
@@ -2504,13 +2505,13 @@ pub const LogicalPresentation = enum(c.SDL_RendererLogicalPresentation) {
     pub fn fromSdl(value: c.SDL_RendererLogicalPresentation) ?LogicalPresentation {
         if (value == c.SDL_LOGICAL_PRESENTATION_DISABLED)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?LogicalPresentation) c.SDL_RendererLogicalPresentation {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_LOGICAL_PRESENTATION_DISABLED;
     }
 };
@@ -2563,14 +2564,14 @@ pub const Texture = struct {
                 errors.callErrorCallback();
                 return error.SdlError;
             }
-            return @enumFromInt(value);
+            return @fromBackingInt(@intCast(value));
         }
 
         /// Convert to SDL.
         pub fn toSdl(
             self: AddressMode,
         ) c.SDL_TextureAddressMode {
-            return @intFromEnum(self);
+            return @backingInt(self);
         }
     };
 
@@ -2649,11 +2650,11 @@ pub const Texture = struct {
         ) !properties.Group {
             const ret = try properties.Group.init();
             if (self.colorspace) |val|
-                try ret.set(c.SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, .{ .number = @intFromEnum(val) });
+                try ret.set(c.SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, .{ .number = @backingInt(val) });
             if (self.format) |val|
                 try ret.set(c.SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, .{ .number = pixels.Format.toSdl(val.value) });
             if (self.access) |val|
-                try ret.set(c.SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, .{ .number = @intFromEnum(val) });
+                try ret.set(c.SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, .{ .number = @backingInt(val) });
             if (self.width) |val|
                 try ret.set(c.SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, .{ .number = @intCast(val) });
             if (self.height) |val|
@@ -2784,9 +2785,9 @@ pub const Texture = struct {
             props: properties.Group,
         ) Properties {
             return .{
-                .colorspace = if (props.get(c.SDL_PROP_TEXTURE_COLORSPACE_NUMBER)) |val| @enumFromInt(val.number) else null,
+                .colorspace = if (props.get(c.SDL_PROP_TEXTURE_COLORSPACE_NUMBER)) |val| @fromBackingInt(@intCast(val.number)) else null,
                 .format = if (props.get(c.SDL_PROP_TEXTURE_FORMAT_NUMBER)) |val| .{ .value = pixels.Format.fromSdl(@intCast(val.number)) } else null,
-                .access = if (props.get(c.SDL_PROP_TEXTURE_ACCESS_NUMBER)) |val| @enumFromInt(val.number) else null,
+                .access = if (props.get(c.SDL_PROP_TEXTURE_ACCESS_NUMBER)) |val| @fromBackingInt(@intCast(val.number)) else null,
                 .width = if (props.get(c.SDL_PROP_TEXTURE_WIDTH_NUMBER)) |val| @intCast(val.number) else null,
                 .height = if (props.get(c.SDL_PROP_TEXTURE_HEIGHT_NUMBER)) |val| @intCast(val.number) else null,
                 .sdr_white_point = if (props.get(c.SDL_PROP_TEXTURE_SDR_WHITE_POINT_FLOAT)) |val| val.float else null,
@@ -3093,7 +3094,7 @@ pub const Texture = struct {
             &mode,
         );
         try errors.wrapCallBool(ret);
-        return @enumFromInt(mode);
+        return @fromBackingInt(@intCast(mode));
     }
 
     /// Get the size of a texture, as floating point values.
@@ -3431,7 +3432,7 @@ pub const Texture = struct {
     ) !void {
         const ret = c.SDL_SetTextureScaleMode(
             self.value,
-            @intCast(@intFromEnum(mode)),
+            @intCast(@backingInt(mode)),
         );
         return errors.wrapCallBool(ret);
     }

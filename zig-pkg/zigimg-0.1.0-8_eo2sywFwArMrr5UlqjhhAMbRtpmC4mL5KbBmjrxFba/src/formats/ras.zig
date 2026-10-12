@@ -105,7 +105,7 @@ pub const RAS = struct {
 
     pub fn uncompressBitmap(self: *RAS, reader: *std.Io.Reader, buffer: []u8) Image.ReadError!void {
         switch (self.header.type) {
-        // no compression for these types
+            // no compression for these types
             .old, .standard, .rgb => _ = try reader.readSliceAll(buffer[0..]),
             // rle encoding with x80 trigger byte
             .byte_encoded => {

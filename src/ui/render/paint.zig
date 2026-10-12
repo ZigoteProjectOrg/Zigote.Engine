@@ -28,6 +28,8 @@ pub const Command = union(enum) {
 pub const Clip = struct {
     rect: geometry.Rect,
     radius: f32 = 0,
+    /// Squircle corners instead of circular ones (only meaningful with a positive radius).
+    squircle: bool = false,
 };
 
 /// A 2-D affine transform pushed onto the paint transform stack:
@@ -77,7 +79,7 @@ pub const GlyphRun = struct {
 pub const ShaderEffect = struct {
     bounds: geometry.Rect,
     shader_id: u32,
-    params: [8]f32 = [_]f32{0} ** 8,
+    params: [8]f32 = @splat(0),
     /// Optional app-owned texture handle bound at @group(1) — a LUT, a mask, a gradient ramp.
     /// The pixels ride along (resolved from the image registry, exactly like Image) so the GPU
     /// cache entry can be created on first use even though the texture is never drawn as an image.
@@ -111,6 +113,8 @@ pub const Shadow = struct {
     radius: f32 = 0,
     blur_radius: f32 = 0,
     spread: f32 = 0,
+    /// Squircle corners instead of circular ones.
+    squircle: bool = false,
 };
 
 /// A cubic Bézier stroke: control points (x0,y0)→(x1,y1)→(x2,y2)→(x3,y3) and a stroke width.
@@ -138,6 +142,8 @@ pub const Rect = struct {
     bounds: geometry.Rect,
     color: geometry.Color,
     radius: f32 = 0,
+    /// Squircle corners instead of circular ones.
+    squircle: bool = false,
 };
 
 pub const Border = struct {
@@ -145,6 +151,8 @@ pub const Border = struct {
     color: geometry.Color,
     radius: f32 = 0,
     width: f32 = 1,
+    /// Squircle corners instead of circular ones.
+    squircle: bool = false,
 };
 
 pub const Text = struct {
@@ -180,6 +188,9 @@ pub const Image = struct {
     /// matching wgpu format and the sampler resolves the order, so nothing downstream changes.
     bgra: bool = false,
     cache_key: ?u64 = null,
+    /// Multiplied into every texel. White draws the picture as it is; its alpha is how a fading
+    /// parent takes its pictures with it.
+    tint: geometry.Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
     u0: f32 = 0.0,
     v0: f32 = 0.0,
     u1: f32 = 1.0,

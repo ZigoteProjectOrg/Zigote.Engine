@@ -49,13 +49,13 @@ pub const ProgressState = enum(c.SDL_ProgressState) {
         }
         if (value == c.SDL_PROGRESS_STATE_NONE)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?ProgressState) c.SDL_ProgressState {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_PROGRESS_STATE_NONE;
     }
 };
@@ -74,13 +74,13 @@ pub const SystemTheme = enum(c.SDL_SystemTheme) {
     pub fn fromSdl(value: c.SDL_SystemTheme) ?SystemTheme {
         if (value == c.SDL_SYSTEM_THEME_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?SystemTheme) c.SDL_SystemTheme {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_SYSTEM_THEME_UNKNOWN;
     }
 };
@@ -192,7 +192,7 @@ pub const Display = packed struct {
         /// Convert to an SDL value.
         pub fn toSdl(self: ?Orientation) c.SDL_DisplayOrientation {
             const val = self orelse return c.SDL_ORIENTATION_UNKNOWN;
-            return @intFromEnum(val);
+            return @backingInt(val);
         }
     };
 
@@ -1008,7 +1008,7 @@ pub const gl = struct {
         attr: gl.Attribute,
     ) !u32 {
         var value: c_int = undefined;
-        const ret = c.SDL_GL_GetAttribute(@intFromEnum(attr), &value);
+        const ret = c.SDL_GL_GetAttribute(@backingInt(attr), &value);
         try errors.wrapCallBool(ret);
         return @intCast(value);
     }
@@ -1095,7 +1095,7 @@ pub const gl = struct {
         var interval: c_int = undefined;
         const ret = c.SDL_GL_GetSwapInterval(&interval);
         try errors.wrapCallBool(ret);
-        return @enumFromInt(interval);
+        return @fromBackingInt(@intCast(interval));
     }
 
     /// Dynamically load an OpenGL library.
@@ -1151,7 +1151,7 @@ pub const gl = struct {
         attr: gl.Attribute,
         value: u32,
     ) !void {
-        const ret = c.SDL_GL_SetAttribute(@intFromEnum(attr), @intCast(value));
+        const ret = c.SDL_GL_SetAttribute(@backingInt(attr), @intCast(value));
         try errors.wrapCallBool(ret);
     }
 
@@ -1174,7 +1174,7 @@ pub const gl = struct {
     pub fn setSwapInterval(
         interval: SwapInterval,
     ) !void {
-        const ret = c.SDL_GL_SetSwapInterval(@intFromEnum(interval));
+        const ret = c.SDL_GL_SetSwapInterval(@backingInt(interval));
         try errors.wrapCallBool(ret);
     }
 
@@ -1257,12 +1257,12 @@ pub const FlashOperation = enum(c.SDL_FlashOperation) {
 
     /// Convert from SDL.
     pub fn fromSdl(val: c.SDL_FlashOperation) FlashOperation {
-        return @enumFromInt(val);
+        return @fromBackingInt(@intCast(val));
     }
 
     /// Convert to SDL.
     pub fn toSdl(self: FlashOperation) c.SDL_FlashOperation {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -2459,7 +2459,7 @@ pub const Window = extern struct {
         self: Window,
     ) !pixels.Format {
         const ret = c.SDL_GetWindowPixelFormat(self.value);
-        return @enumFromInt(try errors.wrapCall(c_uint, ret, 0));
+        return @fromBackingInt(@intCast(try errors.wrapCall(c_uint, ret, 0)));
     }
 
     /// Get the position of a window.
@@ -3054,7 +3054,7 @@ pub const Window = extern struct {
     ) !void {
         const Cb = struct {
             pub fn run(win_c: ?*c.SDL_Window, area_c: [*c]const c.SDL_Point, user_data_c: ?*anyopaque) callconv(.c) c.SDL_HitTestResult {
-                return @intFromEnum(callback.?(.{ .value = win_c.? }, rect.IPoint.fromSdl(area_c.*), @ptrCast(@alignCast(user_data_c))));
+                return @backingInt(callback.?(.{ .value = win_c.? }, rect.IPoint.fromSdl(area_c.*), @ptrCast(@alignCast(user_data_c))));
             }
         };
         return errors.wrapCallBool(c.SDL_SetWindowHitTest(self.value, if (callback != null) Cb.run else null, @ptrCast(user_data)));

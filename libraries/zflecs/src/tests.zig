@@ -18,36 +18,31 @@ test {
 
 test "extern struct ABI compatibility" {
     @setEvalBranchQuota(50_000);
-    const flecs_c = @cImport({
-        @cDefine("FLECS_SANITIZE", if (builtin.mode == .Debug) "1" else {});
-        @cDefine("FLECS_USE_OS_ALLOC", "1");
-        @cDefine("FLECS_NO_CPP", "1");
-        @cInclude("flecs.h");
-    });
+    const flecs_c = @import("flecs_c"); // flecs.h, translated by build.zig
     inline for (comptime std.meta.declarations(@This())) |decl| {
-        const ZigType = @field(@This(), decl.name);
+        const ZigType = @field(@This(), decl);
         if (@TypeOf(ZigType) != type) {
             continue;
         }
         if (comptime std.meta.activeTag(@typeInfo(ZigType)) == .@"struct" and
             @typeInfo(ZigType).@"struct".layout == .@"extern")
         {
-            const flecs_name = if (comptime std.mem.startsWith(u8, decl.name, "Ecs")) decl.name else "ecs_" ++ decl.name;
+            const flecs_name = if (comptime std.mem.startsWith(u8, decl, "Ecs")) decl else "ecs_" ++ decl;
 
             const CType = @field(flecs_c, flecs_name);
             std.testing.expectEqual(@sizeOf(CType), @sizeOf(ZigType)) catch |err| {
-                std.log.err("@sizeOf({s}) != @sizeOf({s})", .{ flecs_name, decl.name });
+                std.log.err("@sizeOf({s}) != @sizeOf({s})", .{ flecs_name, decl });
                 return err;
             };
             comptime var i: usize = 0;
-            inline for (comptime std.meta.fieldNames(CType)) |c_field_name| {
+            inline for (comptime @typeInfo(CType).@"struct".field_names) |c_field_name| {
                 std.testing.expectEqual(
                     @offsetOf(CType, c_field_name),
-                    @offsetOf(ZigType, std.meta.fieldNames(ZigType)[i]),
+                    @offsetOf(ZigType, @typeInfo(ZigType).@"struct".field_names[i]),
                 ) catch |err| {
                     std.log.err(
                         "@offsetOf({s}, {s}) != @offsetOf({s}, {s})",
-                        .{ flecs_name, c_field_name, decl.name, std.meta.fieldNames(ZigType)[i] },
+                        .{ flecs_name, c_field_name, decl, @typeInfo(ZigType).@"struct".field_names[i] },
                     );
                     return err;
                 };

@@ -43,13 +43,13 @@ pub const ArrayOrder = enum(c.SDL_ArrayOrder) {
     pub fn fromSdl(value: c.SDL_ArrayOrder) ?ArrayOrder {
         if (value == c.SDL_ARRAYORDER_NONE)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?ArrayOrder) c.SDL_ArrayOrder {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_ARRAYORDER_NONE;
     }
 };
@@ -66,13 +66,13 @@ pub const BitmapOrder = enum(c.SDL_BitmapOrder) {
     pub fn fromSdl(value: c.SDL_BitmapOrder) ?BitmapOrder {
         if (value == c.SDL_BITMAPORDER_NONE)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?BitmapOrder) c.SDL_BitmapOrder {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_BITMAPORDER_NONE;
     }
 };
@@ -95,13 +95,13 @@ pub const ChromaLocation = enum(c.SDL_ChromaLocation) {
     pub fn fromSdl(value: c.SDL_ChromaLocation) ?ChromaLocation {
         if (value == c.SDL_CHROMA_LOCATION_NONE)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?ChromaLocation) c.SDL_ChromaLocation {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_CHROMA_LOCATION_NONE;
     }
 };
@@ -150,21 +150,21 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
     _,
 
     /// The default colorspace for RGB surfaces if no colorspace is specified.
-    pub const rgb_default: Colorspace = @enumFromInt(c.SDL_COLORSPACE_RGB_DEFAULT);
+    pub const rgb_default: Colorspace = @fromBackingInt(@intCast(c.SDL_COLORSPACE_RGB_DEFAULT));
     /// The default colorspace for YUV surfaces if no colorspace is specified.
-    pub const yuv_default: Colorspace = @enumFromInt(c.SDL_COLORSPACE_YUV_DEFAULT);
+    pub const yuv_default: Colorspace = @fromBackingInt(@intCast(c.SDL_COLORSPACE_YUV_DEFAULT));
 
     /// Convert from SDL.
     pub fn fromSdl(val: c.SDL_Colorspace) ?Colorspace {
         if (val == c.SDL_COLORSPACE_UNKNOWN)
             return null;
-        return @enumFromInt(val);
+        return @fromBackingInt(@intCast(val));
     }
 
     /// Convert to SDL.
     pub fn toSdl(self: ?Colorspace) c.SDL_Colorspace {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_COLORSPACE_UNKNOWN;
     }
 
@@ -213,10 +213,10 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
             ColorRange.toSdl(range),
             ColorPrimaries.toSdl(primaries),
             TransferCharacteristics.toSdl(transfer),
-            @intFromEnum(matrix),
+            @backingInt(matrix),
             ChromaLocation.toSdl(chroma),
         );
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Get the color space chroma.
@@ -233,7 +233,7 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) ?ChromaLocation {
         const ret = c.SDL_COLORSPACECHROMA(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ChromaLocation.fromSdl(ret);
     }
@@ -252,7 +252,7 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) ?ColorPrimaries {
         const ret = c.SDL_COLORSPACEPRIMARIES(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ColorPrimaries.fromSdl(ret);
     }
@@ -274,9 +274,9 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) MatrixCoefficients {
         const ret = c.SDL_COLORSPACEMATRIX(
-            @intFromEnum(self),
+            @backingInt(self),
         );
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Get the color space range.
@@ -296,7 +296,7 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) ?ColorRange {
         const ret = c.SDL_COLORSPACERANGE(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ColorRange.fromSdl(ret);
     }
@@ -318,7 +318,7 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) ?TransferCharacteristics {
         const ret = c.SDL_COLORSPACETRANSFER(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return TransferCharacteristics.fromSdl(ret);
     }
@@ -340,7 +340,7 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) ?ColorType {
         const ret = c.SDL_COLORSPACETYPE(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ColorType.fromSdl(ret);
     }
@@ -362,7 +362,7 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) bool {
         const ret = c.SDL_ISCOLORSPACE_MATRIX_BT2020_NCL(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ret;
     }
@@ -384,7 +384,7 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) bool {
         const ret = c.SDL_ISCOLORSPACE_MATRIX_BT601(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ret;
     }
@@ -406,7 +406,7 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) bool {
         const ret = c.SDL_ISCOLORSPACE_MATRIX_BT709(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ret;
     }
@@ -428,7 +428,7 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) bool {
         const ret = c.SDL_ISCOLORSPACE_FULL_RANGE(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ret;
     }
@@ -450,7 +450,7 @@ pub const Colorspace = enum(c.SDL_Colorspace) {
         self: Colorspace,
     ) bool {
         const ret = c.SDL_ISCOLORSPACE_LIMITED_RANGE(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ret;
     }
@@ -490,13 +490,13 @@ pub const ColorPrimaries = enum(c.SDL_ColorPrimaries) {
     pub fn fromSdl(value: c.SDL_ColorPrimaries) ?ColorPrimaries {
         if (value == c.SDL_COLOR_PRIMARIES_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?ColorPrimaries) c.SDL_ColorPrimaries {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_COLOR_PRIMARIES_UNKNOWN;
     }
 };
@@ -515,13 +515,13 @@ pub const ColorRange = enum(c.SDL_ColorRange) {
     pub fn fromSdl(value: c.SDL_ColorRange) ?ColorRange {
         if (value == c.SDL_COLOR_RANGE_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?ColorRange) c.SDL_ColorRange {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_COLOR_RANGE_UNKNOWN;
     }
 };
@@ -538,13 +538,13 @@ pub const ColorType = enum(c.SDL_ColorType) {
     pub fn fromSdl(value: c.SDL_ColorType) ?ColorType {
         if (value == c.SDL_COLOR_TYPE_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?ColorType) c.SDL_ColorType {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_COLOR_TYPE_UNKNOWN;
     }
 };
@@ -644,14 +644,14 @@ pub const Format = enum(c.SDL_PixelFormat) {
     // MJPG is in SDL 3.4.0?
     _,
 
-    pub const array_rgba_32: Format = @enumFromInt(c.SDL_PIXELFORMAT_RGBA32);
-    pub const array_argb_32: Format = @enumFromInt(c.SDL_PIXELFORMAT_ARGB32);
-    pub const array_bgra_32: Format = @enumFromInt(c.SDL_PIXELFORMAT_BGRA32);
-    pub const array_abgr_32: Format = @enumFromInt(c.SDL_PIXELFORMAT_ABGR32);
-    pub const array_rgbx_32: Format = @enumFromInt(c.SDL_PIXELFORMAT_RGBX32);
-    pub const array_xrgb_32: Format = @enumFromInt(c.SDL_PIXELFORMAT_XRGB32);
-    pub const array_bgrx_32: Format = @enumFromInt(c.SDL_PIXELFORMAT_BGRX32);
-    pub const array_xbgr_32: Format = @enumFromInt(c.SDL_PIXELFORMAT_XBGR32);
+    pub const array_rgba_32: Format = @fromBackingInt(@intCast(c.SDL_PIXELFORMAT_RGBA32));
+    pub const array_argb_32: Format = @fromBackingInt(@intCast(c.SDL_PIXELFORMAT_ARGB32));
+    pub const array_bgra_32: Format = @fromBackingInt(@intCast(c.SDL_PIXELFORMAT_BGRA32));
+    pub const array_abgr_32: Format = @fromBackingInt(@intCast(c.SDL_PIXELFORMAT_ABGR32));
+    pub const array_rgbx_32: Format = @fromBackingInt(@intCast(c.SDL_PIXELFORMAT_RGBX32));
+    pub const array_xrgb_32: Format = @fromBackingInt(@intCast(c.SDL_PIXELFORMAT_XRGB32));
+    pub const array_bgrx_32: Format = @fromBackingInt(@intCast(c.SDL_PIXELFORMAT_BGRX32));
+    pub const array_xbgr_32: Format = @fromBackingInt(@intCast(c.SDL_PIXELFORMAT_XBGR32));
 
     /// Details about the format of a pixel.
     ///
@@ -929,13 +929,13 @@ pub const Format = enum(c.SDL_PixelFormat) {
     pub fn fromSdl(value: c.SDL_PixelFormat) ?Format {
         if (value == c.SDL_PIXELFORMAT_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?Format) c.SDL_PixelFormat {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_PIXELFORMAT_UNKNOWN;
     }
 
@@ -976,13 +976,13 @@ pub const Format = enum(c.SDL_PixelFormat) {
         bytes: u8,
     ) Format {
         const ret = c.SDL_DEFINE_PIXELFORMAT(
-            @intFromEnum(pixel_type),
-            @intFromEnum(order),
+            @backingInt(pixel_type),
+            @backingInt(order),
             PackedLayout.toSdl(layout),
             @intCast(bits),
             @intCast(bytes),
         );
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Define a format using 4 characters (Ex: YV12).
@@ -1016,7 +1016,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
             @as(c_uint, @intCast(c3)),
             @as(c_uint, @intCast(c4)),
         );
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Define a pixel format.
@@ -1062,7 +1062,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
             @as(c_int, @intCast(bits)),
             @as(c_int, @intCast(bytes)),
         );
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Convert a bpp value and RGBA masks to an enumerated pixel format.
@@ -1120,7 +1120,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
     ) u8 {
 
         // Translate C break macro so do it manually.
-        return if (self.is4cc()) 0 else @intCast((@intFromEnum(self) >> 8) & 0xff);
+        return if (self.is4cc()) 0 else @intCast((@backingInt(self) >> 8) & 0xff);
     }
 
     /// Get the bytes per pixel of the format.
@@ -1144,7 +1144,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
     ) u8 {
 
         // Ported manually because translate C not working properly for this macro.
-        return if (self.is4cc()) (if (self == .fourcc_yuy2 or self == .fourcc_uyvy or self == .fourcc_yvyu or self == .fourcc_p010) 2 else 1) else @intCast(@intFromEnum(self) & 0xff);
+        return if (self.is4cc()) (if (self == .fourcc_yuy2 or self == .fourcc_uyvy or self == .fourcc_yvyu or self == .fourcc_p010) 2 else 1) else @intCast(@backingInt(self) & 0xff);
     }
 
     /// Create a `pixels.Details` structure corresponding to a pixel format.
@@ -1164,7 +1164,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
         self: Format,
     ) !Details {
         const ret = try errors.wrapCallNull(*const c.SDL_PixelFormatDetails, c.SDL_GetPixelFormatDetails(
-            @intFromEnum(self),
+            @backingInt(self),
         ));
         return .{ .value = (try errors.wrapCallNull(*const c.SDL_PixelFormatDetails, ret)).* };
     }
@@ -1189,7 +1189,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
         self: Format,
     ) bool {
         const ret = c.SDL_PIXELFLAG(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ret != 0;
     }
@@ -1211,7 +1211,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
         self: Format,
     ) ?PackedLayout {
         const ret = c.SDL_PIXELLAYOUT(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return PackedLayout.fromSdl(ret);
     }
@@ -1238,7 +1238,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
         var b_mask: u32 = undefined;
         var a_mask: u32 = undefined;
         const ret = c.SDL_GetMasksForPixelFormat(
-            @intFromEnum(self),
+            @backingInt(self),
             &bpp,
             &r_mask,
             &g_mask,
@@ -1266,7 +1266,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
         self: Format,
     ) ?[:0]const u8 {
         const ret = c.SDL_GetPixelFormatName(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         const converted_ret = std.mem.span(ret);
         if (std.mem.eql(u8, converted_ret, "SDL_PIXELFORMAT_UNKNOWN"))
@@ -1288,7 +1288,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
         self: Format,
     ) c_uint {
         const ret = c.SDL_PIXELORDER(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return @bitCast(ret);
     }
@@ -1310,7 +1310,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
         self: Format,
     ) ?OrderType(self.getType().?) {
         const ret = c.SDL_PIXELORDER(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return OrderType(self.getType().?).fromSdl(ret);
     }
@@ -1329,7 +1329,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
         self: Format,
     ) ?Type {
         const ret = c.SDL_PIXELTYPE(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return Type.fromSdl(ret);
     }
@@ -1370,7 +1370,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
     pub fn is10Bit(
         self: Format,
     ) bool {
-        const format = @intFromEnum(self);
+        const format = @backingInt(self);
         return !(c.SDL_ISPIXELFORMAT_FOURCC(format)) and ((c.SDL_PIXELTYPE(format) == c.SDL_PIXELTYPE_PACKED32) and (c.SDL_PIXELLAYOUT(format) == c.SDL_PACKEDLAYOUT_2101010));
     }
 
@@ -1391,7 +1391,7 @@ pub const Format = enum(c.SDL_PixelFormat) {
         self: Format,
     ) bool {
         const ret = c.SDL_ISPIXELFORMAT_FOURCC(
-            @intFromEnum(self),
+            @backingInt(self),
         );
         return ret;
     }
@@ -1517,13 +1517,13 @@ pub const PackedLayout = enum(c.SDL_PackedLayout) {
     pub fn fromSdl(value: c.SDL_PackedLayout) ?PackedLayout {
         if (value == c.SDL_PACKEDLAYOUT_NONE)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?PackedLayout) c.SDL_PackedLayout {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_PACKEDLAYOUT_NONE;
     }
 };
@@ -1546,13 +1546,13 @@ pub const PackedOrder = enum(c.SDL_PackedOrder) {
     pub fn fromSdl(value: c.SDL_PackedOrder) ?PackedOrder {
         if (value == c.SDL_PACKEDORDER_NONE)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?PackedOrder) c.SDL_PackedOrder {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_PACKEDORDER_NONE;
     }
 };
@@ -1699,13 +1699,13 @@ pub const TransferCharacteristics = enum(c.SDL_TransferCharacteristics) {
     pub fn fromSdl(value: c.SDL_TransferCharacteristics) ?TransferCharacteristics {
         if (value == c.SDL_TRANSFER_CHARACTERISTICS_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?TransferCharacteristics) c.SDL_TransferCharacteristics {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_TRANSFER_CHARACTERISTICS_UNKNOWN;
     }
 };
@@ -1732,13 +1732,13 @@ pub const Type = enum(c.SDL_PixelType) {
     pub fn fromSdl(value: c.SDL_PixelType) ?Type {
         if (value == c.SDL_PIXELTYPE_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?Type) c.SDL_PixelType {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_PIXELTYPE_UNKNOWN;
     }
 };

@@ -67,8 +67,8 @@ pub const SpriteSystem = struct {
     // Frame state: CPU arenas packed by draw(), uploaded once by the first render stage.
     frame_active: bool = false,
     uploaded: bool = false,
-    scene_cam: [20]f32 = [_]f32{0} ** 20,
-    overlay_cam: [20]f32 = [_]f32{0} ** 20,
+    scene_cam: [20]f32 = @splat(0),
+    overlay_cam: [20]f32 = @splat(0),
     inst_cpu: std.ArrayListUnmanaged(f32) = .empty,
     params_cpu: std.ArrayListUnmanaged(u8) = .empty,
     batches: std.ArrayListUnmanaged(Batch) = .empty,
@@ -329,7 +329,7 @@ pub const SpriteSystem = struct {
 
         // One 256-byte slot per batch; 16 params floats zero-padded.
         const params_off: u32 = @intCast(self.params_cpu.items.len);
-        var slot = [_]u8{0} ** PARAMS_SLOT;
+        var slot: [PARAMS_SLOT]u8 = @splat(0);
         // `n` must be explicitly usize: @min narrows its result type to the smallest int that can
         // hold the comptime-known bound (16 → u5, max 31), so an inferred `n * 4` overflowed for
         // any params.len >= 8 — which is every Renderer2D draw, since Material2D always sends 16.
@@ -607,7 +607,7 @@ pub const SpriteSystem = struct {
     }
 
     fn pipeKey(shader: u32, format: wgpu.TextureFormat, blend: u32, stage: u32) u64 {
-        return (@as(u64, shader) << 32) | (@as(u64, @intFromEnum(format)) << 8) | (@as(u64, blend) << 1) | stage;
+        return (@as(u64, shader) << 32) | (@as(u64, @backingInt(format)) << 8) | (@as(u64, blend) << 1) | stage;
     }
 
     fn getPipeline(self: *SpriteSystem, device: *wgpu.Device, shader: u32, format: wgpu.TextureFormat, blend: u32, stage: u32) ?*wgpu.RenderPipeline {

@@ -117,8 +117,8 @@ pub fn main(
     try sdl3.net.init();
     defer sdl3.net.quit();
 
-    const log_server: sdl3.log.Category = @enumFromInt(@intFromEnum(sdl3.log.Category.custom) + 0);
-    const log_client: sdl3.log.Category = @enumFromInt(@intFromEnum(sdl3.log.Category.custom) + 1);
+    const log_server: sdl3.log.Category = @fromBackingInt(@intCast(@backingInt(sdl3.log.Category.custom) + 0));
+    const log_client: sdl3.log.Category = @fromBackingInt(@intCast(@backingInt(sdl3.log.Category.custom) + 1));
 
     log_server.setPriority(.verbose);
     log_client.setPriority(.verbose);

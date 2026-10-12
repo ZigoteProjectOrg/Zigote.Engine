@@ -1,7 +1,7 @@
 const std = @import("std");
 const zemscripten = @import("zemscripten");
 
-fn buildBin(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) !void {
+fn buildBin(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) !void {
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -31,7 +31,7 @@ fn buildBin(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
     run_step.dependOn(&run_cmd.step);
 }
 
-fn buildWeb(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) !void {
+fn buildWeb(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) !void {
     const activateEmsdk = zemscripten.activateEmsdkStep(b);
     b.default_step.dependOn(activateEmsdk);
 

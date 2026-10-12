@@ -1,7 +1,7 @@
 //! Headless GPU checks — `zig build check-gpu`.
 //!
-//! Two things, on one throwaway device: every WGSL shader compiles, and the texture row-pitch
-//! contract three upload paths depend on actually holds.
+//! On one throwaway device: compile every WGSL shader and renderer pipeline, validate
+//! instanced material draws, and check the texture row-pitch contract.
 //!
 //! Every `.wgsl` in this engine is compiled by wgpu-native's embedded naga at **runtime**, on the
 //! first frame that uses it. A broken shader therefore builds perfectly and fails in front of a
@@ -95,7 +95,7 @@ pub fn main() !u8 {
     };
     defer instance.release();
 
-    // No surface: nothing here rasterises, so the adapter needs no presentation support. This is
+    // No surface: all rendering is offscreen, so the adapter needs no presentation support. This is
     // what lets the check run in CI and over SSH.
     var adapter_opts = wgpu.RequestAdapterOptions{ .compatible_surface = null };
     const adapter_resp = instance.requestAdapterSync(&adapter_opts, 5_000_000);
@@ -142,6 +142,27 @@ pub fn main() !u8 {
         std.debug.print("check-gpu: no queue — skipping the row-pitch check\n", .{});
         return 0;
     };
+    defer queue.release();
+    // Compile the real renderer pipelines as well as shader modules: interface mismatches,
+    // instanced vertex layouts and MRT/depth state are only validated at pipeline creation.
+    current_shader = "3d pipeline initialization";
+    var gpu3d = renderer.wgpu_3d.Gpu3d.init(std.heap.page_allocator, device, queue, .rgba8_unorm) catch |err| {
+        std.debug.print("check-gpu: renderer initialization failed: {}\n", .{err});
+        return 1;
+    };
+    defer gpu3d.deinit();
+    _ = device.poll(true, null);
+    if (failures != 0) return 1;
+    std.debug.print("check-gpu: 3d pipelines initialized clean\n", .{});
+    current_shader = "instanced material draws";
+    checkInstancedMaterials(&gpu3d, device, queue) catch |err| {
+        std.debug.print("check-gpu: instanced material check failed: {}\n", .{err});
+        return 1;
+    };
+    _ = device.poll(true, null);
+    if (failures != 0) return 1;
+    std.debug.print("check-gpu: instanced material routing, ordering and empty batches passed\n", .{});
+    current_shader = "row pitch";
     const pitch_mismatches = checkUnalignedRowPitch(device, queue) catch |err| {
         std.debug.print("check-gpu: row-pitch check failed: {}\n", .{err});
         return 1;
@@ -156,6 +177,68 @@ pub fn main() !u8 {
     }
     std.debug.print("check-gpu: unaligned writeTexture round-trips byte-exact\n", .{});
     return 0;
+}
+
+/// Exercise actual draw commands for every alpha/culling combination, including first_instance
+/// offsets in sorted transparent draws. This is a validation/ordering regression, not an image baseline.
+fn checkInstancedMaterials(gpu: *renderer.wgpu_3d.Gpu3d, device: *wgpu.Device, queue: *wgpu.Queue) !void {
+    const engine = @import("zigote");
+    const alloc = std.heap.page_allocator;
+    var world = engine.World.init(alloc);
+    defer world.deinit();
+    const camera = try world.createNode("camera");
+    try camera.addComponent(alloc, .{ .camera = .{} });
+    world.active_camera = camera;
+    const mesh = try world.addMesh(try engine.Mesh.createQuad(alloc));
+    const modes = [_]engine.resources.AlphaMode{ .opaque_mode, .mask, .blend, .glass };
+    var near = engine.Mat4.identity;
+    near.cols[3].z = -2;
+    var far = engine.Mat4.identity;
+    far.cols[3].z = -4;
+    const matrices = near.toArray() ++ far.toArray();
+    for (modes) |mode| {
+        for ([_]bool{ false, true }) |double_sided| {
+            const mat = try world.addMaterial(.{
+                .alpha_mode = mode,
+                .double_sided = double_sided,
+                .base_color_factor = .{ .x = 1, .y = 1, .z = 1, .w = 0.75 },
+            });
+            const node = try world.createNode("instances");
+            try node.addComponent(alloc, .{ .mesh_renderer = .{ .mesh = mesh, .material = mat } });
+            gpu.setInstances(node.entity, &matrices, 2);
+            const empty = try world.createNode("empty instances");
+            try empty.addComponent(alloc, .{ .mesh_renderer = .{ .mesh = mesh, .material = mat } });
+            gpu.setInstances(empty.entity, null, 0);
+        }
+    }
+    const ordinary = try world.createNode("ordinary blend between instances");
+    ordinary.local_transform.position.z = -3;
+    const blend = try world.addMaterial(.{ .alpha_mode = .blend });
+    try ordinary.addComponent(alloc, .{ .mesh_renderer = .{ .mesh = mesh, .material = blend } });
+    world.updateTransforms();
+    const enc = device.createCommandEncoder(&.{}) orelse return error.CreateEncoderFailed;
+    defer enc.release();
+    try gpu.beginScene(&world, queue, enc, 64, 64, 0);
+    try gpu.renderSkyPass(enc, true);
+    const before = gpu.stats;
+    _ = try gpu.renderSceneGeometry(&world, queue, enc, 64, 64);
+    if (gpu.stats.draw_calls - before.draw_calls != 13 or gpu.stats.triangles - before.triangles != 34)
+        return error.UnexpectedInstanceDrawCount;
+    if (gpu.instanced_scratch.items.len != 4 or gpu.glass_scratch.items.len != 4 or gpu.transparent_scratch.items.len != 5)
+        return error.IncorrectMaterialPass;
+    const sorted = gpu.transparent_scratch.items;
+    if (sorted[2].renderable.node != ordinary or sorted[2].instance_index != null)
+        return error.OrdinaryObjectNotInterleaved;
+    for (sorted[0..2]) |item| {
+        if (item.depth != 4 or item.instance_index != 1) return error.IncorrectFarInstance;
+    }
+    for (sorted[3..5]) |item| {
+        if (item.depth != 2 or item.instance_index != 0) return error.IncorrectNearInstance;
+    }
+    const cmd = enc.finish(&.{}) orelse return error.FinishFailed;
+    defer cmd.release();
+    queue.submit(&.{cmd});
+    _ = device.poll(true, null);
 }
 
 /// Write a texture whose row pitch is deliberately not a multiple of 256, read it back, and
@@ -239,7 +322,7 @@ fn checkUnalignedRowPitch(device: *wgpu.Device, queue: *wgpu.Queue) !u32 {
 
 fn wgpuLog(level: wgpu.LogLevel, message: wgpu.StringView, userdata: ?*anyopaque) callconv(.c) void {
     _ = userdata;
-    if (@intFromEnum(level) > @intFromEnum(wgpu.LogLevel.warn)) return;
+    if (@backingInt(level) > @backingInt(wgpu.LogLevel.warn)) return;
     std.debug.print("  wgpu [{s}]: {s}\n", .{ @tagName(level), message.toSlice() orelse "" });
 }
 

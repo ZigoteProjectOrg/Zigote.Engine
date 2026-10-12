@@ -2,7 +2,7 @@ const std = @import("std");
 const math = @import("math.zig");
 const Allocator = std.mem.Allocator;
 const PixelFormat = @import("pixel_format.zig").PixelFormat;
-const TypeInfo = std.builtin.TypeInfo;
+const TypeInfo = std.lang.TypeInfo;
 
 fn isAll8BitColor(comptime red_type: type, comptime green_type: type, comptime blue_type: type, comptime alpha_type: type) bool {
     return red_type == u8 and green_type == u8 and blue_type == u8 and (alpha_type == u8 or alpha_type == void);
@@ -118,8 +118,8 @@ fn FromMethods(comptime T: type) type {
 
     const multiple_channel_types =
         RedT != GreenT or
-            RedT != BlueT or
-            (RedT != AlphaT and AlphaT != void);
+        RedT != BlueT or
+        (RedT != AlphaT and AlphaT != void);
 
     const scaleRed = ScaleValue(RedT);
     const scaleGreen = ScaleValue(GreenT);
@@ -374,8 +374,8 @@ fn ToMethods(
 
     const multiple_channel_types =
         RedT != GreenT or
-            RedT != BlueT or
-            (RedT != AlphaT and AlphaT != void);
+        RedT != BlueT or
+        (RedT != AlphaT and AlphaT != void);
 
     const scaleRed = ScaleValue(RedT);
     const scaleGreen = ScaleValue(GreenT);
@@ -618,10 +618,10 @@ fn RgbaColor(comptime T: type) type {
         g: T align(1) = 0,
         b: T align(1) = 0,
         a: T align(1) =
-        if (@typeInfo(T) == .int)
-            std.math.maxInt(T)
-        else
-            1.0,
+            if (@typeInfo(T) == .int)
+                std.math.maxInt(T)
+            else
+                1.0,
     };
 }
 
@@ -673,10 +673,10 @@ fn BgraColor(comptime T: type) type {
         g: T align(1) = 0,
         r: T align(1) = 0,
         a: T align(1) =
-        if (@typeInfo(T) == .int)
-            std.math.maxInt(T)
-        else
-            1.0,
+            if (@typeInfo(T) == .int)
+                std.math.maxInt(T)
+            else
+                1.0,
     };
 }
 
@@ -768,10 +768,10 @@ pub fn GrayscaleAlpha(comptime T: type) type {
     return struct {
         value: T,
         alpha: T =
-        if (@typeInfo(T) == .int)
-            std.math.maxInt(T)
-        else
-            1.0,
+            if (@typeInfo(T) == .int)
+                std.math.maxInt(T)
+            else
+                1.0,
 
         const Self = @This();
 

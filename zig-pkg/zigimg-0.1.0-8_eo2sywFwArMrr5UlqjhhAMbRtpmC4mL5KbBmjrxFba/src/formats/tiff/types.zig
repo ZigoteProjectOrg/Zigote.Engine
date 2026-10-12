@@ -127,19 +127,19 @@ pub const BitmapDescriptor = struct {
         }
 
         switch (self.photometric_interpretation) {
-        // bi-level/grayscale pictures
+            // bi-level/grayscale pictures
             0, 1 => {
-            const bits_per_sample = self.bits_per_sample.data[0];
-            switch (bits_per_sample) {
-            // lower column values are stored in lower-order bits
-            // no support for bilevel files with a predictor
+                const bits_per_sample = self.bits_per_sample.data[0];
+                switch (bits_per_sample) {
+                    // lower column values are stored in lower-order bits
+                    // no support for bilevel files with a predictor
                     1 => return if (self.fill_order == 1 and self.predictor == 1) PixelFormat.grayscale1 else Image.Error.Unsupported,
-                // TODO
+                    // TODO
                     4 => return Image.Error.Unsupported,
-                8 => return PixelFormat.grayscale8,
-                else => return Image.Error.Unsupported,
-            }
-        },
+                    8 => return PixelFormat.grayscale8,
+                    else => return Image.Error.Unsupported,
+                }
+            },
             // pictures with color_map
             3 => {
                 const bits_per_sample = self.bits_per_sample.data[0];
@@ -234,15 +234,15 @@ pub const TagField = extern struct {
     // Some fields (eg. image_width) can be encoded as long or short:
     // this function either returns an u16 casted to u32, or an u32
     // based on the tag data_type
-    pub inline fn toLongOrShort(self: *const TagField, endianess: std.builtin.Endian) u32 {
-        return if (self.data_type == @intFromEnum(TagType.short)) self.toShort(endianess) else self.data_offset;
+    pub inline fn toLongOrShort(self: *const TagField, endianess: std.lang.Endian) u32 {
+        return if (self.data_type == @backingInt(TagType.short)) self.toShort(endianess) else self.data_offset;
     }
 
-    pub inline fn toShort(self: *const TagField, endianess: std.builtin.Endian) u16 {
+    pub inline fn toShort(self: *const TagField, endianess: std.lang.Endian) u16 {
         return if (endianess == .big) @truncate(self.data_offset >> 16) else @truncate(self.data_offset & 0xFFFF);
     }
 
-    pub fn readRational(self: *const TagField, read_stream: *io.ReadStream, endianess: std.builtin.Endian) ![2]u32 {
+    pub fn readRational(self: *const TagField, read_stream: *io.ReadStream, endianess: std.lang.Endian) ![2]u32 {
         try read_stream.seekTo(self.data_offset);
         const reader = read_stream.reader();
 
@@ -252,8 +252,8 @@ pub const TagField = extern struct {
         };
     }
 
-    pub fn readTagData(self: *const TagField, allocator: std.mem.Allocator, read_stream: *io.ReadStream, endianess: std.builtin.Endian) ![]u32 {
-        const byte_size = if (self.data_type == @intFromEnum(TagType.short)) self.data_count * 2 else self.data_count * 4;
+    pub fn readTagData(self: *const TagField, allocator: std.mem.Allocator, read_stream: *io.ReadStream, endianess: std.lang.Endian) ![]u32 {
+        const byte_size = if (self.data_type == @backingInt(TagType.short)) self.data_count * 2 else self.data_count * 4;
         const long_data: []u32 = try allocator.alloc(u32, self.data_count);
 
         // the offset is enough to hold the data so
@@ -272,7 +272,7 @@ pub const TagField = extern struct {
 
         _ = try reader.readSliceShort(data[0..]);
 
-        if (self.data_type == @intFromEnum(TagType.long)) {
+        if (self.data_type == @backingInt(TagType.long)) {
             if (endianess == native_endian) {
                 @memcpy(std.mem.sliceAsBytes(long_data)[0..], std.mem.sliceAsBytes(data)[0..]);
             } else {
@@ -315,7 +315,7 @@ pub const IFD = struct {
         };
     }
 
-    pub fn readTags(self: *IFD, endianess: std.builtin.Endian) !void {
+    pub fn readTags(self: *IFD, endianess: std.lang.Endian) !void {
         const read_stream = self.read_stream;
 
         try read_stream.seekTo(self.ifd_offset);

@@ -10,9 +10,7 @@
 ///   BPLayer 1 = MOVING
 const std = @import("std");
 
-const joltc = @cImport({
-    @cInclude("JoltPhysicsC.h");
-});
+const joltc = @import("joltc_c");
 
 pub const INVALID_BODY_ID: u32 = 0xFFFF_FFFF;
 

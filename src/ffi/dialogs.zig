@@ -209,7 +209,7 @@ fn macDialogDone(paths_nl: [*c]const u8, outcome: i32) callconv(.c) void {
                 status.store(.err, .release);
                 return;
             });
-            const buf = alloc.dupeZ(u8, src) catch {
+            const buf = alloc.dupeSentinel(u8, src, 0) catch {
                 status.store(.err, .release);
                 return;
             };
@@ -223,7 +223,7 @@ fn macDialogDone(paths_nl: [*c]const u8, outcome: i32) callconv(.c) void {
 
 /// 0 idle · 1 pending · 2 done-selected · 3 done-cancelled · 4 done-error. Main thread only.
 export fn zigote_file_dialog_status() i32 {
-    return @intFromEnum(status.load(.acquire));
+    return @backingInt(status.load(.acquire));
 }
 
 /// Newline-joined selected locations (UTF-8). Non-null only in status 2; valid until
@@ -255,9 +255,9 @@ fn buildProps(
 ) !sdl3.dialog.Properties {
     var props = sdl3.dialog.Properties{};
     if (title != null and title[0] != 0)
-        props.title = try a.dupeZ(u8, std.mem.span(title));
+        props.title = try a.dupeSentinel(u8, std.mem.span(title), 0);
     if (accept_label != null and accept_label[0] != 0)
-        props.accept = try a.dupeZ(u8, std.mem.span(accept_label));
+        props.accept = try a.dupeSentinel(u8, std.mem.span(accept_label), 0);
 
     // SDL has a single "location" (folder, or folder + suggested name for save) — join the
     // split fields back together for it. The macOS backend takes them separately.
@@ -269,9 +269,9 @@ fn buildProps(
             &.{ std.mem.span(directory), std.mem.span(file_name) },
         );
     } else if (has_dir) {
-        props.location = try a.dupeZ(u8, std.mem.span(directory));
+        props.location = try a.dupeSentinel(u8, std.mem.span(directory), 0);
     } else if (has_name) {
-        props.location = try a.dupeZ(u8, std.mem.span(file_name));
+        props.location = try a.dupeSentinel(u8, std.mem.span(file_name), 0);
     }
 
     if (filters != null and filters[0] != 0 and dialog_type != .open_folder)
@@ -300,8 +300,8 @@ fn parseFilters(a: std.mem.Allocator, spec: []const u8) ![]sdl3.dialog.FileFilte
         const bar = std.mem.indexOfScalar(u8, line, '|') orelse return error.BadFilterSpec;
         if (bar == 0 or bar == line.len - 1) return error.BadFilterSpec;
         list[i] = .{
-            .name = try a.dupeZ(u8, line[0..bar]),
-            .pattern = try a.dupeZ(u8, line[bar + 1 ..]),
+            .name = try a.dupeSentinel(u8, line[0..bar], 0),
+            .pattern = try a.dupeSentinel(u8, line[bar + 1 ..], 0),
         };
         i += 1;
     }

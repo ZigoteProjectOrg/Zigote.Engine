@@ -62,9 +62,9 @@ All default **on**; disable them for lean 2D/UI apps and game exports.
 | `-Denable3d`  | `true`            | Build the Assimp model importer. Exports/2D apps disable it (the `.zmesh` parser stays). |
 | `-Dphysics3d` | `true`            | Build the Jolt 3D physics FFI.                                                           |
 | `-Decs`       | `true`            | Build the flecs ECS FFI.                                                                 |
-| `-Dstrip`     | ReleaseFast/Small | Strip debug info from the shared library.                                                |
+| `-Dstrip`     | fast/small        | Strip debug info from the shared library.                                                |
 
-Example lean 2D build: `zig build shared-lib -Denable3d=false -Dphysics3d=false -Decs=false -Doptimize=ReleaseFast`.
+Example lean 2D build: `zig build shared-lib -Denable3d=false -Dphysics3d=false -Decs=false -Doptimize=fast`.
 
 ### Dependencies
 

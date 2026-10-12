@@ -103,7 +103,7 @@ fn setupExample(
     options: *std.Build.Step.Options,
     name: []const u8,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) struct { *std.Build.Step.Compile, *std.Build.Step.InstallArtifact } {
     const exe_mod = b.createModule(.{
         .root_source_file = b.path(b.fmt("src/{s}.zig", .{name})),

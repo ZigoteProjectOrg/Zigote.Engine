@@ -11,7 +11,7 @@ pub fn setup(
     extension_config: ExtensionConfig,
     options: Options,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) void {
     const upstream = b.lazyDependency("sdl_net", .{}) orelse return;
     const native_os = target.result.os.tag;

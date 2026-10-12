@@ -433,7 +433,7 @@ pub const Storage = extern struct {
                 dir_name_c: [*c]const u8,
                 name_c: [*c]const u8,
             ) callconv(.c) c.SDL_EnumerationResult {
-                return @intFromEnum(callback(@ptrCast(@alignCast(user_data_c)), std.mem.span(dir_name_c), std.mem.span(name_c)));
+                return @backingInt(callback(@ptrCast(@alignCast(user_data_c)), std.mem.span(dir_name_c), std.mem.span(name_c)));
             }
         };
         return errors.wrapCallBool(c.SDL_EnumerateStorageDirectory(storage.value, if (path) |val| val.ptr else null, Cb.run, @ptrCast(user_data)));

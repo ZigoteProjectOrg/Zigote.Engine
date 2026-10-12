@@ -7,6 +7,6 @@ translate_c: *std.Build.Step.TranslateC,
 /// Optional SDL lib to link against.
 sdl_dep_lib: ?*std.Build.Step.Compile,
 /// How to link the extension library.
-linkage: std.builtin.LinkMode,
+linkage: std.lang.LinkMode,
 /// If to use the system include path.
 system_include_path: ?std.Build.LazyPath,

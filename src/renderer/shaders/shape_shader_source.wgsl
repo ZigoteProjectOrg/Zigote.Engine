@@ -32,16 +32,13 @@ fn vs_main(
 // UI colors arrive sRGB-encoded (theme values). The swapchain is an *_srgb format that encodes
 // on write, so emit linear here or every flat fill gets encoded twice and washes out toward
 // white (#222226 -> #676769, accent #3584e4 -> pastel). Same 2.2 approximation as the
-// tonemapper's srgb_decode; blending then happens in linear space, which pairs correctly with
-// the sRGB target.
+// tonemapper's srgb_decode. Blending then happens in linear space; perceptual_alpha compensates
+// so translucent tokens still land where a gamma-space blend would put them.
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   let half_size = in.rect_size / 2.0;
-  var q = abs(in.local_pos) - half_size + vec2<f32>(in.radius);
-  if (in.blur_radius > 0.0) {
-    q = abs(in.local_pos) - (half_size - vec2<f32>(2.0 * in.blur_radius)) + vec2<f32>(in.radius);
-  }
-  let dist = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - in.radius;
+  // A shadow's quad is its shape grown by twice the blur; a negative radius is a squircle corner.
+  let dist = sd_corner_rect(in.local_pos, half_size - vec2<f32>(2.0 * max(in.blur_radius, 0.0)), in.radius);
 
   // Derivative-based AA half-window. At a 1:1 logical→physical mapping fwidth(dist)≈1, so this is
   // 0.5 and matches the previous fixed smoothstep(0.5,-0.5,dist); under a DPI/content scale != 1
@@ -67,5 +64,5 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     discard;
   }
 
-  return vec4<f32>(srgb_decode(in.color.rgb), in.color.a * alpha);
+  return vec4<f32>(srgb_decode(in.color.rgb), perceptual_alpha(in.color.rgb, in.color.a * alpha));
 }

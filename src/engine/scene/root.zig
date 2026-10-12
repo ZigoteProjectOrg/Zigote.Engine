@@ -2,6 +2,7 @@ pub const entity = @import("entity.zig");
 pub const transform = @import("transform.zig");
 pub const components = @import("components.zig");
 pub const node = @import("node.zig");
+pub const draw_order = @import("draw_order.zig");
 pub const world = @import("world.zig");
 
 pub const Entity = entity.Entity;
@@ -30,4 +31,5 @@ test {
     _ = components;
     _ = node;
     _ = world;
+    _ = draw_order;
 }

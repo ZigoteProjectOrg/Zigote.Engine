@@ -121,10 +121,7 @@ const FrameStats = frame_mod.FrameStats;
 const RenderSettings = frame_mod.RenderSettings;
 const wgpu_blur = wgpu_renderer.wgpu_blur;
 
-const webp = @cImport({
-    @cInclude("webp/decode.h");
-    @cInclude("webp/types.h");
-});
+const webp = @import("webp_c");
 const builtin = @import("builtin");
 
 // ── Native crash diagnostics ──────────────────────────────────────────────────
@@ -138,9 +135,7 @@ const builtin = @import("builtin");
 const crash_diagnostics = builtin.os.tag == .macos or
     (builtin.os.tag == .linux and builtin.abi.isGnu());
 
-const execinfo = if (crash_diagnostics) @cImport({
-    @cInclude("execinfo.h");
-}) else struct {};
+const execinfo = @import("execinfo_c"); // empty where crash_diagnostics is false (build.zig)
 
 const fatal_sigs = [_]std.posix.SIG{ .ILL, .TRAP, .ABRT, .BUS, .FPE, .SEGV };
 var prev_sigactions: [fatal_sigs.len]std.posix.Sigaction = undefined;
@@ -168,7 +163,7 @@ fn nativeCrashSignalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t
     const msg = std.fmt.bufPrint(
         &buf,
         "\n[Zigote::FATAL] native crash: signal {d} {s}, fault address 0x{x}\n--- native callstack ---\n",
-        .{ @intFromEnum(sig), sig_name, addr },
+        .{ @backingInt(sig), sig_name, addr },
     ) catch "\n[Zigote::FATAL] native crash\n";
     _ = std.c.write(stderr_fd, msg.ptr, msg.len);
 
@@ -247,9 +242,9 @@ pub fn myLogFn(
 ) void {
     _ = scope;
     var buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, format, args) catch return;
+    const msg = std.fmt.bufPrintSentinel(&buf, format, args, 0) catch return;
     android_log.write(level, msg.ptr);
-    if (log_callback) |cb| cb(@intFromEnum(level), msg.ptr);
+    if (log_callback) |cb| cb(@backingInt(level), msg.ptr);
 }
 
 /// Every wgpu validation error, routed to the engine log. wgpu discards these by default, so a
@@ -267,9 +262,9 @@ fn wgpuUncapturedError(
     _ = userdata2;
     const text = message.toSlice() orelse "(no message)";
     var buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, "wgpu {s}: {s}", .{ @tagName(error_type), text }) catch return;
+    const msg = std.fmt.bufPrintSentinel(&buf, "wgpu {s}: {s}", .{ @tagName(error_type), text }, 0) catch return;
     android_log.write(.err, msg.ptr);
-    if (log_callback) |cb| cb(@intFromEnum(std.log.Level.err), msg.ptr);
+    if (log_callback) |cb| cb(@backingInt(std.log.Level.err), msg.ptr);
 }
 
 /// Forward wgpu-native's own diagnostics into the same sink. Without this the only trace of a
@@ -278,7 +273,7 @@ fn wgpuLogToEngine(level: wgpu.LogLevel, message: wgpu.StringView, userdata: ?*a
     _ = userdata;
     const text = message.toSlice() orelse return;
     var buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrintZ(&buf, "wgpu: {s}", .{text}) catch return;
+    const msg = std.fmt.bufPrintSentinel(&buf, "wgpu: {s}", .{text}, 0) catch return;
     const lvl: std.log.Level = switch (level) {
         .@"error" => .err,
         .warn => .warn,
@@ -286,7 +281,7 @@ fn wgpuLogToEngine(level: wgpu.LogLevel, message: wgpu.StringView, userdata: ?*a
         else => .debug,
     };
     android_log.write(lvl, msg.ptr);
-    if (log_callback) |cb| cb(@intFromEnum(lvl), msg.ptr);
+    if (log_callback) |cb| cb(@backingInt(lvl), msg.ptr);
 }
 
 pub const std_options: std.Options = .{
@@ -301,15 +296,11 @@ pub const std_options: std.Options = .{
 // float slots (a=rect_x b=rect_y c=rect_w d=rect_h tx=radius ty=border_width) — no new
 // ZgPaintCommand fields, so the ABI stays at version 9 (same pattern as CMD_POLYGON).
 
-
-
-
-
 /// Event kind values for ZgEvent.kind.
 pub const EVT_MOUSE_MOVE: u8 = 0;
 pub const EVT_MOUSE_DOWN: u8 = 1;
 pub const EVT_MOUSE_UP: u8 = 2;
-pub const EVT_SCROLL: u8 = 3;
+pub const EVT_SCROLL: u8 = 3; // button carries 1 for a precise device (trackpad), 0 for a wheel
 pub const EVT_KEY_DOWN: u8 = 4;
 pub const EVT_KEY_UP: u8 = 5;
 pub const EVT_QUIT: u8 = 6;
@@ -377,16 +368,6 @@ pub const BTN_LEFT: u8 = 0;
 pub const BTN_RIGHT: u8 = 1;
 pub const BTN_MIDDLE: u8 = 2;
 
-
-
-
-
-
-
-
-
-
-
 // ── Render texture ───────────────────────────────────────────────────────────
 
 /// A GPU-side render texture. Paint commands can be routed into it via
@@ -426,7 +407,6 @@ const BlurRequest = struct {
 /// A spin lock rather than a mutex: `std.Thread.Mutex` is gone in this zig version and
 /// `std.Io.Mutex` wants an `Io` handle the FFI layer has no reason to hold, while every critical
 /// section here is one hashmap lookup or insert. Decoding always happens outside the lock.
-
 pub const LoadedImage = struct {
     width: u32,
     height: u32,
@@ -486,6 +466,10 @@ const SecondaryWindow = struct {
     lock_surface: ?*wayland_lock.LockSurface = null,
 
     fn deinit(self: *SecondaryWindow, alloc: std.mem.Allocator) void {
+        // Remove the window (including native shadows) before releasing its backing
+        // surface. GPU teardown must not leave floating chrome on the desktop.
+        @import("chrome.zig").prepareClose(self.id);
+        self.window.hide() catch {};
         self.overlay_paint_list.deinit(alloc);
         self.paint_list.deinit(alloc);
         self.gpu_ui.deinit();
@@ -607,6 +591,11 @@ const EngineState = struct {
     // "natural scroll" setting only per wheel event, so there is no static query — we latch it
     // here and serve zigote_get_scroll_orientation from it.
     scroll_orientation: u8 = 0,
+    // macOS: whether the wheel event SDL last queued came from a precise device (trackpad),
+    // latched by resizeEventWatch and stamped on EVT_SCROLL by the poll.
+    // ponytail: one latch, not one per queued event — a trackpad and a wheel scrolled within the
+    // same frame both get the later one's verdict. Queue it per event if that ever shows.
+    scroll_precise: bool = false,
 
     // Active touch fingers: slot index (reported to C# in key_scancode) → the SDL
     // (touch device id, finger id) pair it stands for. SDL finger ids are u64s that may be
@@ -751,7 +740,7 @@ fn windowFromSdlId(state: *EngineState, sdl_id: u32) ?*SecondaryWindow {
 }
 
 fn recordLoadedFont(state: *EngineState, name: []const u8, path: []const u8) !void {
-    const owned_path = try state.allocator.dupeZ(u8, path);
+    const owned_path = try state.allocator.dupeSentinel(u8, path, 0);
     errdefer state.allocator.free(owned_path);
     // Re-registering an existing family swaps its face (the runtime font-switch path) — replace
     // the recorded path so window replay loads the current face, not the whole history.
@@ -762,7 +751,7 @@ fn recordLoadedFont(state: *EngineState, name: []const u8, path: []const u8) !vo
             return;
         }
     }
-    const owned_name = try state.allocator.dupeZ(u8, name);
+    const owned_name = try state.allocator.dupeSentinel(u8, name, 0);
     errdefer state.allocator.free(owned_name);
     try state.loaded_fonts.append(state.allocator, .{ .name = owned_name, .path = owned_path });
 }
@@ -1052,7 +1041,7 @@ fn zigote_init_impl(
     // Route wgpu's diagnostics into the engine log before anything can fail: on Android a fatal
     // surface/adapter error otherwise aborts with no message at all.
     wgpu.setLogCallback(wgpuLogToEngine, null);
-    wgpu.setLogLevel(if (@import("builtin").abi.isAndroid()) .debug else if (@import("builtin").mode == .Debug) .info else .warn);
+    wgpu.setLogLevel(if (@import("builtin").abi.isAndroid()) .debug else if (@import("builtin").mode == .debug) .info else .warn);
 
     std.log.info("wgpu backends mask = 0x{x} (android={})", .{ instance_extras.backends, @import("builtin").abi.isAndroid() });
     const instance_desc = (wgpu.InstanceDescriptor{}).withNativeExtras(&instance_extras);
@@ -1346,6 +1335,10 @@ fn resizeEventWatch(userdata: ?*EngineState, event: *sdl3.events.Event) bool {
             cb(resized.id, new_w, new_h);
             state.in_resize_cb = false;
         },
+        .mouse_wheel => {
+            if (comptime builtin.os.tag == .macos)
+                state.scroll_precise = @import("chrome.zig").macScrollIsPrecise();
+        },
         else => {},
     }
     return true;
@@ -1353,7 +1346,8 @@ fn resizeEventWatch(userdata: ?*EngineState, event: *sdl3.events.Event) bool {
 
 /// Register (null clears) the C# callback the resize watch invokes to render live frames during a modal
 /// window-resize drag. See EngineState.resize_render_cb and resizeEventWatch.
-export fn zigote_set_resize_render_callback(cb: ?*const fn (window_id: u32, width: u32, height: u32) callconv(.c) void,
+export fn zigote_set_resize_render_callback(
+    cb: ?*const fn (window_id: u32, width: u32, height: u32) callconv(.c) void,
 ) void {
     const state = engineState() orelse return;
     state.resize_render_cb = cb;
@@ -1361,7 +1355,7 @@ export fn zigote_set_resize_render_callback(cb: ?*const fn (window_id: u32, widt
 
 // System-cursor cache: SDL cursors are process-global (one active cursor, not per-window), created
 // lazily on first request and kept for the process lifetime. Index = the ZgCursor id from C#.
-var cursor_cache: [12]?sdl3.mouse.Cursor = [_]?sdl3.mouse.Cursor{null} ** 12;
+var cursor_cache: [12]?sdl3.mouse.Cursor = @splat(null);
 
 fn systemCursorFromId(id: u32) sdl3.mouse.SystemCursor {
     return switch (id) {
@@ -1644,6 +1638,14 @@ export fn zigote_poll_events(buf: [*]ZgEvent, capacity: u32) u32 {
                 }
                 zge.scroll_x = sx;
                 zge.scroll_y = sy;
+                // Scroll events don't use the mouse `button` byte, so it carries "precise device".
+                // macOS knows (NSEvent, see resizeEventWatch). Elsewhere SDL only hands over the
+                // delta, and a fractional one is what a notched wheel never sends.
+                const precise = if (comptime builtin.os.tag == .macos)
+                    state.scroll_precise
+                else
+                    sx != @round(sx) or sy != @round(sy);
+                zge.button = @intFromBool(precise);
                 zge.window_id = wheel.window_id orelse 0;
                 buf[count] = zge;
                 count += 1;
@@ -1658,12 +1660,12 @@ export fn zigote_poll_events(buf: [*]ZgEvent, capacity: u32) u32 {
                 if (mod.left_alt or mod.right_alt) zge.modifiers |= MOD_ALT;
                 if (mod.left_gui or mod.right_gui) zge.modifiers |= MOD_GUI;
                 if (ke.key) |k| {
-                    const int_val = @intFromEnum(k);
+                    const int_val = @backingInt(k);
                     if (int_val >= 32 and int_val <= 126) {
                         zge.key_char = @intCast(int_val);
                     }
                 }
-                zge.key_scancode = if (ke.scancode) |sc| @intFromEnum(sc) else 0;
+                zge.key_scancode = if (ke.scancode) |sc| @backingInt(sc) else 0;
                 zge.window_id = ke.window_id orelse 0;
                 buf[count] = zge;
                 count += 1;
@@ -2644,26 +2646,28 @@ fn fillPaintList(
         defer off += header.size;
 
         switch (header.kind) {
-            @intFromEnum(abi.ZgPaintOp.rect) => {
+            @backingInt(abi.ZgPaintOp.rect) => {
                 if (rec.len < @sizeOf(abi.ZgPaintRect)) continue;
                 const op: *const abi.ZgPaintRect = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .rect = .{
                     .bounds = xywh(op.bounds),
                     .color = rgba(op.color),
                     .radius = op.radius,
+                    .squircle = op.squircle != 0,
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.border) => {
+            @backingInt(abi.ZgPaintOp.border) => {
                 if (rec.len < @sizeOf(abi.ZgPaintBorder)) continue;
                 const op: *const abi.ZgPaintBorder = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .border = .{
                     .bounds = xywh(op.bounds),
                     .color = rgba(op.color),
-                    .radius = op.radius,
+                    .radius = @abs(op.radius),
+                    .squircle = op.radius < 0,
                     .width = op.width,
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.shadow) => {
+            @backingInt(abi.ZgPaintOp.shadow) => {
                 if (rec.len < @sizeOf(abi.ZgPaintShadow)) continue;
                 const op: *const abi.ZgPaintShadow = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .shadow = .{
@@ -2672,9 +2676,10 @@ fn fillPaintList(
                     .radius = op.radius,
                     .blur_radius = op.blur_radius,
                     .spread = op.spread,
+                    .squircle = op.squircle != 0,
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.liquid_glass) => {
+            @backingInt(abi.ZgPaintOp.liquid_glass) => {
                 if (rec.len < @sizeOf(abi.ZgPaintLiquidGlass)) continue;
                 const op: *const abi.ZgPaintLiquidGlass = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .liquid_glass = .{
@@ -2688,12 +2693,12 @@ fn fillPaintList(
                     .adapt = op.adapt,
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.text) => {
+            @backingInt(abi.ZgPaintOp.text) => {
                 if (rec.len < @sizeOf(abi.ZgPaintText)) continue;
                 const op: *const abi.ZgPaintText = @ptrCast(@alignCast(rec.ptr));
                 if (op.text_ptr == null or op.text_len == 0) continue;
                 const text_slice = op.text_ptr[0..op.text_len];
-                const fw: text_mod.FontWeight = @enumFromInt(@as(u16, @truncate(op.font_weight)));
+                const fw: text_mod.FontWeight = @fromBackingInt(@intCast(@as(u16, @truncate(op.font_weight))));
                 const fs: text_mod.FontStyle = if (op.font_style == 1) .italic else .normal;
                 const font_family: ?[]const u8 =
                     if (op.family_ptr != null and op.family_len > 0)
@@ -2733,7 +2738,7 @@ fn fillPaintList(
                     });
                 }
             },
-            @intFromEnum(abi.ZgPaintOp.image) => {
+            @backingInt(abi.ZgPaintOp.image) => {
                 if (rec.len < @sizeOf(abi.ZgPaintImage)) continue;
                 const op: *const abi.ZgPaintImage = @ptrCast(@alignCast(rec.ptr));
                 const cache_key: ?u64 = if (op.has_cache_key != 0) op.cache_key else null;
@@ -2782,22 +2787,24 @@ fn fillPaintList(
                     .stride = stride,
                     .bgra = bgra,
                     .cache_key = cache_key,
+                    .tint = rgba(op.tint),
                     .u0 = op.u0,
                     .v0 = op.v0,
                     .u1 = op.u1,
                     .v1 = op.v1,
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.clip_start) => {
+            @backingInt(abi.ZgPaintOp.clip_start) => {
                 if (rec.len < @sizeOf(abi.ZgPaintClipStart)) continue;
                 const op: *const abi.ZgPaintClipStart = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .clip_start = .{
                     .rect = xywh(op.bounds),
                     .radius = @max(0, op.radius),
+                    .squircle = op.squircle != 0,
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.clip_end) => try current.append(alloc, .clip_end),
-            @intFromEnum(abi.ZgPaintOp.push_opacity) => {
+            @backingInt(abi.ZgPaintOp.clip_end) => try current.append(alloc, .clip_end),
+            @backingInt(abi.ZgPaintOp.push_opacity) => {
                 if (rec.len < @sizeOf(abi.ZgPaintPushOpacity)) continue;
                 const op: *const abi.ZgPaintPushOpacity = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .push_opacity = .{
@@ -2805,8 +2812,8 @@ fn fillPaintList(
                     .alpha = op.alpha,
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.pop_opacity) => try current.append(alloc, .pop_opacity),
-            @intFromEnum(abi.ZgPaintOp.shader_effect) => {
+            @backingInt(abi.ZgPaintOp.pop_opacity) => try current.append(alloc, .pop_opacity),
+            @backingInt(abi.ZgPaintOp.shader_effect) => {
                 if (rec.len < @sizeOf(abi.ZgPaintShaderEffect)) continue;
                 const op: *const abi.ZgPaintShaderEffect = @ptrCast(@alignCast(rec.ptr));
                 // Optional @group(1) texture: same registry resolve as an image op, so the
@@ -2837,7 +2844,7 @@ fn fillPaintList(
                     .chains_backdrop = op.chains_backdrop != 0,
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.text_layout) => {
+            @backingInt(abi.ZgPaintOp.text_layout) => {
                 if (rec.len < @sizeOf(abi.ZgPaintTextLayout)) continue;
                 const op: *const abi.ZgPaintTextLayout = @ptrCast(@alignCast(rec.ptr));
                 if (op.layout == 0) continue;
@@ -2848,7 +2855,7 @@ fn fillPaintList(
                     .color = rgba(op.color),
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.glyph_run) => {
+            @backingInt(abi.ZgPaintOp.glyph_run) => {
                 if (rec.len < @sizeOf(abi.ZgPaintGlyphRun)) continue;
                 const op: *const abi.ZgPaintGlyphRun = @ptrCast(@alignCast(rec.ptr));
                 if (op.quads_ptr == null or op.quad_count == 0) continue;
@@ -2859,7 +2866,7 @@ fn fillPaintList(
                     .quads = quads_src[0..op.quad_count],
                 });
             },
-            @intFromEnum(abi.ZgPaintOp.render_texture_begin) => {
+            @backingInt(abi.ZgPaintOp.render_texture_begin) => {
                 if (rec.len < @sizeOf(abi.ZgPaintRenderTextureBegin)) continue;
                 const op: *const abi.ZgPaintRenderTextureBegin = @ptrCast(@alignCast(rec.ptr));
                 if (op.rt_handle == 0) continue;
@@ -2876,13 +2883,13 @@ fn fillPaintList(
                     std.log.warn("zigote: render_texture_begin: unknown RT handle 0x{x}", .{op.rt_handle});
                 }
             },
-            @intFromEnum(abi.ZgPaintOp.render_texture_end) => {
+            @backingInt(abi.ZgPaintOp.render_texture_end) => {
                 if (stack_depth > 0) {
                     stack_depth -= 1;
                     current = list_stack[stack_depth];
                 }
             },
-            @intFromEnum(abi.ZgPaintOp.blur) => {
+            @backingInt(abi.ZgPaintOp.blur) => {
                 if (rec.len < @sizeOf(abi.ZgPaintBlur)) continue;
                 const op: *const abi.ZgPaintBlur = @ptrCast(@alignCast(rec.ptr));
                 if (op.src_handle == 0) continue;
@@ -2891,7 +2898,7 @@ fn fillPaintList(
                     .sigma = op.sigma,
                 });
             },
-            @intFromEnum(abi.ZgPaintOp.bezier) => {
+            @backingInt(abi.ZgPaintOp.bezier) => {
                 if (rec.len < @sizeOf(abi.ZgPaintBezier)) continue;
                 const op: *const abi.ZgPaintBezier = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .bezier = .{
@@ -2907,14 +2914,14 @@ fn fillPaintList(
                     .width = op.width,
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.polygon) => {
+            @backingInt(abi.ZgPaintOp.polygon) => {
                 if (rec.len < @sizeOf(abi.ZgPaintPolygon)) continue;
                 const op: *const abi.ZgPaintPolygon = @ptrCast(@alignCast(rec.ptr));
                 // Points are (x,y) f32 pairs; a polygon needs at least 3 (24 bytes).
                 if (op.points_ptr == null or op.points_len < 24) continue;
                 try current.appendOwnedPolygon(alloc, op.points_ptr[0..op.points_len], rgba(op.color));
             },
-            @intFromEnum(abi.ZgPaintOp.transform_push) => {
+            @backingInt(abi.ZgPaintOp.transform_push) => {
                 if (rec.len < @sizeOf(abi.ZgPaintTransformPush)) continue;
                 const op: *const abi.ZgPaintTransformPush = @ptrCast(@alignCast(rec.ptr));
                 try current.append(alloc, .{ .transform_push = .{
@@ -2926,7 +2933,7 @@ fn fillPaintList(
                     .ty = op.ty,
                 } });
             },
-            @intFromEnum(abi.ZgPaintOp.transform_pop) => try current.append(alloc, .transform_pop),
+            @backingInt(abi.ZgPaintOp.transform_pop) => try current.append(alloc, .transform_pop),
             else => {}, // unknown op: skipped by size
         }
     }
@@ -2958,7 +2965,8 @@ export fn zigote_register_shader(id: u32, wgsl_ptr: [*]const u8, wgsl_len: usize
 /// Measure text using the heuristic text model (no GPU required).
 ///
 /// Returns (0,0) if the engine is not initialized.
-export fn zigote_measure_text(text: [*c]const u8,
+export fn zigote_measure_text(
+    text: [*c]const u8,
     text_len: u32,
     font_size: f32,
     max_width: f32,
@@ -2967,11 +2975,12 @@ export fn zigote_measure_text(text: [*c]const u8,
     letter_spacing: f32,
     word_spacing: f32,
     font_family: [*c]const u8,
-    font_family_len: u32,) ZgSize {
+    font_family_len: u32,
+) ZgSize {
     if (text == null or text_len == 0) return .{ .width = 0, .height = 0 };
 
     const text_slice = text[0..text_len];
-    const fw: text_mod.FontWeight = @enumFromInt(font_weight);
+    const fw: text_mod.FontWeight = @fromBackingInt(@intCast(font_weight));
     const fs: text_mod.FontStyle = if (font_style == 1) .italic else .normal;
     const family: ?[]const u8 =
         if (font_family != null and font_family_len > 0) font_family[0..font_family_len] else null;
@@ -3233,7 +3242,8 @@ export fn zigote_scene_set_mesh_primitive(node_handle: u64, prim_type: u8) ZgSta
     return .ok;
 }
 
-export fn zigote_scene_set_light_properties(node_handle: u64,
+export fn zigote_scene_set_light_properties(
+    node_handle: u64,
     kind: u8,
     r: f32,
     g: f32,
@@ -3242,7 +3252,8 @@ export fn zigote_scene_set_light_properties(node_handle: u64,
     range: f32,
     inner_angle: f32,
     outer_angle: f32,
-    cast_shadows: u32,) ZgStatus {
+    cast_shadows: u32,
+) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
     const node = state.nodeFromHandle(node_handle) orelse return .ok;
 
@@ -3321,12 +3332,12 @@ fn applySceneOp(state: *EngineState, record: []const u8, header: *const abi.ZgSc
     // that needs the state directly does not change this signature.
     _ = state;
     switch (header.kind) {
-        @intFromEnum(abi.ZgSceneOp.transform) => {
+        @backingInt(abi.ZgSceneOp.transform) => {
             if (record.len < @sizeOf(abi.ZgSceneTransform)) return;
             const op: *const abi.ZgSceneTransform = @ptrCast(@alignCast(record.ptr));
             _ = zigote_scene_update_node(op.node, op.x, op.y, op.z, op.qx, op.qy, op.qz, op.qw, op.sx, op.sy, op.sz);
         },
-        @intFromEnum(abi.ZgSceneOp.light) => {
+        @backingInt(abi.ZgSceneOp.light) => {
             if (record.len < @sizeOf(abi.ZgSceneLight)) return;
             const op: *const abi.ZgSceneLight = @ptrCast(@alignCast(record.ptr));
             _ = zigote_scene_set_light_properties(
@@ -3342,12 +3353,12 @@ fn applySceneOp(state: *EngineState, record: []const u8, header: *const abi.ZgSc
                 op.cast_shadows,
             );
         },
-        @intFromEnum(abi.ZgSceneOp.camera) => {
+        @backingInt(abi.ZgSceneOp.camera) => {
             if (record.len < @sizeOf(abi.ZgSceneCamera)) return;
             const op: *const abi.ZgSceneCamera = @ptrCast(@alignCast(record.ptr));
             _ = zigote_scene_set_camera_params(op.node, op.fovy_degrees, op.near, op.far);
         },
-        @intFromEnum(abi.ZgSceneOp.material) => {
+        @backingInt(abi.ZgSceneOp.material) => {
             if (record.len < @sizeOf(abi.ZgSceneMaterial)) return;
             const op: *const abi.ZgSceneMaterial = @ptrCast(@alignCast(record.ptr));
             _ = zigote_scene_set_mesh_color(op.node, op.color_r, op.color_g, op.color_b);
@@ -3360,12 +3371,12 @@ fn applySceneOp(state: *EngineState, record: []const u8, header: *const abi.ZgSc
             _ = zigote_scene_set_mesh_alpha_mode(op.node, op.alpha_mode, op.alpha_cutoff);
             _ = zigote_scene_set_mesh_double_sided(op.node, op.double_sided);
         },
-        @intFromEnum(abi.ZgSceneOp.visibility) => {
+        @backingInt(abi.ZgSceneOp.visibility) => {
             if (record.len < @sizeOf(abi.ZgSceneVisibility)) return;
             const op: *const abi.ZgSceneVisibility = @ptrCast(@alignCast(record.ptr));
             _ = zigote_scene_set_node_visible(op.node, op.visible);
         },
-        @intFromEnum(abi.ZgSceneOp.primitive) => {
+        @backingInt(abi.ZgSceneOp.primitive) => {
             if (record.len < @sizeOf(abi.ZgScenePrimitive)) return;
             const op: *const abi.ZgScenePrimitive = @ptrCast(@alignCast(record.ptr));
             _ = zigote_scene_set_mesh_primitive(op.node, @truncate(op.prim_type));
@@ -3594,7 +3605,7 @@ export fn zigote_scene_set_mesh_effect(node_handle: u64, effect: u32) ZgStatus {
     const mat_handle = mr_comp.mesh_renderer.material;
     if (mat_handle == std.math.maxInt(u32)) return .ok;
     if (mat_handle >= state.world.materials.items.len) return .ok;
-    state.world.materials.items[mat_handle].effect = @enumFromInt(effect);
+    state.world.materials.items[mat_handle].effect = @fromBackingInt(@intCast(effect));
     return .ok;
 }
 
@@ -3610,7 +3621,7 @@ export fn zigote_scene_set_mesh_alpha_mode(node_handle: u64, mode: u32, cutoff: 
     if (mat_handle == std.math.maxInt(u32)) return .ok;
     if (mat_handle >= state.world.materials.items.len) return .ok;
     const mat = &state.world.materials.items[mat_handle];
-    mat.alpha_mode = @enumFromInt(mode);
+    mat.alpha_mode = @fromBackingInt(@intCast(mode));
     mat.alpha_cutoff = std.math.clamp(cutoff, 0.0, 1.0);
     if (mode == 2 and mat.base_color_factor.w >= 0.999) {
         mat.base_color_factor.w = 0.35; // default glass tint when the glTF gave no alpha
@@ -3850,8 +3861,6 @@ export fn zigote_scene_set_mesh_emissive_texture_file(node_handle: u64, path_c: 
     invalidateMaterialGpu(state, mat_handle);
     return .ok;
 }
-
-
 
 /// Which material slot a decoded image targets.
 const TexKind = enum(u8) { base, mr, normal, emissive };
@@ -4093,7 +4102,8 @@ export fn zigote_scene_remove_node(node_handle: u64) ZgStatus {
     return .ok;
 }
 
-export fn zigote_scene_update_node(node_handle: u64,
+export fn zigote_scene_update_node(
+    node_handle: u64,
     x: f32,
     y: f32,
     z: f32,
@@ -4103,7 +4113,8 @@ export fn zigote_scene_update_node(node_handle: u64,
     qw: f32,
     sx: f32,
     sy: f32,
-    sz: f32,) ZgStatus {
+    sz: f32,
+) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
     const node = state.nodeFromHandle(node_handle) orelse {
         std.log.warn("zigote_scene_update_node: invalid handle 0x{x}", .{node_handle});
@@ -4509,11 +4520,13 @@ fn tryAutoCapture(state: *EngineState) void {
 /// giving the 2D paint path a headless golden-image regression seam it otherwise lacks. Additive: it
 /// reuses the existing renderToTexture + BMP readback and never touches the live present path. Submit
 /// a frame's paint commands first (zigote_submit_paint_commands), then call this.
-export fn zigote_capture_ui_bmp(path_ptr: [*c]const u8,
+export fn zigote_capture_ui_bmp(
+    path_ptr: [*c]const u8,
     path_len: usize,
     width: u32,
     height: u32,
-    scale: f32,) ZgResult {
+    scale: f32,
+) ZgResult {
     const state = engineState() orelse return .err;
     if (width == 0 or height == 0 or path_ptr == null) return .err;
     const path = path_ptr[0..path_len];
@@ -4746,10 +4759,12 @@ fn onLayerConfigure(l: *wayland_layer.LayerSurface) void {
 
 /// Create a secondary UI-only OS window. out_window receives the opaque window handle to pass to
 /// the other zigote_window_* calls. width/height are logical pixels (like zigote_init).
-export fn zigote_window_create(width: u32,
+export fn zigote_window_create(
+    width: u32,
     height: u32,
     title: [*c]const u8,
-    out_window: *u64,) ZgResult {
+    out_window: *u64,
+) ZgResult {
     const state = engineState() orelse return .err;
     const win = createSecondaryWindowImpl(state, width, height, title, null, null) catch |err| {
         std.log.err("zigote_window_create failed: {}", .{err});
@@ -4769,7 +4784,8 @@ export fn zigote_window_create(width: u32,
 /// Where the compositor has no layer-shell (GNOME, X11, any other OS) this degrades to an
 /// ordinary secondary window — same size, a stretched axis becoming 1280 or 720 — so a shell can
 /// be developed anywhere; the out_is_layer flag says which one you got.
-export fn zigote_window_create_layer(width: u32,
+export fn zigote_window_create_layer(
+    width: u32,
     height: u32,
     title: [*c]const u8,
     layer: u32,
@@ -4777,13 +4793,15 @@ export fn zigote_window_create_layer(width: u32,
     exclusive_zone: i32,
     keyboard: u32,
     out_window: *u64,
-    out_is_layer: *u32,) ZgResult {
+    out_is_layer: *u32,
+) ZgResult {
     return createLayerImpl(width, height, title, layer, anchor, exclusive_zone, keyboard, 0, out_window, out_is_layer);
 }
 
 /// zigote_window_create_layer on a specific output (an id from zigote_output_get); 0 = let the
 /// compositor choose. An unknown id also falls back to the compositor's choice.
-export fn zigote_window_create_layer_on(width: u32,
+export fn zigote_window_create_layer_on(
+    width: u32,
     height: u32,
     title: [*c]const u8,
     layer: u32,
@@ -4792,7 +4810,8 @@ export fn zigote_window_create_layer_on(width: u32,
     keyboard: u32,
     output_id: u64,
     out_window: *u64,
-    out_is_layer: *u32,) ZgResult {
+    out_is_layer: *u32,
+) ZgResult {
     return createLayerImpl(width, height, title, layer, anchor, exclusive_zone, keyboard, output_id, out_window, out_is_layer);
 }
 
@@ -4810,10 +4829,10 @@ fn createLayerImpl(width: u32, height: u32, title: [*c]const u8, layer: u32, anc
                     null;
                 opts = .{
                     .output = output,
-                    .layer = @enumFromInt(@min(layer, 3)),
+                    .layer = @fromBackingInt(@intCast(@min(layer, 3))),
                     .anchor = anchor & 0xF,
                     .exclusive_zone = exclusive_zone,
-                    .keyboard = @enumFromInt(@min(keyboard, 2)),
+                    .keyboard = @fromBackingInt(@intCast(@min(keyboard, 2))),
                     .width = width,
                     .height = height,
                 };
@@ -4922,7 +4941,7 @@ export fn zigote_session_lock() ZgStatus {
 /// 0 none, 1 pending, 2 locked, 3 finished (the compositor refused or another locker won).
 export fn zigote_session_lock_state() u32 {
     const l = session_lock orelse return 0;
-    return @intFromEnum(l.state);
+    return @backingInt(l.state);
 }
 
 /// A lock surface on `output_id` (from zigote_output_get). The compositor sizes it to the output.
@@ -5167,6 +5186,21 @@ export fn zigote_main_window_set_visible(visible: u32) ZgStatus {
     return .ok;
 }
 
+/// Resize the MAIN window's client area, in logical points — the size the app lays out at.
+///
+/// A real OS resize: SDL answers with the same resize event a user dragging the window edge
+/// produces, so the swapchain and every size-dependent GPU target are rebuilt on the normal
+/// path. That is the point — it is how an out-of-process driver reaches the bugs only a
+/// framebuffer change triggers. The WM may clamp or refuse (minimum size, tiling, fullscreen);
+/// the size that actually resulted is whatever the following resize event reports.
+export fn zigote_main_window_set_size(width: u32, height: u32) ZgStatus {
+    const state = engineState() orelse return .invalid_handle;
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return .invalid_argument;
+    if (!sdl3.c.SDL_SetWindowSize(state.window.value, @intCast(width), @intCast(height)))
+        return .unsupported;
+    return .ok;
+}
+
 /// Screen position (top-left, logical desktop coordinates) of the MAIN engine window.
 export fn zigote_main_window_position(out_x: *i32, out_y: *i32) ZgStatus {
     out_x.* = 0;
@@ -5306,12 +5340,14 @@ export fn zigote_window_stop_text_input(window_handle: u64) ZgStatus {
 }
 
 /// IME caret anchor for a secondary window (see zigote_set_text_input_area).
-export fn zigote_window_set_text_input_area(window_handle: u64,
+export fn zigote_window_set_text_input_area(
+    window_handle: u64,
     x: i32,
     y: i32,
     w: i32,
     h: i32,
-    cursor: i32,) ZgStatus {
+    cursor: i32,
+) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
     const win = windowFromHandle(state, window_handle) orelse return .ok;
     sdl3.keyboard.setTextInputArea(win.window, .{ .x = x, .y = y, .w = w, .h = h }, cursor) catch {};
@@ -5363,6 +5399,36 @@ export fn zigote_get_clipboard(buf: [*]u8, capacity: u32) u32 {
 export fn zigote_set_clipboard(text_ptr: [*c]const u8) ZgStatus {
     const text: [:0]const u8 = std.mem.span(text_ptr);
     sdl3.clipboard.setText(text) catch {};
+    return .ok;
+}
+
+fn clipboardBlobData(userdata: ?*anyopaque, _: [*c]const u8, size: [*c]usize) callconv(.c) ?*const anyopaque {
+    const blob: *[]u8 = @ptrCast(@alignCast(userdata.?));
+    size.* = blob.len;
+    return blob.ptr;
+}
+
+fn clipboardBlobFree(userdata: ?*anyopaque) callconv(.c) void {
+    const blob: *[]u8 = @ptrCast(@alignCast(userdata.?));
+    std.heap.c_allocator.free(blob.*);
+    std.heap.c_allocator.destroy(blob);
+}
+
+/// Put one binary payload on the clipboard under a MIME type ("image/png"): what "Copy Image" is.
+/// The bytes are copied — SDL asks for them lazily, whenever another app pastes — and freed by
+/// SDL's cleanup callback when the clipboard is next replaced. Main thread only, as zigote_set_clipboard.
+export fn zigote_set_clipboard_data(mime_ptr: [*c]const u8, data_ptr: [*]const u8, data_len: usize) ZgStatus {
+    if (mime_ptr == null or data_len == 0) return .invalid_argument;
+    const a = std.heap.c_allocator;
+    const blob = a.create([]u8) catch return .out_of_memory;
+    blob.* = a.dupe(u8, data_ptr[0..data_len]) catch {
+        a.destroy(blob);
+        return .out_of_memory;
+    };
+    // From here the blob is SDL's: it runs the cleanup when the clipboard is replaced, a failed
+    // set included, so nothing is freed on this side.
+    var mimes = [_][*c]const u8{mime_ptr};
+    if (!sdl3.c.SDL_SetClipboardData(clipboardBlobData, clipboardBlobFree, @ptrCast(blob), &mimes, 1)) return .err;
     return .ok;
 }
 
@@ -5939,7 +6005,8 @@ export fn zigote_load_texture_from_memory_scaled(data_ptr: [*c]const u8, data_le
 /// The handle can be passed to zigote_draw_text_layout each frame to skip HarfBuzz shaping.
 /// Call zigote_text_layout_release() when the layout is no longer needed.
 /// Returns 0 on error.
-export fn zigote_text_layout_create(text_ptr: [*c]const u8,
+export fn zigote_text_layout_create(
+    text_ptr: [*c]const u8,
     text_len: usize,
     font_family_ptr: [*c]const u8,
     font_family_len: usize,
@@ -5949,7 +6016,8 @@ export fn zigote_text_layout_create(text_ptr: [*c]const u8,
     line_height: f32,
     letter_spacing: f32,
     word_spacing: f32,
-    max_width: f32,) u64 {
+    max_width: f32,
+) u64 {
     _ = max_width; // TODO: word-wrap support
     const state = engineState() orelse return 0;
     if (text_ptr == null or text_len == 0) return 0;
@@ -5958,7 +6026,7 @@ export fn zigote_text_layout_create(text_ptr: [*c]const u8,
     // Optional family (e.g. "code" for the monospace editor face); null falls back to the default.
     const family_slice: ?[]const u8 =
         if (font_family_ptr != null and font_family_len > 0) font_family_ptr[0..font_family_len] else null;
-    const fw: text_mod.FontWeight = @enumFromInt(font_weight);
+    const fw: text_mod.FontWeight = @fromBackingInt(@intCast(font_weight));
     const fs: text_mod.FontStyle = if (font_style == 1) .italic else .normal;
 
     const layout_h = state.gpu_ui.text.appendTextLayout(state.allocator, .{
@@ -6024,10 +6092,12 @@ export fn zigote_text_layout_move_caret(eng: u64, layout_handle: u64, text_offse
 /// pixels rather than loading a file — a procedural page, a video frame, an extension handing back
 /// raw bytes — which otherwise have to encode to PNG purely to get past the decoder.
 /// Release it with zigote_release_texture like any other handle. Returns 0 on error.
-export fn zigote_load_texture_from_rgba(pixels_ptr: [*c]const u8,
+export fn zigote_load_texture_from_rgba(
+    pixels_ptr: [*c]const u8,
     pixels_len: usize,
     width: u32,
-    height: u32,) u64 {
+    height: u32,
+) u64 {
     return zigote_load_texture_from_pixels(pixels_ptr, pixels_len, width, height, 0, false);
 }
 
@@ -6035,12 +6105,14 @@ export fn zigote_load_texture_from_rgba(pixels_ptr: [*c]const u8,
 /// (0 = tightly packed) and `bgra` says the bytes are B,G,R,A. Both are free — the stride goes
 /// straight into the GPU copy and the channel order into the texture format — which is what lets a
 /// Cairo/GTK surface (padded rows, BGRA) upload with no conversion pass and no repacking at all.
-export fn zigote_load_texture_from_pixels(pixels_ptr: [*c]const u8,
+export fn zigote_load_texture_from_pixels(
+    pixels_ptr: [*c]const u8,
     pixels_len: usize,
     width: u32,
     height: u32,
     stride: u32,
-    bgra: bool,) u64 {
+    bgra: bool,
+) u64 {
     const state = engineState() orelse return 0;
     if (pixels_ptr == null or width == 0 or height == 0) return 0;
 
@@ -6065,11 +6137,13 @@ export fn zigote_load_texture_from_pixels(pixels_ptr: [*c]const u8,
 ///
 /// Safe from any thread. The texel upload itself is deferred to the top of the next frame, on the
 /// render thread, where writing a texture is legal (see drainImageUpdates).
-export fn zigote_update_texture_rgba(image_handle: u64,
+export fn zigote_update_texture_rgba(
+    image_handle: u64,
     pixels_ptr: [*c]const u8,
     pixels_len: usize,
     width: u32,
-    height: u32,) bool {
+    height: u32,
+) bool {
     return zigote_update_texture_rgba_rows(image_handle, pixels_ptr, pixels_len, width, height, 0, height);
 }
 
@@ -6080,27 +6154,31 @@ export fn zigote_update_texture_rgba(image_handle: u64,
 /// The CPU-side copy is kept alive between partial updates (a full-frame update still drops it),
 /// so the caller must keep handing over a buffer whose untouched rows are still valid — which is
 /// the natural shape for anything double-buffering a surface.
-export fn zigote_update_texture_rgba_rows(image_handle: u64,
+export fn zigote_update_texture_rgba_rows(
+    image_handle: u64,
     pixels_ptr: [*c]const u8,
     pixels_len: usize,
     width: u32,
     height: u32,
     y0: u32,
-    y1: u32,) bool {
+    y1: u32,
+) bool {
     return zigote_update_texture_rows(image_handle, pixels_ptr, pixels_len, width, height, 0, y0, y1);
 }
 
 /// zigote_update_texture_rgba_rows for a producer with its own row stride (0 = tightly packed).
 /// The channel order is fixed at creation by zigote_load_texture_from_pixels — an update is a byte
 /// copy and does not care.
-export fn zigote_update_texture_rows(image_handle: u64,
+export fn zigote_update_texture_rows(
+    image_handle: u64,
     pixels_ptr: [*c]const u8,
     pixels_len: usize,
     width: u32,
     height: u32,
     stride: u32,
     y0: u32,
-    y1: u32,) bool {
+    y1: u32,
+) bool {
     const state = engineState() orelse return false;
     if (image_handle == 0 or pixels_ptr == null or width == 0 or height == 0) return false;
 
@@ -6218,10 +6296,12 @@ fn drainImageUpdates(state: *EngineState) void {
 /// Upload a custom glyph atlas (R8 grayscale) and return a texture handle.
 /// The handle can be used in CMD_GLYPH_RUN commands via AddGlyphRun().
 /// Returns 0 on error.
-export fn zigote_upload_glyph_atlas(pixels_ptr: [*c]const u8,
+export fn zigote_upload_glyph_atlas(
+    pixels_ptr: [*c]const u8,
     pixels_len: usize,
     width: u32,
-    height: u32,) u64 {
+    height: u32,
+) u64 {
     const state = engineState() orelse return 0;
     if (pixels_ptr == null or pixels_len == 0 or width == 0 or height == 0) return 0;
 
@@ -6283,7 +6363,7 @@ export fn zigote_add_emoji_font(name_ptr: [*c]const u8) ZgResult {
     var it = state.windows.iterator();
     while (it.next()) |win| win.*.gpu_ui.text.addEmojiFontFamily(name);
     if (state.emoji_family) |old| state.allocator.free(old);
-    state.emoji_family = state.allocator.dupeZ(u8, name) catch null;
+    state.emoji_family = state.allocator.dupeSentinel(u8, name, 0) catch null;
     return .ok;
 }
 
@@ -6303,7 +6383,7 @@ export fn zigote_add_fallback_font(name_ptr: [*c]const u8) ZgResult {
     var it = state.windows.iterator();
     while (it.next()) |win| win.*.gpu_ui.text.addFallbackFontFamily(name);
 
-    const owned = state.allocator.dupeZ(u8, name) catch return .ok;
+    const owned = state.allocator.dupeSentinel(u8, name, 0) catch return .ok;
     state.fallback_families.append(state.allocator, owned) catch state.allocator.free(owned);
     return .ok;
 }
@@ -6422,7 +6502,8 @@ export fn zigote_physics_optimize_broadphase() ZgStatus {
 /// motion_type: 0=Static, 1=Kinematic, 2=Dynamic
 /// friction: surface friction coefficient (0–1, default 0.2)
 /// restitution: bounce coefficient (0–1, default 0.0)
-export fn zigote_physics_create_body(shape_type: u8,
+export fn zigote_physics_create_body(
+    shape_type: u8,
     hx: f32,
     hy: f32,
     hz: f32,
@@ -6436,7 +6517,8 @@ export fn zigote_physics_create_body(shape_type: u8,
     friction: f32,
     restitution: f32,
     gravity_factor: f32,
-    mass: f32,) u32 {
+    mass: f32,
+) u32 {
     const state = engineState() orelse return physics_ffi.INVALID_BODY_ID;
     const phys = state.physics orelse return physics_ffi.INVALID_BODY_ID;
     return physics_ffi.createBody(phys, shape_type, hx, hy, hz, px, py, pz, rx, ry, rz, motion_type, friction, restitution, gravity_factor, mass);
@@ -6581,7 +6663,8 @@ export fn zigote_physics_get_body_transforms(ids: [*c]const u32, count: u32, out
 }
 
 /// Closest-hit world ray cast, skipping `ignore_body` (0xFFFFFFFF = none). Returns 1 on hit, 0 on miss.
-export fn zigote_physics_raycast_closest(ox: f32,
+export fn zigote_physics_raycast_closest(
+    ox: f32,
     oy: f32,
     oz: f32,
     dx: f32,
@@ -6596,7 +6679,8 @@ export fn zigote_physics_raycast_closest(ox: f32,
     out_pz: *f32,
     out_nx: *f32,
     out_ny: *f32,
-    out_nz: *f32,) u32 {
+    out_nz: *f32,
+) u32 {
     const state = engineState() orelse return 0;
     const phys = state.physics orelse return 0;
     const hit = physics_ffi.raycastClosest(phys, ox, oy, oz, dx, dy, dz, max_dist, ignore_body, out_body, out_fraction, out_px, out_py, out_pz, out_nx, out_ny, out_nz);
@@ -6631,7 +6715,7 @@ export fn zigote_get_renderer_caps(out_caps: *ZgRendererCaps) ZgStatus {
 
     const caps = backend_mod.Caps{ .active_backend = state.backend_id };
     out_caps.* = .{
-        .active_backend = @intFromEnum(caps.active_backend),
+        .active_backend = @backingInt(caps.active_backend),
         .upscalers = caps.upscalers,
         .raytracing = @intFromBool(caps.raytracing),
         .raytracing_from_render = @intFromBool(caps.raytracing_from_render),
@@ -7245,9 +7329,11 @@ export fn zigote_render_texture_cache_key(rt_handle: u64) u64 {
 /// end of a GPU image pipeline: paint sources and shader passes into the RT, render the frame, then
 /// pull the processed pixels out for encoding or export. Synchronous (blocks on the GPU copy), so it
 /// is a capture-time call, not a per-frame one. `out` must hold width*height*4 bytes.
-export fn zigote_render_texture_read_rgba(rt_handle: u64,
+export fn zigote_render_texture_read_rgba(
+    rt_handle: u64,
     out_ptr: [*c]u8,
-    out_len: usize,) bool {
+    out_len: usize,
+) bool {
     const state = engineState() orelse return false;
     const rt = state.render_textures.getPtr(rt_handle) orelse return false;
     if (out_ptr == null) return false;
@@ -7360,8 +7446,6 @@ export fn zigote_set_render_settings(enable_glass: u8, enable_debug: u8) ZgStatu
     state.render_settings.enable_debug_overlays = enable_debug != 0;
     return .ok;
 }
-
-
 
 fn settingsToWire(s: wgpu_renderer.wgpu_3d.Settings3D) ZgRenderSettings3D {
     return .{
@@ -7747,8 +7831,6 @@ export fn zigote_set_reflection_probe(cx: f32, cy: f32, cz: f32, ex: f32, ey: f3
     g3d.setReflectionProbe(.{ cx, cy, cz }, .{ ex, ey, ez });
     return .ok;
 }
-
-
 
 export fn zigote_debug_get_engine_stats(out_stats: *ZgEngineStats) ZgStatus {
     const state = engineState() orelse {
@@ -8166,7 +8248,7 @@ test "scene stream framing: unknown ops skip, malformed sizes are rejected" {
     unknown.* = .{ .kind = 0xDEAD, .size = 16 };
     const vis: *abi.ZgSceneVisibility = @ptrCast(@alignCast(&buf[16]));
     vis.* = .{
-        .header = .{ .kind = @intFromEnum(abi.ZgSceneOp.visibility), .size = @sizeOf(abi.ZgSceneVisibility) },
+        .header = .{ .kind = @backingInt(abi.ZgSceneOp.visibility), .size = @sizeOf(abi.ZgSceneVisibility) },
         .node = 0,
         .visible = 1,
     };

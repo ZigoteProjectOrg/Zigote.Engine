@@ -49,13 +49,13 @@ pub const State = enum(c.SDL_ThreadState) {
     pub fn fromSdl(value: c.SDL_ThreadState) ?State {
         if (value == c.SDL_THREAD_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?State) c.SDL_ThreadState {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_THREAD_UNKNOWN;
     }
 };
@@ -482,7 +482,7 @@ pub fn getCurrentId() Id {
 pub fn setCurrentPriority(
     priority: Priority,
 ) !void {
-    return errors.wrapCallBool(c.SDL_SetCurrentThreadPriority(@intFromEnum(priority)));
+    return errors.wrapCallBool(c.SDL_SetCurrentThreadPriority(@backingInt(priority)));
 }
 
 fn threadFunc(user_data: ?*void) c_int {

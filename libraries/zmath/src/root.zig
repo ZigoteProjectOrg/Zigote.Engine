@@ -1440,7 +1440,7 @@ pub inline fn swizzle(
     comptime z: F32x4Component,
     comptime w: F32x4Component,
 ) F32x4 {
-    return @shuffle(f32, v, undefined, [4]i32{ @intFromEnum(x), @intFromEnum(y), @intFromEnum(z), @intFromEnum(w) });
+    return @shuffle(f32, v, undefined, [4]i32{ @backingInt(x), @backingInt(y), @backingInt(z), @backingInt(w) });
 }
 
 pub inline fn mod(v0: anytype, v1: anytype) @TypeOf(v0, v1) {

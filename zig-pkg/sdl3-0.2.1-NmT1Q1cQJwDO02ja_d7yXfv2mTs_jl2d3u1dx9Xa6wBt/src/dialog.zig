@@ -385,7 +385,7 @@ pub fn showWithProperties(
     };
     const ret = try props.toProperties();
     c.SDL_ShowFileDialogWithProperties(
-        @intFromEnum(dialog_type),
+        @backingInt(dialog_type),
         Cb.run,
         @ptrCast(user_data),
         ret.value,

@@ -94,13 +94,13 @@ pub const IoVarType = enum(c_uint) {
     pub fn fromSdl(value: c.SDL_ShaderCross_IOVarType) ?IoVarType {
         if (value == c.SDL_SHADERCROSS_IOVAR_TYPE_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?IoVarType) c.SDL_ShaderCross_IOVarType {
         if (self) |val| {
-            return @intFromEnum(val);
+            return @backingInt(val);
         }
         return c.SDL_SHADERCROSS_IOVAR_TYPE_UNKNOWN;
     }
@@ -197,7 +197,7 @@ pub const HlslInfo = struct {
             .entrypoint = self.entry_point.ptr,
             .include_dir = if (self.include_dir) |val| val.ptr else null,
             .defines = if (self.defines) |val| @ptrCast(val) else null,
-            .shader_stage = @intFromEnum(self.shader_stage),
+            .shader_stage = @backingInt(self.shader_stage),
             .enable_debug = self.enable_debug,
             .name = if (self.name) |val| val.ptr else null,
         };
@@ -260,7 +260,7 @@ pub const SpirvInfo = struct {
             .bytecode = self.bytecode.ptr,
             .bytecode_size = self.bytecode.len,
             .entrypoint = self.entry_point.ptr,
-            .shader_stage = @intFromEnum(self.shader_stage),
+            .shader_stage = @backingInt(self.shader_stage),
             .enable_debug = self.enable_debug,
             .name = if (self.name) |val| val.ptr else null,
             .props = 0,

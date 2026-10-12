@@ -302,7 +302,7 @@ pub const Keycode = enum(c.SDL_Keycode) {
     pub fn isExtended(
         self: Keycode,
     ) bool {
-        return c.SDLK_EXTENDED_MASK & @intFromEnum(self) != 0;
+        return c.SDLK_EXTENDED_MASK & @backingInt(self) != 0;
     }
 
     /// Returns if this keycode maps to a scancode.
@@ -316,7 +316,7 @@ pub const Keycode = enum(c.SDL_Keycode) {
     /// ## Version
     /// This function is available since SDL 3.2.0.
     pub fn isScancode(self: Keycode) bool {
-        return c.SDLK_SCANCODE_MASK & @intFromEnum(self) != 0;
+        return c.SDLK_SCANCODE_MASK & @backingInt(self) != 0;
     }
 
     /// Create an unmanaged keycode from a keycode enum.
@@ -333,7 +333,7 @@ pub const Keycode = enum(c.SDL_Keycode) {
     /// ## Version
     /// This function is provided by zig-sdl3.
     pub fn toSdl(self: ?Keycode) c.SDL_Keycode {
-        return if (self) |val| @intFromEnum(val) else c.SDLK_UNKNOWN;
+        return if (self) |val| @backingInt(val) else c.SDLK_UNKNOWN;
     }
 
     /// Create a keycode enum from an SDL keycode.
@@ -351,7 +351,7 @@ pub const Keycode = enum(c.SDL_Keycode) {
     /// This function is provided by zig-sdl3.
     pub fn fromSdl(key_code: c.SDL_Keycode) ?Keycode {
         if (key_code == c.SDLK_UNKNOWN) return null;
-        return @enumFromInt(key_code);
+        return @fromBackingInt(@intCast(key_code));
     }
 };
 

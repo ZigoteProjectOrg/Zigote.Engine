@@ -14,18 +14,21 @@ pub const vendor_info = std.fmt.comptimePrint("https://github.com/castholm/SDL {
 const revision_without_vendor_info = std.fmt.comptimePrint("SDL-{f}", .{version});
 pub const revision = revision_without_vendor_info ++ " (" ++ vendor_info ++ ")";
 
+/// The SDK / NDK root (`-Dsysroot`), null when not given. Set once at the top of `build`.
+var sysroot: ?[]const u8 = null;
+
 /// Point a module at the NDK sysroot's per-architecture pieces. Neither is derived from
 /// `--sysroot`: bionic splits the arch-specific headers (asm/) into a per-triple include
 /// directory, and the system libraries (android, log, dl) live in a per-triple, per-API-level
 /// library directory that zig does not search on its own.
 fn addAndroidSysrootPaths(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    const sysroot = b.sysroot orelse return;
+    const ndk = sysroot orelse return;
     const arch_dir = switch (target.result.cpu.arch) {
         .aarch64 => "aarch64-linux-android",
         .x86_64 => "x86_64-linux-android",
         else => @panic("SDL: unsupported Android arch"),
     };
-    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include", arch_dir }) });
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk, "usr/include", arch_dir }) });
     // Sysroot-RELATIVE: the linker prepends the sysroot to -L paths itself, so an absolute path
     // would be doubled. API level must match the one the target triple pins (…-android.34).
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ "/usr/lib", arch_dir, "34" }) });
@@ -34,8 +37,11 @@ fn addAndroidSysrootPaths(b: *std.Build, mod: *std.Build.Module, target: std.Bui
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    if (b.option([]const u8, "sysroot", "SDK / NDK root. Pass the same path as --sysroot: since zig 0.17 a build script cannot read that flag.")) |s| {
+        if (s.len > 0) sysroot = s;
+    }
     const preferred_linkage = b.option(
-        std.builtin.LinkMode,
+        std.lang.LinkMode,
         "preferred_linkage",
         "Prefer building statically or dynamically linked libraries (default: static)",
     ) orelse .static;
@@ -92,8 +98,8 @@ pub fn build(b: *std.Build) void {
             // linux dependency set (X11/Wayland/ALSA/…); its system surface is the NDK sysroot.
             if (target.result.abi.isAndroid()) {
                 android = true;
-                if (b.sysroot) |sysroot| {
-                    system_include_path = .{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) };
+                if (sysroot) |sdk| {
+                    system_include_path = .{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) };
                 } else {
                     std.log.err("'--sysroot' (the NDK sysroot) is required when building SDL for Android targets", .{});
                     std.process.exit(1);
@@ -108,9 +114,11 @@ pub fn build(b: *std.Build) void {
         },
         .macos => {
             macos = true;
-            if (b.sysroot) |sysroot| {
-                system_include_path = .{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) };
-                system_framework_path = .{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) };
+            if (sysroot) |sdk| {
+                system_include_path = .{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) };
+                // Sysroot-relative, like the library path: zig 0.17 prepends the sysroot to
+                // framework search paths too.
+                system_framework_path = .{ .cwd_relative = "/System/Library/Frameworks" };
                 library_path = .{ .cwd_relative = "/usr/lib" }; // ???
             } else if (!target.query.isNative()) {
                 std.log.err("'--sysroot' is required when building SDL for non-native macOS targets", .{});
@@ -119,9 +127,11 @@ pub fn build(b: *std.Build) void {
         },
         .ios => {
             ios = true;
-            if (b.sysroot) |sysroot| {
-                system_include_path = .{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) };
-                system_framework_path = .{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) };
+            if (sysroot) |sdk| {
+                system_include_path = .{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) };
+                // Sysroot-relative, like the library path: zig 0.17 prepends the sysroot to
+                // framework search paths too.
+                system_framework_path = .{ .cwd_relative = "/System/Library/Frameworks" };
                 library_path = .{ .cwd_relative = "/usr/lib" };
             } else {
                 std.log.err("'--sysroot' is required when building SDL for iOS targets", .{});
@@ -130,8 +140,8 @@ pub fn build(b: *std.Build) void {
         },
         .emscripten => {
             emscripten = true;
-            if (b.sysroot) |sysroot| {
-                system_include_path = .{ .cwd_relative = b.pathJoin(&.{ sysroot, "include" }) };
+            if (sysroot) |sdk| {
+                system_include_path = .{ .cwd_relative = b.pathJoin(&.{ sdk, "include" }) };
             } else {
                 std.log.err("'--sysroot' is required when building SDL for Emscripten", .{});
                 std.process.exit(1);
@@ -715,8 +725,8 @@ pub fn build(b: *std.Build) void {
         // Xcode 26 SDKs split some framework dependencies (UIKit's UIUtilities) into a separate
         // SubFrameworks directory that Xcode has on its default search path but we must add.
         if (ios) {
-            if (b.sysroot) |sysroot| {
-                sdl_mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/SubFrameworks" }) });
+            if (sysroot != null) {
+                sdl_mod.addSystemFrameworkPath(.{ .cwd_relative = "/System/Library/SubFrameworks" });
             }
         }
     }

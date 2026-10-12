@@ -83,7 +83,7 @@ pub const VirtualKeyboard = struct {
     }
 
     fn sendKeymap(self: *VirtualKeyboard) !void {
-        var xkb = std.DynLib.open("libxkbcommon.so.0") catch return error.XkbUnavailable;
+        var xkb = wl.DynLib.open("libxkbcommon.so.0") catch return error.XkbUnavailable;
         defer xkb.close();
         const context_new = xkb.lookup(XkbContextNew, "xkb_context_new") orelse return error.XkbUnavailable;
         const keymap_new = xkb.lookup(XkbKeymapNewFromNames, "xkb_keymap_new_from_names") orelse return error.XkbUnavailable;

@@ -77,7 +77,7 @@ pub fn enterAppMainCallbacks(
             };
             app_state.user_data = ret_user_data;
             app_state_c.* = app_state;
-            return @intFromEnum(ret);
+            return @backingInt(ret);
         }
         pub fn iterate(app_state_c: ?*anyopaque) callconv(.c) c_uint {
             const app_state: *AppState = @ptrCast(@alignCast(app_state_c orelse return c.SDL_APP_FAILURE));
@@ -89,7 +89,7 @@ pub fn enterAppMainCallbacks(
                     }
                     return c.SDL_APP_FAILURE;
                 };
-                return @intFromEnum(ret);
+                return @backingInt(ret);
             }
             return c.SDL_APP_CONTINUE;
         }
@@ -103,14 +103,14 @@ pub fn enterAppMainCallbacks(
                     }
                     return c.SDL_APP_FAILURE;
                 };
-                return @intFromEnum(ret);
+                return @backingInt(ret);
             }
             return c.SDL_APP_CONTINUE;
         }
         pub fn quit(app_state_c: ?*anyopaque, result_c: c_uint) callconv(.c) void {
             const app_state: ?*AppState = if (app_state_c) |val| @ptrCast(@alignCast(val)) else null;
             if (app_quit) |cb| {
-                cb(if (app_state) |val| &val.user_data else null, @enumFromInt(result_c));
+                cb(if (app_state) |val| &val.user_data else null, @fromBackingInt(@intCast(result_c)));
             }
             if (app_state) |val| {
                 val.init.deinit(std.heap.c_allocator);

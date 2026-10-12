@@ -7,7 +7,7 @@ const test_io = std.testing.io;
 
 // Simple 8x1 XBM with alternating pixels: 10101010
 const simple_8x1_xbm =
-"#define test_width 8\n" ++
+    "#define test_width 8\n" ++
     "#define test_height 1\n" ++
     "static unsigned char test_bits[] = {\n" ++
     "  0xAA\n" ++
@@ -15,7 +15,7 @@ const simple_8x1_xbm =
 
 // 8x2 XBM with pattern: first row 10101010, second row 01010101
 const simple_8x2_xbm =
-"#define test_width 8\n" ++
+    "#define test_width 8\n" ++
     "#define test_height 2\n" ++
     "static unsigned char test_bits[] = {\n" ++
     "  0xAA, 0x55\n" ++
@@ -23,7 +23,7 @@ const simple_8x2_xbm =
 
 // 4x4 XBM with a simple pattern
 const simple_4x4_xbm =
-"#define test_width 4\n" ++
+    "#define test_width 4\n" ++
     "#define test_height 4\n" ++
     "static unsigned char test_bits[] = {\n" ++
     "  0x0F, 0x0F, 0xF0, 0xF0\n" ++

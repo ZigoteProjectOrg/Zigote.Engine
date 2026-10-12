@@ -49,7 +49,7 @@ pub const PowerState = enum(c.SDL_PowerState) {
         );
         const ret = try errors.wrapCall(c_int, val, c.SDL_POWERSTATE_ERROR);
         return .{
-            .state = @enumFromInt(ret),
+            .state = @fromBackingInt(@intCast(ret)),
             .seconds_left = if (seconds_left == -1) null else @intCast(seconds_left),
             .percent = if (percent == -1) null else @intCast(percent),
         };

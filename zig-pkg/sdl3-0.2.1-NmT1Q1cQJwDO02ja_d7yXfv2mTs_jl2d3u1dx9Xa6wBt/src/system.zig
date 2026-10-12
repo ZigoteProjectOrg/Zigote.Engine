@@ -57,7 +57,7 @@ pub fn getSandbox() ?Sandbox {
     const ret = c.SDL_GetSandbox();
     if (ret == c.SDL_SANDBOX_NONE)
         return null;
-    return @enumFromInt(ret);
+    return @fromBackingInt(@intCast(ret));
 }
 
 // isChromebook

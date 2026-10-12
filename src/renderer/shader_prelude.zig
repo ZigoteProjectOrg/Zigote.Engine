@@ -17,12 +17,16 @@ pub const fullscreen = @embedFile("shaders/common_fullscreen.wgsl") ++ "\n";
 /// `srgb_decode`. Prepend to anything that decodes an sRGB-encoded colour.
 pub const color = @embedFile("shaders/common_color.wgsl") ++ "\n";
 
+/// `sd_corner_rect` / `sd_squircle_rect`. `roundedClip` already carries it; prepend it yourself
+/// only to a shader that draws a rounded shape without the clip uniform (Liquid Glass).
+pub const corner = @embedFile("shaders/common_corner.wgsl") ++ "\n";
+
 const rounded_clip_template = @embedFile("shaders/common_rounded_clip.wgsl");
 
-/// `RoundedClip` + its uniform binding + `rounded_clip_coverage`, bound to `group`.
+/// `corner` + `RoundedClip` + its uniform binding + `rounded_clip_coverage`, bound to `group`.
 /// Shapes bind it at group 0; images and text at group 1.
 pub fn roundedClip(comptime group: u32) []const u8 {
-    return comptime replace(
+    return comptime corner ++ replace(
         rounded_clip_template,
         "$CLIP_GROUP",
         std.fmt.comptimePrint("{d}", .{group}),
@@ -65,6 +69,8 @@ test "prelude fragments declare what callers rely on" {
     try std.testing.expect(std.mem.indexOf(u8, fullscreen, "struct VOut") != null);
     try std.testing.expect(std.mem.indexOf(u8, color, "fn srgb_decode") != null);
     try std.testing.expect(std.mem.indexOf(u8, roundedClip(0), "fn rounded_clip_coverage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, roundedClip(0), "fn sd_corner_rect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, corner, "fn sd_squircle_rect") != null);
 }
 
 test "replace handles absent, single and repeated needles" {

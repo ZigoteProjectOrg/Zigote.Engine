@@ -120,9 +120,9 @@ pub const Outcome = struct {
     pub fn fromSdl(value: c.SDL_AsyncIOOutcome) Outcome {
         return .{
             .file = .{ .value = value.asyncio.? },
-            .task_type = @enumFromInt(value.type),
-            .result = @enumFromInt(value.result),
-            .buffer = @as([*]u8, @alignCast(@ptrCast(value.buffer.?)))[0..@intCast(value.bytes_transferred)],
+            .task_type = @fromBackingInt(@intCast(value.type)),
+            .result = @fromBackingInt(@intCast(value.result)),
+            .buffer = @as([*]u8, @ptrCast(@alignCast(value.buffer.?)))[0..@intCast(value.bytes_transferred)],
             .offset = @intCast(value.offset),
             .bytes_requested = @intCast(value.bytes_requested),
             .user_data = value.userdata,
@@ -133,8 +133,8 @@ pub const Outcome = struct {
     pub fn toSdl(self: Outcome) c.SDL_AsyncIOOutcome {
         return .{
             .asyncio = self.file.value,
-            .type = @intFromEnum(self.task_type),
-            .result = @intFromEnum(self.result),
+            .type = @backingInt(self.task_type),
+            .result = @backingInt(self.result),
             .buffer = self.buffer.ptr,
             .offset = @intCast(self.offset),
             .bytes_requested = @intCast(self.bytes_requested),

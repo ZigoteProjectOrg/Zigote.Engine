@@ -268,7 +268,7 @@ pub const Group = packed struct {
             self.value,
             name.ptr,
         ), c.SDL_PROPERTY_TYPE_INVALID) catch return null;
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 
     /// Return whether a property exists in a group of properties.

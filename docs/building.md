@@ -1,6 +1,6 @@
 # Building
 
-Requires **Zig 0.16+** (matching the toolchain the parent solution pins). Three build steps:
+Requires **Zig 0.17** (matching the toolchain the parent solution pins). Three build steps:
 
 ```bash
 zig build shared-lib     # build libzigote.dylib / zigote.dll / libzigote.so
@@ -34,21 +34,21 @@ passes `-Denable3d=false` yet still needs Jolt and flecs at runtime).
 | `-Denable3d`  | `true`                                            | Build the **Assimp** model importer (editor-only). Games load pre-baked `.zmesh`; the `.zmesh` parser stays ungated in `engine/resources/zmesh_format.zig`. The wgpu 3D renderer itself stays either way — its targets are allocated lazily, so a 2D app pays no runtime cost. |
 | `-Dphysics3d` | `true`                                            | Build the **Jolt** 3D physics FFI (`ffi/physics.zig` + the JoltC static lib). `false` swaps in `physics_stub.zig` — the `zigote_physics_*` wrappers still compile and link, as no-ops.                                                                                         |
 | `-Decs`       | `true`                                            | Build the **flecs** ECS FFI (`ffi/ecs.zig` + the flecs static lib). `false` drops the whole module — the `zigote_ecs_*` exports vanish, so a caller must never invoke them.                                                                                                    |
-| `-Dstrip`     | `true` for ReleaseFast/ReleaseSmall, else `false` | Strip debug info from the shared library. ELF embeds DWARF for every static dep straight into the `.so` (~90 MB of a 123 MB Linux build); stripping cuts it dramatically. Override with `-Dstrip=false` for a symbolized profiling build.                                      |
+| `-Dstrip`     | `true` for fast/small, else `false` | Strip debug info from the shared library. ELF embeds DWARF for every static dep straight into the `.so` (~90 MB of a 123 MB Linux build); stripping cuts it dramatically. Override with `-Dstrip=false` for a symbolized profiling build.                                      |
 
-Standard Zig options apply too: `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall` and
+Standard Zig options apply too: `-Doptimize=debug|safe|fast|small` (the 0.16 names `Debug|ReleaseSafe|ReleaseFast|ReleaseSmall` are still accepted, deprecated) and
 `-Dtarget=<triple>` for cross-compilation.
 
 **Lean 2D/UI build** (what a pure-widget app or a 2D game export uses):
 
 ```bash
-zig build shared-lib -Denable3d=false -Dphysics3d=false -Decs=false -Doptimize=ReleaseFast
+zig build shared-lib -Denable3d=false -Dphysics3d=false -Decs=false -Doptimize=fast
 ```
 
 **Game export build** (needs Jolt + flecs at runtime, drops Assimp, strips symbols):
 
 ```bash
-zig build shared-lib -Denable3d=false -Doptimize=ReleaseFast -Dstrip
+zig build shared-lib -Denable3d=false -Doptimize=fast -Dstrip
 ```
 
 ## Dependencies
@@ -101,8 +101,8 @@ Zig cross-compiles from any host. The lazy wgpu fetch means only the target's pr
 downloads. Example:
 
 ```bash
-zig build shared-lib -Dtarget=x86_64-linux-gnu  -Doptimize=ReleaseFast -Denable3d=false
-zig build shared-lib -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseFast -Denable3d=false
+zig build shared-lib -Dtarget=x86_64-linux-gnu  -Doptimize=fast -Denable3d=false
+zig build shared-lib -Dtarget=aarch64-linux-gnu -Doptimize=fast -Denable3d=false
 ```
 
 **macOS→macOS cross-arch needs the SDK as an explicit sysroot.** Zig only auto-detects the macOS
@@ -110,8 +110,15 @@ SDK for *native* targets; for `-Dtarget=x86_64-macos` from an arm64 Mac, SDL ref
 the framework links (miniaudio, Cocoa, wgpu's Metal deps) can't resolve without it:
 
 ```bash
-zig build shared-lib -Dtarget=x86_64-macos -Doptimize=ReleaseFast --sysroot "$(xcrun --show-sdk-path)"
+SDK="$(xcrun --show-sdk-path)"
+zig libc -target x86_64-macos > libc-macos.txt
+zig build shared-lib -Dtarget=x86_64-macos -Doptimize=fast \
+    --sysroot "$SDK" -Dsysroot="$SDK" --libc libc-macos.txt
 ```
+
+`-Dsysroot` repeats the path for `build.zig`: since Zig 0.17 a build script can no longer read
+`--sysroot` itself. `--libc` supplies the SDK's C headers, which a non-native target does not find
+on its own.
 
 (`build/Zigote.Native.targets` passes this automatically when publishing a foreign-arch macOS RID.)
 

@@ -60,7 +60,6 @@ const Entry = struct {
 /// `std.Io.Mutex` wants an `Io` handle the FFI layer has no reason to hold — the same trade
 /// root.zig and netstream.zig already make. It fits even better here: every critical section is a
 /// scan of at most 32 entries, and handlers are always called with the lock released.
-
 var entries: [max_channels]Entry = @splat(.{});
 var entry_count: usize = 0;
 var receiver: ?Receiver = null;

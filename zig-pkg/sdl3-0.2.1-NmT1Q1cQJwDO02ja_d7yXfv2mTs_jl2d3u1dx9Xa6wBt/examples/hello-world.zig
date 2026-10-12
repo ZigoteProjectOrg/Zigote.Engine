@@ -34,10 +34,10 @@ pub fn main() !void {
 
         // Event logic.
         while (sdl3.events.poll()) |event|
-        switch (event) {
-            .quit => quit = true,
-            .terminating => quit = true,
-            else => {},
-        };
+            switch (event) {
+                .quit => quit = true,
+                .terminating => quit = true,
+                else => {},
+            };
     }
 }

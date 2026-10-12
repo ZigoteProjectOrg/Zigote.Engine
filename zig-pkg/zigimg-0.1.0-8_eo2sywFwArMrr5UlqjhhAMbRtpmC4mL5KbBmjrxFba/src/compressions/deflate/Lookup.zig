@@ -58,9 +58,9 @@ pub fn bulkAdd(self: *Self, data: []const u8, len: u16, pos: u16) void {
     }
     var hb =
         @as(u32, data[3]) |
-            @as(u32, data[2]) << 8 |
-            @as(u32, data[1]) << 16 |
-            @as(u32, data[0]) << 24;
+        @as(u32, data[2]) << 8 |
+        @as(u32, data[1]) << 16 |
+        @as(u32, data[0]) << 24;
     _ = self.set(hashu(hb), pos);
 
     var i = pos;

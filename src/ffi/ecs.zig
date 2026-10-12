@@ -15,9 +15,7 @@
 const std = @import("std");
 const ZgStatus = @import("zigote_abi").ZgStatus;
 
-pub const flecs = @cImport({
-    @cInclude("flecs.h");
-});
+pub const flecs = @import("flecs_c");
 
 // ── Handle helpers ─────────────────────────────────────────────────────────────
 //

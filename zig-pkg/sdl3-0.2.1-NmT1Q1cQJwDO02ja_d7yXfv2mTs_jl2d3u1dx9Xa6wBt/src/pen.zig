@@ -57,7 +57,7 @@ pub const DeviceType = enum(c.SDL_PenDeviceType) {
         }
         if (value == c.SDL_PEN_DEVICE_TYPE_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 };
 

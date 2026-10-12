@@ -31,13 +31,13 @@ pub const Axis = enum(c.SDL_GamepadAxis) {
     pub fn fromSdl(value: c_int) ?Axis {
         if (value == c.SDL_GAMEPAD_AXIS_INVALID)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to SDL.
     pub fn toSdl(self: ?Axis) c_int {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_GAMEPAD_AXIS_INVALID;
     }
 
@@ -140,7 +140,7 @@ pub const Binding = struct {
                 } },
                 c.SDL_GAMEPAD_BINDTYPE_HAT => .{ .hat = .{
                     .index = @intCast(ptr.input.hat.hat),
-                    .type = @enumFromInt(ptr.input.hat.hat_mask),
+                    .type = @fromBackingInt(@intCast(ptr.input.hat.hat_mask)),
                 } },
                 else => .{
                     .button = @intCast(ptr.input.button),
@@ -148,12 +148,12 @@ pub const Binding = struct {
             },
             .output = switch (ptr.output_type) {
                 c.SDL_GAMEPAD_BINDTYPE_AXIS => .{ .axis = .{
-                    .index = @enumFromInt(ptr.output.axis.axis),
+                    .index = @fromBackingInt(@intCast(ptr.output.axis.axis)),
                     .min = @intCast(ptr.output.axis.axis_min),
                     .max = @intCast(ptr.output.axis.axis_max),
                 } },
                 else => .{
-                    .button = @enumFromInt(ptr.output.button),
+                    .button = @fromBackingInt(@intCast(ptr.output.button)),
                 },
             },
         };
@@ -176,7 +176,7 @@ pub const Binding = struct {
         switch (self.input) {
             .button => |val| ret.input.button = @intCast(val),
             .axis => |val| ret.input.axis = .{ .axis = @intCast(val.index), .axis_min = @intCast(val.min), .axis_max = @intCast(val.max) },
-            .hat => |val| ret.input.hat = .{ .hat = @intCast(val.index), .hat_mask = @intFromEnum(val.type) },
+            .hat => |val| ret.input.hat = .{ .hat = @intCast(val.index), .hat_mask = @backingInt(val.type) },
         }
         switch (self.output) {
             .button => |val| ret.output.button = Button.toSdl(val),
@@ -204,13 +204,13 @@ pub const BindingType = enum(c.SDL_GamepadBindingType) {
     pub fn fromSdl(value: c.SDL_GamepadBindingType) ?BindingType {
         if (value == c.SDL_GAMEPAD_BINDTYPE_NONE)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to SDL.
     pub fn toSdl(self: ?BindingType) c.SDL_GamepadBindingType {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_GAMEPAD_BINDTYPE_NONE;
     }
 };
@@ -279,13 +279,13 @@ pub const Button = enum(c.SDL_GamepadButton) {
     pub fn fromSdl(value: c.SDL_GamepadButton) ?Button {
         if (value == c.SDL_GAMEPAD_BUTTON_INVALID)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to SDL.
     pub fn toSdl(self: ?Button) c.SDL_GamepadButton {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_GAMEPAD_BUTTON_INVALID;
     }
 
@@ -353,13 +353,13 @@ pub const ButtonLabel = enum(c.SDL_GamepadButtonLabel) {
     pub fn fromSdl(value: c.SDL_GamepadButtonLabel) ?ButtonLabel {
         if (value == c.SDL_GAMEPAD_BUTTON_LABEL_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to SDL.
     pub fn toSdl(self: ?ButtonLabel) c.SDL_GamepadButtonLabel {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_GAMEPAD_BUTTON_LABEL_UNKNOWN;
     }
 };
@@ -837,7 +837,7 @@ pub const Gamepad = struct {
             self.value,
             &percent,
         );
-        return .{ @enumFromInt(try errors.wrapCall(c_int, ret, c.SDL_POWERSTATE_ERROR)), if (percent == -1) null else @intCast(percent) };
+        return .{ @fromBackingInt(@intCast(try errors.wrapCall(c_int, ret, c.SDL_POWERSTATE_ERROR))), if (percent == -1) null else @intCast(percent) };
     }
 
     /// Get the USB product ID of an opened gamepad, if available.
@@ -1306,13 +1306,13 @@ pub const Type = enum(c.SDL_GamepadType) {
     pub fn fromSdl(value: c.SDL_GamepadType) ?Type {
         if (value == c.SDL_GAMEPAD_TYPE_UNKNOWN)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to SDL.
     pub fn toSdl(self: ?Type) c.SDL_GamepadType {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_GAMEPAD_TYPE_UNKNOWN;
     }
 
@@ -1351,7 +1351,7 @@ pub const Type = enum(c.SDL_GamepadType) {
         button_type: Type,
         button: Button,
     ) ButtonLabel {
-        return @enumFromInt(c.SDL_GetGamepadButtonLabelForType(Type.toSdl(button_type), Button.toSdl(button)));
+        return @fromBackingInt(@intCast(c.SDL_GetGamepadButtonLabelForType(Type.toSdl(button_type), Button.toSdl(button))));
     }
 
     /// Convert from a type enum to a string.

@@ -85,15 +85,15 @@ pub const Process = extern struct {
             if (self.working_directory) |val|
                 try ret.set(c.SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, .{ .string = val });
             if (self.stdin) |val|
-                try ret.set(c.SDL_PROP_PROCESS_CREATE_STDIN_NUMBER, .{ .number = @intFromEnum(val) });
+                try ret.set(c.SDL_PROP_PROCESS_CREATE_STDIN_NUMBER, .{ .number = @backingInt(val) });
             if (self.stdin_redirect) |val|
                 try ret.set(c.SDL_PROP_PROCESS_CREATE_STDIN_POINTER, .{ .pointer = val.value });
             if (self.stdout) |val|
-                try ret.set(c.SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, .{ .number = @intFromEnum(val) });
+                try ret.set(c.SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, .{ .number = @backingInt(val) });
             if (self.stdout_redirect) |val|
                 try ret.set(c.SDL_PROP_PROCESS_CREATE_STDOUT_POINTER, .{ .pointer = val.value });
             if (self.stderr) |val|
-                try ret.set(c.SDL_PROP_PROCESS_CREATE_STDERR_NUMBER, .{ .number = @intFromEnum(val) });
+                try ret.set(c.SDL_PROP_PROCESS_CREATE_STDERR_NUMBER, .{ .number = @backingInt(val) });
             if (self.stderr_redirect) |val|
                 try ret.set(c.SDL_PROP_PROCESS_CREATE_STDERR_POINTER, .{ .pointer = val.value });
             if (self.stderr_to_stdout) |val|

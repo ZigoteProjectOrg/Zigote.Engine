@@ -16,6 +16,18 @@ const std = @import("std");
 const wayland_toplevel = @import("wayland_toplevel.zig");
 const wayland_vkbd = @import("wayland_vkbd.zig");
 
+/// std.DynLib has no Windows implementation, and there is no Wayland there to load: a stand-in
+/// whose `open` always fails keeps the Wayland files compiling for that target.
+pub const DynLib = if (@import("builtin").os.tag == .windows) struct {
+    pub fn open(_: []const u8) error{FileNotFound}!@This() {
+        return error.FileNotFound;
+    }
+    pub fn close(_: *@This()) void {}
+    pub fn lookup(_: *@This(), comptime T: type, _: [:0]const u8) ?T {
+        return null;
+    }
+} else std.DynLib;
+
 pub const Layer = enum(u32) { background = 0, bottom = 1, top = 2, overlay = 3 };
 /// Bitmask, matching zwlr_layer_surface_v1.anchor: top=1, bottom=2, left=4, right=8.
 pub const Anchor = u32;
@@ -72,7 +84,7 @@ const DestroyFn = *const fn (*Proxy) callconv(.c) void;
 const RoundtripFn = *const fn (*Proxy) callconv(.c) c_int;
 
 pub const Lib = struct {
-    handle: std.DynLib,
+    handle: DynLib,
     marshal: MarshalFn,
     add_listener: AddListenerFn,
     get_version: GetVersionFn,
@@ -89,7 +101,7 @@ pub const Lib = struct {
 
     pub fn get() !*Lib {
         if (cached) |*l| return l;
-        var handle = std.DynLib.open("libwayland-client.so.0") catch return error.WaylandClientUnavailable;
+        var handle = DynLib.open("libwayland-client.so.0") catch return error.WaylandClientUnavailable;
         errdefer handle.close();
         const l = Lib{
             .handle = handle,
@@ -304,7 +316,7 @@ pub const LayerSurface = struct {
         const self = try alloc.create(LayerSurface);
         errdefer alloc.destroy(self);
 
-        var get_args = [_]WlArgument{ .{ .n = 0 }, .{ .o = surface }, .{ .o = opts.output }, .{ .u = @intFromEnum(opts.layer) }, .{ .s = "zigote-shell" } };
+        var get_args = [_]WlArgument{ .{ .n = 0 }, .{ .o = surface }, .{ .o = opts.output }, .{ .u = @backingInt(opts.layer) }, .{ .s = "zigote-shell" } };
         const ls = lib.marshal(layer_shell, 0, &layer_surface_interface, lib.get_version(layer_shell), 0, &get_args) orelse return error.LayerSurfaceUnavailable;
 
         self.* = .{ .lib = lib, .registry = g.registry, .layer_shell = layer_shell, .compositor = g.compositor, .surface = surface, .layer_surface = ls };
@@ -317,7 +329,7 @@ pub const LayerSurface = struct {
         _ = lib.marshal(ls, LS_SET_ANCHOR, null, v, 0, &anchor_args);
         var zone_args = [_]WlArgument{.{ .i = opts.exclusive_zone }};
         _ = lib.marshal(ls, LS_SET_EXCLUSIVE_ZONE, null, v, 0, &zone_args);
-        var kb_args = [_]WlArgument{.{ .u = @intFromEnum(opts.keyboard) }};
+        var kb_args = [_]WlArgument{.{ .u = @backingInt(opts.keyboard) }};
         _ = lib.marshal(ls, LS_SET_KEYBOARD_INTERACTIVITY, null, v, 0, &kb_args);
 
         // A commit with no buffer asks for the first configure; nothing may be attached before

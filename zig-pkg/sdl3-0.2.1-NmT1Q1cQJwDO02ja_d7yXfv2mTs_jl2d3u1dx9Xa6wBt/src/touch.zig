@@ -139,7 +139,7 @@ pub const Id = packed struct {
         const ret = c.SDL_GetTouchDeviceType(self.value);
         if (ret == c.SDL_TOUCH_DEVICE_INVALID)
             return null;
-        return @enumFromInt(ret);
+        return @fromBackingInt(@intCast(ret));
     }
 };
 

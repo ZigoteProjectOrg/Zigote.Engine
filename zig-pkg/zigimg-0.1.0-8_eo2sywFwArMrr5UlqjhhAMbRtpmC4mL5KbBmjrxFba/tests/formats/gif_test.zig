@@ -1026,15 +1026,15 @@ fn doGifRoundtripTest(entry_name: []const u8) !RoundtripResult {
     // Verify dimensions match
     if (original_gif.header.width != decoded_gif.header.width or
         original_gif.header.height != decoded_gif.header.height)
-        {
-            std.debug.print("FAIL (dimension mismatch: {}x{} vs {}x{})\n", .{
-                original_gif.header.width,
-                original_gif.header.height,
-                decoded_gif.header.width,
-                decoded_gif.header.height,
-            });
-            return .failed;
-        }
+    {
+        std.debug.print("FAIL (dimension mismatch: {}x{} vs {}x{})\n", .{
+            original_gif.header.width,
+            original_gif.header.height,
+            decoded_gif.header.width,
+            decoded_gif.header.height,
+        });
+        return .failed;
+    }
 
     // Verify we got at least one frame
     if (decoded_frames.items.len == 0) {

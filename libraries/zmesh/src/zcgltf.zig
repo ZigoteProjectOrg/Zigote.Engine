@@ -1043,9 +1043,9 @@ test {
 
 test "extern struct layout" {
     @setEvalBranchQuota(10_000);
-    const c = @cImport(@cInclude("cgltf.h"));
+    const c = @import("cgltf_c"); // cgltf.h translated by the host build (zig 0.17 removed @cImport)
     inline for (comptime std.meta.declarations(@This())) |decl| {
-        const ZigType = @field(@This(), decl.name);
+        const ZigType = @field(@This(), decl);
         if (@TypeOf(ZigType) != type) {
             continue;
         }
@@ -1053,21 +1053,21 @@ test "extern struct layout" {
             @typeInfo(ZigType).@"struct".layout == .@"extern")
         {
             comptime var c_name_buf: [256]u8 = undefined;
-            const c_name = comptime try cTypeNameFromZigTypeName(&c_name_buf, decl.name);
+            const c_name = comptime try cTypeNameFromZigTypeName(&c_name_buf, decl);
             const CType = @field(c, c_name);
             std.testing.expectEqual(@sizeOf(CType), @sizeOf(ZigType)) catch |err| {
-                std.log.err("@sizeOf({s}) != @sizeOf({s})", .{ decl.name, c_name });
+                std.log.err("@sizeOf({s}) != @sizeOf({s})", .{ decl, c_name });
                 return err;
             };
             comptime var i: usize = 0;
-            inline for (comptime std.meta.fieldNames(CType)) |c_field_name| {
+            inline for (comptime @typeInfo(CType).@"struct".field_names) |c_field_name| {
                 std.testing.expectEqual(
                     @offsetOf(CType, c_field_name),
-                    @offsetOf(ZigType, std.meta.fieldNames(ZigType)[i]),
+                    @offsetOf(ZigType, @typeInfo(ZigType).@"struct".field_names[i]),
                 ) catch |err| {
                     std.log.err(
                         "@offsetOf({s}, {s}) != @offsetOf({s}, {s})",
-                        .{ decl.name, std.meta.fieldNames(ZigType)[i], c_name, c_field_name },
+                        .{ decl, @typeInfo(ZigType).@"struct".field_names[i], c_name, c_field_name },
                     );
                     return err;
                 };
@@ -1079,21 +1079,21 @@ test "extern struct layout" {
 
 test "enum" {
     @setEvalBranchQuota(10_000);
-    const c = @cImport(@cInclude("cgltf.h"));
+    const c = @import("cgltf_c"); // cgltf.h translated by the host build (zig 0.17 removed @cImport)
     inline for (comptime std.meta.declarations(@This())) |decl| {
-        const ZigType = @field(@This(), decl.name);
+        const ZigType = @field(@This(), decl);
         if (@TypeOf(ZigType) != type) {
             continue;
         }
         if (comptime std.meta.activeTag(@typeInfo(ZigType)) == .@"enum") {
             comptime var c_name_buf: [256]u8 = undefined;
-            const c_name = comptime try cTypeNameFromZigTypeName(&c_name_buf, decl.name);
+            const c_name = comptime try cTypeNameFromZigTypeName(&c_name_buf, decl);
             const CType = @field(c, c_name);
             std.testing.expectEqual(@sizeOf(CType), @sizeOf(ZigType)) catch |err| {
-                std.log.err("@sizeOf({s}) != @sizeOf({s})", .{ decl.name, c_name });
+                std.log.err("@sizeOf({s}) != @sizeOf({s})", .{ decl, c_name });
                 return err;
             };
-            inline for (comptime std.meta.fieldNames(ZigType)) |field_name| {
+            inline for (comptime @typeInfo(ZigType).@"struct".field_names) |field_name| {
                 const c_field_name = comptime buildName: {
                     var buf: [256]u8 = undefined;
                     var fbs = std.io.fixedBufferStream(&buf);
@@ -1104,9 +1104,9 @@ test "enum" {
                 };
                 std.testing.expectEqual(
                     @field(c, c_field_name),
-                    @intFromEnum(@field(ZigType, field_name)),
+                    @backingInt(@field(ZigType, field_name)),
                 ) catch |err| {
-                    std.log.err(decl.name ++ "." ++ field_name ++ " != " ++ c_field_name, .{});
+                    std.log.err(decl ++ "." ++ field_name ++ " != " ++ c_field_name, .{});
                     return err;
                 };
             }

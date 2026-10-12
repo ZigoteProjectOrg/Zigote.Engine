@@ -24,7 +24,7 @@ pub fn setup(
     extension_config: ExtensionConfig,
     options: Options,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) void {
     const upstream = b.lazyDependency("sdl_image", .{}) orelse return;
 

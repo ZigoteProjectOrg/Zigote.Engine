@@ -322,13 +322,13 @@ pub const PathType = enum(c.SDL_PathType) {
     pub fn fromSdl(value: c.SDL_PathType) ?PathType {
         if (value == c.SDL_PATHTYPE_NONE)
             return null;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     /// Convert to an SDL value.
     pub fn toSdl(self: ?PathType) c.SDL_PathType {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_PATHTYPE_NONE;
     }
 };
@@ -416,7 +416,7 @@ pub fn enumerateDirectory(
             dir_name_c: [*c]const u8,
             name_c: [*c]const u8,
         ) callconv(.c) c.SDL_EnumerationResult {
-            return @intFromEnum(callback(@ptrCast(@alignCast(user_data_c)), std.mem.span(dir_name_c), std.mem.span(name_c)));
+            return @backingInt(callback(@ptrCast(@alignCast(user_data_c)), std.mem.span(dir_name_c), std.mem.span(name_c)));
         }
     };
     return errors.wrapCallBool(c.SDL_EnumerateDirectory(path.ptr, Cb.run, @ptrCast(user_data)));
@@ -642,7 +642,7 @@ pub fn getPrefPath(
 pub fn getUserFolder(
     folder: Folder,
 ) ![:0]const u8 {
-    return errors.wrapCallCString(c.SDL_GetUserFolder(@intFromEnum(folder)));
+    return errors.wrapCallCString(c.SDL_GetUserFolder(@backingInt(folder)));
 }
 
 /// Enumerate a directory tree, filtered by pattern, and return a list.

@@ -165,7 +165,7 @@ pub const Group = enum {
         self: Group,
         event_type: Type,
     ) bool {
-        const raw: c.SDL_EventType = @intFromEnum(event_type);
+        const raw: c.SDL_EventType = @backingInt(event_type);
         const min, const max = self.minMax();
         return raw >= min and raw <= max;
     }
@@ -596,7 +596,7 @@ pub const Common = struct {
     pub fn toSdl(self: Common, event_type: Type) c.SDL_Event {
         return .{
             .common = .{
-                .type = @intFromEnum(event_type),
+                .type = @backingInt(event_type),
                 .timestamp = self.timestamp,
             },
         };
@@ -646,7 +646,7 @@ pub const DisplayOrientation = struct {
         return .{
             .common = Common.fromSdl(val),
             .display = .{ .value = val.display.displayID },
-            .orientation = @enumFromInt(val.display.data1),
+            .orientation = @fromBackingInt(@intCast(val.display.data1)),
         };
     }
 
@@ -654,7 +654,7 @@ pub const DisplayOrientation = struct {
     pub fn toSdl(self: DisplayOrientation, event_type: Type) c.SDL_Event {
         var ret = self.common.toSdl(event_type);
         ret.display.displayID = self.display.value;
-        ret.display.data1 = @intCast(@intFromEnum(self.orientation));
+        ret.display.data1 = @intCast(@backingInt(self.orientation));
         return ret;
     }
 };
@@ -830,7 +830,7 @@ pub const GamepadAxis = struct {
         return .{
             .common = Common.fromSdl(val),
             .id = .{ .value = val.gaxis.which },
-            .axis = @enumFromInt(val.gaxis.axis),
+            .axis = @fromBackingInt(@intCast(val.gaxis.axis)),
             .value = val.gaxis.value,
         };
     }
@@ -839,7 +839,7 @@ pub const GamepadAxis = struct {
     pub fn toSdl(self: GamepadAxis, event_type: Type) c.SDL_Event {
         var ret = self.common.toSdl(event_type);
         ret.gaxis.which = self.id.value;
-        ret.gaxis.axis = @intCast(@intFromEnum(self.axis));
+        ret.gaxis.axis = @intCast(@backingInt(self.axis));
         ret.gaxis.value = self.value;
         return ret;
     }
@@ -864,7 +864,7 @@ pub const GamepadButton = struct {
         return .{
             .common = Common.fromSdl(val),
             .id = .{ .value = val.gbutton.which },
-            .button = @enumFromInt(val.gbutton.button),
+            .button = @fromBackingInt(@intCast(val.gbutton.button)),
             .down = val.gbutton.down,
         };
     }
@@ -873,7 +873,7 @@ pub const GamepadButton = struct {
     pub fn toSdl(self: GamepadButton, event_type: Type) c.SDL_Event {
         var ret = self.common.toSdl(event_type);
         ret.gbutton.which = self.id.value;
-        ret.gbutton.button = @intCast(@intFromEnum(self.button));
+        ret.gbutton.button = @intCast(@backingInt(self.button));
         ret.gbutton.down = self.down;
         return ret;
     }
@@ -926,7 +926,7 @@ pub const GamepadSensor = struct {
         return .{
             .common = Common.fromSdl(val),
             .id = .{ .value = val.gsensor.which },
-            .sensor_type = @enumFromInt(val.gsensor.type),
+            .sensor_type = @fromBackingInt(@intCast(val.gsensor.type)),
             .data = val.gsensor.data,
             .sensor_timestamp = val.gsensor.sensor_timestamp,
         };
@@ -936,7 +936,7 @@ pub const GamepadSensor = struct {
     pub fn toSdl(self: GamepadSensor, event_type: Type) c.SDL_Event {
         var ret = self.common.toSdl(event_type);
         ret.gsensor.which = self.id.value;
-        ret.gsensor.type = @bitCast(@intFromEnum(self.sensor_type));
+        ret.gsensor.type = @bitCast(@backingInt(self.sensor_type));
         ret.gsensor.data = self.data;
         ret.gsensor.sensor_timestamp = self.sensor_timestamp;
         return ret;
@@ -1080,7 +1080,7 @@ pub const JoystickBattery = struct {
         return .{
             .common = Common.fromSdl(val),
             .id = .{ .value = val.jbattery.which },
-            .state = @enumFromInt(val.jbattery.state),
+            .state = @fromBackingInt(@intCast(val.jbattery.state)),
             .percent = @intCast(val.jbattery.percent),
         };
     }
@@ -1089,7 +1089,7 @@ pub const JoystickBattery = struct {
     pub fn toSdl(self: JoystickBattery, event_type: Type) c.SDL_Event {
         var ret = self.common.toSdl(event_type);
         ret.jbattery.which = self.id.value;
-        ret.jbattery.state = @intFromEnum(self.state);
+        ret.jbattery.state = @backingInt(self.state);
         ret.jbattery.percent = @intCast(self.percent);
         return ret;
     }
@@ -1181,7 +1181,7 @@ pub const JoystickHat = struct {
             .common = Common.fromSdl(val),
             .id = .{ .value = val.jhat.which },
             .index = @intCast(val.jhat.hat),
-            .value = @enumFromInt(val.jhat.value),
+            .value = @fromBackingInt(@intCast(val.jhat.value)),
         };
     }
 
@@ -1190,7 +1190,7 @@ pub const JoystickHat = struct {
         var ret = self.common.toSdl(event_type);
         ret.jhat.which = self.id.value;
         ret.jhat.hat = @intCast(self.index);
-        ret.jhat.value = @intFromEnum(self.value);
+        ret.jhat.value = @backingInt(self.value);
         return ret;
     }
 };
@@ -1307,7 +1307,7 @@ pub const MouseButton = struct {
             .common = Common.fromSdl(val),
             .window_id = if (val.button.windowID == 0) null else val.button.windowID,
             .id = if (val.button.which == 0) null else .{ .value = val.button.which },
-            .button = @enumFromInt(val.button.button),
+            .button = @fromBackingInt(@intCast(val.button.button)),
             .down = val.button.down,
             .clicks = val.button.clicks,
             .x = val.button.x,
@@ -1320,7 +1320,7 @@ pub const MouseButton = struct {
         var ret = self.common.toSdl(event_type);
         ret.button.windowID = self.window_id orelse 0;
         ret.button.which = if (self.id) |val| val.value else 0;
-        ret.button.button = @intFromEnum(self.button);
+        ret.button.button = @backingInt(self.button);
         ret.button.down = self.down;
         ret.button.clicks = self.clicks;
         ret.button.x = self.x;
@@ -1440,7 +1440,7 @@ pub const MouseWheel = struct {
             .id = if (val.wheel.which == 0) null else .{ .value = val.wheel.which },
             .scroll_x = val.wheel.x,
             .scroll_y = val.wheel.y,
-            .direction = @enumFromInt(val.wheel.direction),
+            .direction = @fromBackingInt(@intCast(val.wheel.direction)),
             .x = val.wheel.mouse_x,
             .y = val.wheel.mouse_y,
             // .x_int = val.wheel.integer_x,
@@ -1455,7 +1455,7 @@ pub const MouseWheel = struct {
         ret.wheel.which = if (self.id) |val| val.value else 0;
         ret.wheel.x = self.scroll_x;
         ret.wheel.y = self.scroll_y;
-        ret.wheel.direction = @intFromEnum(self.direction);
+        ret.wheel.direction = @backingInt(self.direction);
         ret.wheel.mouse_x = self.x;
         ret.wheel.mouse_y = self.y;
         return ret;
@@ -1496,7 +1496,7 @@ pub const PenAxis = struct {
             .state = pen.InputFlags.fromSdl(val.paxis.pen_state),
             .x = val.paxis.x,
             .y = val.paxis.y,
-            .axis = @enumFromInt(val.paxis.axis),
+            .axis = @fromBackingInt(@intCast(val.paxis.axis)),
             .value = val.paxis.value,
         };
     }
@@ -1509,7 +1509,7 @@ pub const PenAxis = struct {
         ret.paxis.pen_state = self.state.toSdl();
         ret.paxis.x = self.x;
         ret.paxis.y = self.y;
-        ret.paxis.axis = @intCast(@intFromEnum(self.axis));
+        ret.paxis.axis = @intCast(@backingInt(self.axis));
         ret.paxis.value = self.value;
         return ret;
     }
@@ -2957,7 +2957,7 @@ pub fn available() bool {
 pub fn enabled(
     event_type: Type,
 ) bool {
-    return c.SDL_EventEnabled(@intFromEnum(event_type));
+    return c.SDL_EventEnabled(@backingInt(event_type));
 }
 
 /// Run a specific filter function on the current event queue, removing any events for which the filter returns false.
@@ -3017,7 +3017,7 @@ pub fn filter(
 pub fn flush(
     event_type: Type,
 ) void {
-    c.SDL_FlushEvent(@intFromEnum(event_type));
+    c.SDL_FlushEvent(@backingInt(event_type));
 }
 
 /// Clear events of a range of types from the event queue.
@@ -3084,7 +3084,7 @@ pub fn getFilter() ?struct { FilterC, ?*anyopaque } {
 pub fn has(
     event_type: Type,
 ) bool {
-    return c.SDL_HasEvent(@intFromEnum(event_type));
+    return c.SDL_HasEvent(@backingInt(event_type));
 }
 
 /// Check for the existence of certain event types in the event queue.
@@ -3145,7 +3145,7 @@ pub fn peep(
     // \--------------------------/
     // Coping shorter item to longer item can only destroy source item but not any item before.
     const raw: [*]c.SDL_Event = @ptrCast(events.ptr);
-    const ret = c.SDL_PeepEvents(raw, @intCast(events.len), @intFromEnum(action), min, max);
+    const ret = c.SDL_PeepEvents(raw, @intCast(events.len), @backingInt(action), min, max);
     for (0..@intCast(ret)) |ind| {
         const rev_ind = events.len - ind - 1;
         events[rev_ind] = Event.fromSdl(raw[rev_ind]);
@@ -3178,7 +3178,7 @@ pub fn peepSize(
     group: Group,
 ) !usize {
     const min, const max = group.minMax();
-    const ret = c.SDL_PeepEvents(null, @intCast(num_events), @intFromEnum(action), min, max);
+    const ret = c.SDL_PeepEvents(null, @intCast(num_events), @backingInt(action), min, max);
     return @intCast(try errors.wrapCall(c_int, ret, -1));
 }
 
@@ -3326,7 +3326,7 @@ pub fn setEnabled(
     event_type: Type,
     enable: bool,
 ) void {
-    c.SDL_SetEventEnabled(@intFromEnum(event_type), enable);
+    c.SDL_SetEventEnabled(@backingInt(event_type), enable);
 }
 
 /// Set up a filter to process all events before they are added to the internal event queue.

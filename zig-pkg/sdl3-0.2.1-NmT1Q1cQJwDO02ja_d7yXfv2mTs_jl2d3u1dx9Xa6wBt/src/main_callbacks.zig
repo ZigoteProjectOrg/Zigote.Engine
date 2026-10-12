@@ -5,20 +5,13 @@ const root = @import("root");
 const sdl3 = @import("sdl3.zig");
 const std = @import("std");
 
-comptime {
-    _ = @cImport({
-        @cDefine("SDL_MAIN_USE_CALLBACKS", {});
-        @cInclude("SDL3/SDL_main.h");
-    });
-}
-
 const AppState = struct {
     init: *sdl3.Init,
     user_data: *anyopaque,
 };
 
 fn getAppStateType() type {
-    return @typeInfo(@typeInfo(@typeInfo(@TypeOf(root.init)).@"fn".return_type.?).error_union.payload).@"struct".fields[0].type;
+    return @typeInfo(@typeInfo(@typeInfo(@TypeOf(root.init)).@"fn".return_type.?).error_union.payload).@"struct".field_types[0];
 }
 
 /// This will be called once before anything else.
@@ -79,11 +72,11 @@ pub export fn SDL_AppInit(
             @typeInfo(init_info.@"fn".return_type.?) != .error_union or
             @typeInfo(@typeInfo(init_info.@"fn".return_type.?).error_union.payload) != .@"struct" or
             !@typeInfo(@typeInfo(init_info.@"fn".return_type.?).error_union.payload).@"struct".is_tuple or
-            @typeInfo(@typeInfo(init_info.@"fn".return_type.?).error_union.payload).@"struct".fields.len != 2 or
-            @typeInfo(@typeInfo(init_info.@"fn".return_type.?).error_union.payload).@"struct".fields[1].type != sdl3.AppResult)
-            {
-                @compileError("The init function must be type fn (sdl3.Init) !struct { AppState, sdl3.AppResult } not " ++ @typeName(@TypeOf(root.init)));
-            }
+            @typeInfo(@typeInfo(init_info.@"fn".return_type.?).error_union.payload).@"struct".field_names.len != 2 or
+            @typeInfo(@typeInfo(init_info.@"fn".return_type.?).error_union.payload).@"struct".field_types[1] != sdl3.AppResult)
+        {
+            @compileError("The init function must be type fn (sdl3.Init) !struct { AppState, sdl3.AppResult } not " ++ @typeName(@TypeOf(root.init)));
+        }
     }
 
     app_state.* = null;
@@ -112,7 +105,7 @@ pub export fn SDL_AppInit(
     };
     @as(*getAppStateType(), @ptrCast(@alignCast(state.user_data))).* = ret_user_data;
     app_state.* = state;
-    return @intFromEnum(ret);
+    return @backingInt(ret);
 }
 
 /// This is called over and over, possibly at the refresh rate of the display or some other metric that the platform dictates.
@@ -177,9 +170,9 @@ pub export fn SDL_AppIterate(
                 fn_info.@"fn".return_type == null or
                 @typeInfo(fn_info.@"fn".return_type.?) != .error_union or
                 @typeInfo(fn_info.@"fn".return_type.?).error_union.payload != sdl3.AppResult)
-                {
-                    @compileError("The iterate function must be type fn (" ++ @typeName(*getAppStateType()) ++ ") !sdl3.AppResult not " ++ @typeName(@TypeOf(root.iterate)));
-                }
+            {
+                @compileError("The iterate function must be type fn (" ++ @typeName(*getAppStateType()) ++ ") !sdl3.AppResult not " ++ @typeName(@TypeOf(root.iterate)));
+            }
         }
     }
 
@@ -192,7 +185,7 @@ pub export fn SDL_AppIterate(
             }
             return c.SDL_APP_FAILURE;
         };
-        return @intFromEnum(ret);
+        return @backingInt(ret);
     } else return c.SDL_APP_CONTINUE;
 }
 
@@ -251,9 +244,9 @@ pub export fn SDL_AppEvent(
                 fn_info.@"fn".return_type == null or
                 @typeInfo(fn_info.@"fn".return_type.?) != .error_union or
                 @typeInfo(fn_info.@"fn".return_type.?).error_union.payload != sdl3.AppResult)
-                {
-                    @compileError("The event function must be type fn (" ++ @typeName(*getAppStateType()) ++ ", sdl3.events.Event) !sdl3.AppResult not " ++ @typeName(@TypeOf(root.event)));
-                }
+            {
+                @compileError("The event function must be type fn (" ++ @typeName(*getAppStateType()) ++ ", sdl3.events.Event) !sdl3.AppResult not " ++ @typeName(@TypeOf(root.event)));
+            }
         }
     }
 
@@ -266,7 +259,7 @@ pub export fn SDL_AppEvent(
             }
             return c.SDL_APP_FAILURE;
         };
-        return @intFromEnum(ret);
+        return @backingInt(ret);
     } else return c.SDL_APP_CONTINUE;
 }
 
@@ -320,15 +313,15 @@ pub export fn SDL_AppQuit(
                 fn_info.@"fn".params[0].type != ?*getAppStateType() or
                 fn_info.@"fn".params[1].type != sdl3.AppResult or
                 fn_info.@"fn".return_type != void)
-                {
-                    @compileError("The quit function must be type fn (" ++ @typeName(?*getAppStateType()) ++ ", sdl3.AppResult) void not " ++ @typeName(@TypeOf(root.quit)));
-                }
+            {
+                @compileError("The quit function must be type fn (" ++ @typeName(?*getAppStateType()) ++ ", sdl3.AppResult) void not " ++ @typeName(@TypeOf(root.quit)));
+            }
         }
     }
 
     const state: ?*AppState = if (app_state) |val| @ptrCast(@alignCast(val)) else null;
     if (@hasDecl(root, "quit")) {
-        root.quit(if (state) |val| @ptrCast(@alignCast(val.user_data)) else null, @enumFromInt(result));
+        root.quit(if (state) |val| @ptrCast(@alignCast(val.user_data)) else null, @fromBackingInt(@intCast(result)));
     }
     if (state) |val| {
         std.heap.c_allocator.destroy(@as(*getAppStateType(), @ptrCast(@alignCast(val.user_data))));

@@ -16,7 +16,7 @@ pub const BitmapDescriptor = types.BitmapDescriptor;
 pub const TagField = types.TagField;
 
 pub const TIFF = struct {
-    endianess: std.builtin.Endian = undefined,
+    endianess: std.lang.Endian = undefined,
     header: Header = undefined,
     // TIFF can have many images but right now
     // we handle only the first one
@@ -60,7 +60,7 @@ pub const TIFF = struct {
                     bitmap.image_height = tag.toLongOrShort(endianess);
                 },
                 .compression => {
-                    bitmap.compression = @enumFromInt(tag.toShort(endianess));
+                    bitmap.compression = @fromBackingInt(@intCast(tag.toShort(endianess)));
                 },
                 .color_map => {
                     // get color_map data: TIFF stores components as 16-bit values
@@ -95,7 +95,7 @@ pub const TIFF = struct {
                     bitmap.samples_per_pixel = tag.toShort(endianess);
                 },
                 .resolution_unit => {
-                    bitmap.resolution_unit = @enumFromInt(tag.toShort(endianess));
+                    bitmap.resolution_unit = @fromBackingInt(@intCast(tag.toShort(endianess)));
                 },
                 .new_subfile_type => {
                     bitmap.new_subfile_type = tag.toLong();
@@ -378,21 +378,21 @@ pub const TIFF = struct {
         _ = encoder_options;
     }
 
-    fn peekEndianess(read_stream: *io.ReadStream) Image.ReadError!std.builtin.Endian {
+    fn peekEndianess(read_stream: *io.ReadStream) Image.ReadError!std.lang.Endian {
         const reader = read_stream.reader();
 
         const magic_buffer = try reader.peek(Header.little_endian_magic.len);
 
         if (std.mem.eql(u8, magic_buffer[0..], Header.little_endian_magic[0..])) {
-            return std.builtin.Endian.little;
+            return std.lang.Endian.little;
         } else if (std.mem.eql(u8, magic_buffer[0..], Header.big_endian_magic[0..])) {
-            return std.builtin.Endian.big;
+            return std.lang.Endian.big;
         }
 
         return Image.ReadError.InvalidData;
     }
 
-    fn takeEndianess(read_stream: *io.ReadStream) Image.ReadError!std.builtin.Endian {
+    fn takeEndianess(read_stream: *io.ReadStream) Image.ReadError!std.lang.Endian {
         const reader = read_stream.reader();
 
         const endianess = try peekEndianess(read_stream);

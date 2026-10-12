@@ -96,9 +96,9 @@ pub fn renderToPixels(self: *Frame, pixels: *color.PixelStorage) Image.ReadError
     switch (self.frame_header.components.len) {
         1 => try self.renderToPixelsGrayscale(pixels.grayscale8), // Grayscale images is non-interleaved
         3 => {
-        try self.yCbCrToRgb();
-        try self.renderToPixelsRgb(pixels.rgb24);
-    },
+            try self.yCbCrToRgb();
+            try self.renderToPixelsRgb(pixels.rgb24);
+        },
         else => unreachable,
     }
 }

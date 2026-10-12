@@ -3,8 +3,8 @@ const std = @import("std");
 const buf_size = 1024;
 
 const Error = error{
-BadArgCount,
-UnrecognizedArg,
+    BadArgCount,
+    UnrecognizedArg,
 };
 
 const DepthReplacing = void;

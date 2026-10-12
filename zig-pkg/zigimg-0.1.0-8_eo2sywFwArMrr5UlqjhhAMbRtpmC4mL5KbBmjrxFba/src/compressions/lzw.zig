@@ -2,7 +2,7 @@ const std = @import("std");
 const io = @import("../io.zig");
 
 // Implement a variable code size LZW decoder with support for clear code and end of information code required for GIF decoding
-pub fn Decoder(comptime endian: std.builtin.Endian) type {
+pub fn Decoder(comptime endian: std.lang.Endian) type {
     return struct {
         area_allocator: std.heap.ArenaAllocator,
         code_size: u8 = 0,
@@ -166,7 +166,7 @@ pub fn Decoder(comptime endian: std.builtin.Endian) type {
 }
 
 /// LZW Encoder, uses LSB (Least Significant Bit first) ordering
-pub fn Encoder(comptime endian: std.builtin.Endian) type {
+pub fn Encoder(comptime endian: std.lang.Endian) type {
     return struct {
         // Constants
         const max_code: u32 = (1 << 12) - 1; // 4095 - maximum 12-bit code
@@ -196,10 +196,10 @@ pub fn Encoder(comptime endian: std.builtin.Endian) type {
         table: [table_size]u32 = @splat(invalid_entry),
 
         pub const Error = error{
-        WriteFailed,
-        InvalidLitWidth,
-        EncoderClosed,
-        InputTooLarge,
+            WriteFailed,
+            InvalidLitWidth,
+            EncoderClosed,
+            InputTooLarge,
         };
 
         pub fn init(literal_width: u4) Error!Self {

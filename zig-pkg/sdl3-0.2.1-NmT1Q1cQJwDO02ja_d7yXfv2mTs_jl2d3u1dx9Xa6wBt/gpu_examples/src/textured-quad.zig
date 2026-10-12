@@ -368,7 +368,7 @@ pub fn quit(
     _ = result;
     if (app_state) |val| {
         for (val.samplers) |sampler|
-        val.device.releaseSampler(sampler);
+            val.device.releaseSampler(sampler);
         val.device.releaseTexture(val.texture);
         val.device.releaseBuffer(val.index_buffer);
         val.device.releaseBuffer(val.vertex_buffer);

@@ -418,7 +418,7 @@ pub const Cursor = extern struct {
     ) !Cursor {
         return .{ .value = try errors.wrapCallNull(
             *c.SDL_Cursor,
-            c.SDL_CreateSystemCursor(@intFromEnum(id)),
+            c.SDL_CreateSystemCursor(@backingInt(id)),
         ) };
     }
 };

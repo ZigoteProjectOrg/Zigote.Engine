@@ -77,19 +77,19 @@ fn writeManifest(w: *std.Io.Writer) !void {
         switch (info) {
             .@"struct" => |st| {
                 try w.writeAll("      \"kind\": \"struct\",\n      \"fields\": [\n");
-                inline for (st.fields, 0..) |f, fi| {
+                inline for (st.field_names, st.field_types, 0..) |name, F, fi| {
                     try w.print(
                         "        {{ \"name\": \"{s}\", \"offset\": {d}, \"size\": {d}, \"type\": \"{s}\" }}{s}\n",
-                        .{ f.name, @offsetOf(T, f.name), @sizeOf(f.type), @typeName(f.type), if (fi + 1 < st.fields.len) "," else "" },
+                        .{ name, @offsetOf(T, name), @sizeOf(F), @typeName(F), if (fi + 1 < st.field_names.len) "," else "" },
                     );
                 }
                 try w.writeAll("      ]\n");
             },
             .@"enum" => |en| {
                 try w.writeAll("      \"kind\": \"enum\",\n      \"values\": [\n");
-                inline for (en.fields, 0..) |f, fi| {
+                inline for (en.field_names, en.field_values, 0..) |name, value, fi| {
                     try w.print("        {{ \"name\": \"{s}\", \"value\": {d} }}{s}\n", .{
-                        f.name, f.value, if (fi + 1 < en.fields.len) "," else "",
+                        name, value, if (fi + 1 < en.field_names.len) "," else "",
                     });
                 }
                 try w.writeAll("      ]\n");
@@ -115,16 +115,16 @@ pub fn main() !void {
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 test "every type declared in abi.zig is in the manifest" {
-    const declared = @typeInfo(abi).@"struct".decls;
+    const declared = @typeInfo(abi).@"struct".decl_names;
     var counted: usize = 0;
     inline for (declared) |d| {
-        const T = @field(abi, d.name);
+        const T = @field(abi, d);
         if (@TypeOf(T) != type) continue;
         const info = @typeInfo(T);
         if (info != .@"struct" and info != .@"enum") continue;
         // ZgResult is a retained alias for ZgStatus — the same type under a second name. It must
         // not be counted or emitted twice.
-        if (comptime std.mem.eql(u8, d.name, "ZgResult")) continue;
+        if (comptime std.mem.eql(u8, d, "ZgResult")) continue;
         counted += 1;
 
         const listed = inline for (wire_types) |W| {
@@ -132,7 +132,7 @@ test "every type declared in abi.zig is in the manifest" {
         } else false;
         if (!listed) {
             std.debug.print("abi.zig declares {s}, which tools/ffi_manifest.zig does not list —" ++
-                " it would cross the ABI unchecked\n", .{d.name});
+                " it would cross the ABI unchecked\n", .{d});
             return error.WireTypeNotInManifest;
         }
     }

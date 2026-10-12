@@ -27,7 +27,6 @@ pub const ZgGlyphRunQuad = extern struct {
     v1: f32,
 };
 
-
 // The flat 112-byte ZgPaintCommand that every kind shared lived here. It is gone: see the
 // "Paint command stream" section below for the tagged records that replaced it, and why.
 
@@ -49,13 +48,11 @@ pub const ZgEvent = extern struct {
     // total: 44 bytes
 };
 
-
 /// Result of zigote_measure_text.
 pub const ZgSize = extern struct {
     width: f32,
     height: f32,
 };
-
 
 /// ABI compatibility info returned by zigote_get_renderer_abi_info().
 /// C# must call this at startup and verify sizes match its compile-time @sizeOf values.
@@ -68,7 +65,6 @@ pub const ZgAbiInfo = extern struct {
     // total: 20 bytes
 };
 
-
 /// Runtime renderer capabilities returned by zigote_get_renderer_caps() AFTER init.
 /// Reports the backend actually selected plus optional native features (vendor upscalers /
 /// hardware ray tracing). Kept separate from ZgAbiInfo (whose 16-byte size is a fixed
@@ -78,10 +74,9 @@ pub const ZgRendererCaps = extern struct {
     upscalers: u32, // offset 4 — bitset of backend.UpscalerKind (0 = none)
     raytracing: u8, // offset 8 — hardware ray tracing available
     raytracing_from_render: u8, // offset 9 — RT usable from fragment shaders (not only compute)
-    pad: [2]u8 = .{0} ** 2, // offset 10 — pad to 12 bytes
+    pad: [2]u8 = @splat(0), // offset 10 — pad to 12 bytes
     // total: 12 bytes
 };
-
 
 /// The one status code every fallible export returns.
 ///
@@ -120,7 +115,6 @@ pub const ZgStatus = enum(i32) {
 /// Retained name for the previous two-value result. Identical encoding; `ZgStatus` is the contract.
 pub const ZgResult = ZgStatus;
 
-
 /// One entry for the parallel batch texture loader. `base_color_path` / `mr_path` / `normal_path`
 /// / `emissive_path` are optional (null = skip that map). Layout must match ZgTextureLoadItem in C#.
 pub const ZgTextureLoadItem = extern struct {
@@ -130,7 +124,6 @@ pub const ZgTextureLoadItem = extern struct {
     normal_path: [*c]const u8,
     emissive_path: [*c]const u8,
 };
-
 
 /// Flat C-ABI mirror of wgpu_3d.Settings3D. Layout must match ZgRenderSettings3D in C#.
 /// All fields f32 (70 floats); colours are linear rgb, sun angles in degrees.
@@ -223,7 +216,6 @@ comptime {
     if (@sizeOf(ZgRenderSettings3D) != 70 * @sizeOf(f32))
         @compileError("ZgRenderSettings3D must be 70 f32 (280 bytes) — keep field count in sync with C#");
 }
-
 
 /// Per-frame engine statistics for the debug overlay/profiler (design doc §14.1). Cheap snapshot —
 /// no allocation, no GPU stall. Mirrors ZgEngineStats in C#.
@@ -428,13 +420,16 @@ pub const ZgPaintRect = extern struct {
     bounds: ZgXywh,
     color: ZgRgba,
     radius: f32,
-    pad: f32 = 0,
+    /// Non-zero = continuous-curvature (squircle) corners.
+    squircle: f32 = 0,
 };
 
 pub const ZgPaintBorder = extern struct {
     header: ZgPaintOpHeader,
     bounds: ZgXywh,
     color: ZgRgba,
+    /// Negative = squircle corners of |radius|. The record has no spare field, and growing it
+    /// would break the wire size for a flag, so the sign carries it.
     radius: f32,
     width: f32,
 };
@@ -446,7 +441,8 @@ pub const ZgPaintShadow = extern struct {
     radius: f32,
     blur_radius: f32,
     spread: f32,
-    pad: f32 = 0,
+    /// Non-zero = continuous-curvature (squircle) corners, to sit under Liquid Glass.
+    squircle: f32 = 0,
 };
 
 pub const ZgPaintLiquidGlass = extern struct {
@@ -506,7 +502,8 @@ pub const ZgPaintClipStart = extern struct {
     header: ZgPaintOpHeader,
     bounds: ZgXywh,
     radius: f32,
-    pad: f32 = 0,
+    /// Non-zero = continuous-curvature (squircle) corners, to clip content inside Liquid Glass.
+    squircle: f32 = 0,
 };
 
 /// clip_end, pop_opacity, render_texture_end and transform_pop carry nothing but their header.
@@ -599,10 +596,10 @@ pub const ZgPaintTransformPush = extern struct {
 
 comptime {
     for ([_]type{
-        ZgPaintRect,          ZgPaintBorder,             ZgPaintShadow,   ZgPaintLiquidGlass,
-        ZgPaintText,          ZgPaintImage,              ZgPaintClipStart, ZgPaintBare,
-        ZgPaintPushOpacity,   ZgPaintShaderEffect,       ZgPaintTextLayout, ZgPaintGlyphRun,
-        ZgPaintRenderTextureBegin, ZgPaintBlur,          ZgPaintBezier,   ZgPaintPolygon,
+        ZgPaintRect,               ZgPaintBorder,       ZgPaintShadow,     ZgPaintLiquidGlass,
+        ZgPaintText,               ZgPaintImage,        ZgPaintClipStart,  ZgPaintBare,
+        ZgPaintPushOpacity,        ZgPaintShaderEffect, ZgPaintTextLayout, ZgPaintGlyphRun,
+        ZgPaintRenderTextureBegin, ZgPaintBlur,         ZgPaintBezier,     ZgPaintPolygon,
         ZgPaintTransformPush,
     }) |T| {
         if (@sizeOf(T) % 8 != 0) @compileError("paint op " ++ @typeName(T) ++ " must be a multiple of 8 bytes");

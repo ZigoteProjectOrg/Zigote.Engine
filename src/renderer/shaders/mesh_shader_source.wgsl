@@ -244,10 +244,10 @@ fn applyFog(col: vec3<f32>, world_pos: vec3<f32>, cam_pos: vec3<f32>) -> vec3<f3
 }
 
 @fragment
-fn fs_main(in: VertexOut) -> FragOut {
+fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut {
   let vpos = vec4<f32>((camera.view * vec4<f32>(in.world_pos, 1.0)).xyz, 1.0);
   // Geometric view-space normal fallback for the unlit/CRT early-outs (roughness 1 = no SSR).
-  let vn_geo = vec4<f32>(normalize((camera.view * vec4<f32>(normalize(in.normal), 0.0)).xyz), 1.0);
+  let vn_geo = vec4<f32>(normalize((camera.view * vec4<f32>(select(-normalize(in.normal), normalize(in.normal), front_facing), 0.0)).xyz), 1.0);
   // Wireframe debug mode (light.debug.z): this primitive is drawn with line-list topology by the
   // dedicated wireframe pipeline; emit a flat unlit colour so the edges read clearly over the
   // scene regardless of material. Skips all lighting/post so it stays a clean overlay.
@@ -294,6 +294,8 @@ fn fs_main(in: VertexOut) -> FragOut {
     let tbn = mat3x3<f32>(t, b, n);
     n = normalize(tbn * map_normal);
   }
+  // Double-sided surfaces must light their visible back face, including the mapped normal.
+  n = select(-n, n, front_facing);
   // Per-pixel rotation angle shared by every shadow PCF dither (cascade, spot, point). It depends
   // only on in.clip_pos.xy, so compute the sin/fract hash and its cos/sin ONCE here and reuse across
   // all three branches instead of re-deriving the identical value up to three times per fragment.
@@ -356,7 +358,7 @@ fn fs_main(in: VertexOut) -> FragOut {
   // (default map is white, so untextured materials use their factor unchanged).
   let mr_sample = textureSample(mr_tex, mr_sampler, in.uv);
   let metallic = clamp(model_data.metallic_roughness.x * mr_sample.b, 0.0, 1.0);
-  var roughness = max(model_data.metallic_roughness.y * mr_sample.g, 0.05); // Prevent 0 roughness
+  var roughness = clamp(model_data.metallic_roughness.y * mr_sample.g, 0.05, 1.0); // Prevent 0 roughness
   // Specular anti-aliasing / prefiltering: as a surface minifies, its normal varies fast on
   // screen, so a pixel covers many reflection directions at once. Widen roughness with that
   // screen-space normal variance so distant metal CONVERGES to the prefiltered average
@@ -401,11 +403,12 @@ fn fs_main(in: VertexOut) -> FragOut {
   // glossy lacquer lobe only when its glTF asks for it, so chrome stays metal and paint stays
   // lacquered regardless of their metallic value.
   let cc_strength = clamp(model_data.metallic_roughness.z, 0.0, 1.0) * light.studio.w;
-  let cc_rough = clamp(model_data.metallic_roughness.w, 0.02, 0.6);
+  let cc_rough = clamp(model_data.metallic_roughness.w, 0.02, 1.0);
   let cc_alpha2 = (cc_rough * cc_rough) * (cc_rough * cc_rough);
 
   var Lo = vec3<f32>(0.0);
   var Lo_cc = vec3<f32>(0.0);
+  var Lo_specular = vec3<f32>(0.0);
   var sun_direct = vec3<f32>(0.0);
   for (var i: u32 = 0u; i < light.light_count.x; i++) {
     let l_data = light.lights[i];
@@ -483,7 +486,7 @@ fn fs_main(in: VertexOut) -> FragOut {
     }
 
     let h = normalize(v + l + vec3<f32>(0.00001));
-    let NdotL = max(dot(n, l), 0.0001);
+    let NdotL = max(dot(n, l), 0.0);
     let NdotH = max(dot(n, h), 0.0001);
     let HdotV = max(dot(h, v), 0.0001);
 
@@ -491,8 +494,10 @@ fn fs_main(in: VertexOut) -> FragOut {
     let alpha2 = alpha * alpha;
     let NdotH2 = NdotH * NdotH;
 
-    let denom = (NdotH2 * (alpha2 - 1.0) + 1.0);
-    let D = alpha2 / (3.14159265 * denom * denom + 0.0001);
+    // This form avoids cancellation near NdotH=1 for smooth materials. An additive epsilon
+    // in the denominator flattens the highlight and loses most of its reflected energy.
+    let denom = (1.0 - NdotH2) + NdotH2 * alpha2;
+    let D = alpha2 / max(3.14159265 * denom * denom, 1e-12);
 
     // Height-correlated Smith visibility (Heitz). The Vis term already folds in the
     // 1/(4·NdotV·NdotL) denominator, so it replaces both the separable G and that divide — more
@@ -509,14 +514,15 @@ fn fs_main(in: VertexOut) -> FragOut {
     kD = kD * (1.0 - metallic);
 
     // Clearcoat specular: sharp GGX (clearcoat roughness from cc_alpha2 above) + Kelemen visibility.
-    let cc_denom = (NdotH2 * (cc_alpha2 - 1.0) + 1.0);
-    let cc_D = cc_alpha2 / (3.14159265 * cc_denom * cc_denom + 0.0001);
+    let cc_denom = (1.0 - NdotH2) + NdotH2 * cc_alpha2;
+    let cc_D = cc_alpha2 / max(3.14159265 * cc_denom * cc_denom, 1e-16);
     let cc_Fr = 0.04 + 0.96 * pow5(clamp(1.0 - HdotV, 0.0, 1.0));
     let cc_vis = 0.25 / (HdotV * HdotV + 0.0001);
     Lo_cc += vec3<f32>(cc_D * cc_Fr * cc_vis) * light_color * attenuation * NdotL;
 
     let direct_lobe = (kD * base_color.rgb / 3.14159265 + specular) * light_color * attenuation * NdotL;
     Lo += direct_lobe;
+    Lo_specular += specular * light_color * attenuation * NdotL;
     if (i == 0u && l_data.position_or_dir.w == 0.0) {
       sun_direct += direct_lobe;
     }
@@ -644,7 +650,7 @@ fn fs_main(in: VertexOut) -> FragOut {
   // Transparency. Opaque geometry stays fully opaque (out_alpha = 1). The alpha mode rides in
   // effect.z: 2 = generic alpha blend (decals, stickers, hair, cloth — the lit surface with the
   // texture's own alpha), 3 = dedicated glass (windows, lenses). Both render on the transparent
-  // pipeline (depth-write off, src-alpha blend on); opaque uses a non-blending pipeline.
+  // pipelines; glass writes depth to select its nearest surface. Opaque does not blend.
   var out_alpha = 1.0;
   if (model_data.effect.z == 2u) {
     // Generic alpha blend: keep the lit PBR colour, take opacity straight from the material /
@@ -661,7 +667,7 @@ fn fs_main(in: VertexOut) -> FragOut {
     let g_ior = clamp(select(1.5, model_data.surface.x, model_data.surface.x >= 1.0), 1.0, 3.0);
     let F0_glass = pow((g_ior - 1.0) / (g_ior + 1.0), 2.0);
     let glass_fresnel = pow5(clamp(1.0 - NdotV, 0.0, 1.0));
-    let F_glass = F0_glass + (1.0 - F0_glass) * glass_fresnel;
+    let F_glass = (F0_glass + (1.0 - F0_glass) * glass_fresnel) * model_data.emissive.w;
     let screen_dims = vec2<f32>(textureDimensions(refraction_tex, 0));
     let screen_uv = in.clip_pos.xy / screen_dims;       // framebuffer pixel → [0,1], top-left origin
     // Physical refraction direction (Snell): bend the view ray through the surface and offset the
@@ -691,36 +697,47 @@ fn fs_main(in: VertexOut) -> FragOut {
     // into long streaks (the classic screen-space-refraction artifact). Off-screen → environment mirror.
     let edge2 = min(refr_uv_raw, vec2<f32>(1.0) - refr_uv_raw);
     let valid = smoothstep(0.0, 0.04, min(edge2.x, edge2.y));
-    let refr_uv = clamp(refr_uv_raw, vec2<f32>(0.0), vec2<f32>(1.0));
+    let half_texel = 0.5 / screen_dims;
+    var refr_uv = clamp(refr_uv_raw, half_texel, vec2<f32>(1.0) - half_texel);
+    // Screen-space refraction must never pull opaque foreground geometry through glass.
+    let refr_pos = textureLoad(gbuf_pos_tex, vec2<i32>(refr_uv * screen_dims), 0);
+    if (refr_pos.w > 0.5 && refr_pos.z >= glass_vz) {
+      refr_uv = screen_uv;
+    }
     // Frosted glass: rough glass scatters both the transmitted and reflected light. Blur the
     // refraction lookup (hexagonal taps, rotated per-pixel so the fixed pattern dissolves to smooth
     // scatter under TAA instead of printing a visible hex ghost) and pull the reflection to a rougher
     // env mip, both scaled by roughness. Smooth glass (frost≈0) keeps the single-sample fast path.
-    let frost = clamp(roughness, 0.0, 1.0);
+    // The BRDF's numerical roughness floor must not force clear glass into the seven-tap path.
+    let frost = clamp((roughness - 0.05) / 0.95, 0.0, 1.0);
     var behind = textureSampleLevel(refraction_tex, env_samp, refr_uv, 0.0).rgb;
     if (frost > 0.04) {
-      let fb = frost * 0.05; // transmission blur radius (uv)
+      let fb = frost * 0.05 * vec2<f32>(screen_dims.y / screen_dims.x, 1.0);
       let frot = mat2x2<f32>(dither_cs, dither_sn, -dither_sn, dither_cs);
       var fd = array<vec2<f32>, 6>(
         vec2<f32>( 1.0, 0.0), vec2<f32>(-0.5, 0.866), vec2<f32>(-0.5, -0.866),
         vec2<f32>(-1.0, 0.0), vec2<f32>( 0.5, 0.866), vec2<f32>( 0.5, -0.866));
       var facc = behind;
       for (var fi: i32 = 0; fi < 6; fi = fi + 1) {
-        let fuv = clamp(refr_uv + (frot * fd[fi]) * fb, vec2<f32>(0.0), vec2<f32>(1.0));
-        facc += textureSampleLevel(refraction_tex, env_samp, fuv, 0.0).rgb;
+        let fuv = clamp(refr_uv + (frot * fd[fi]) * fb, half_texel, vec2<f32>(1.0) - half_texel);
+        let tap_pos = textureLoad(gbuf_pos_tex, vec2<i32>(fuv * screen_dims), 0);
+        if (tap_pos.w > 0.5 && tap_pos.z >= glass_vz) {
+          facc += behind;
+        } else {
+          facc += textureSampleLevel(refraction_tex, env_samp, fuv, 0.0).rgb;
+        }
       }
       behind = facc / 7.0;
     }
-    let absorption = mix(vec3<f32>(1.0), base_color.rgb, clamp(1.0 - base_color.a, 0.0, 0.9));
+    // Surface transmission tint is independent of coverage alpha. Volume absorption requires
+    // authored thickness/attenuation data; inverse opacity is not an absorption coefficient.
+    let absorption = base_color.rgb;
     let env_refl = textureSampleLevel(env_cube, env_samp, R, sqrt(frost) * light.post.w).rgb; // rough → blurred mirror
     let transmitted = mix(env_refl, behind * absorption, valid); // off-screen sample → reflection
-    // Fresnel: clear transmission head-on, environment mirror at grazing. Direct-light glints ride
-    // the sharp clearcoat-shaped lobe, scaled to the material's real F0 so dense glass sparkles
-    // harder. Kept subtle so the glass reads crystal-clear, not milky.
-    let glass_col = mix(transmitted, env_refl, F_glass) + Lo_cc * (0.5 * F0_glass / 0.04) + emissive_rgb;
-    // KHR_materials_transmission: partial transmission blends the standard lit surface toward the
-    // glass response (native side maps legacy glass-with-no-transmission to 1.0 = full glass).
-    color = mix(color, glass_col, clamp(model_data.surface.y, 0.0, 1.0));
+    // Use the material's own specular lobe for direct glints, including its roughness and
+    // specular factor. Borrowing the clearcoat lobe made uncoated frosted glass sparkle sharply.
+    let glass_col = mix(transmitted, env_refl, F_glass) + Lo_specular + emissive_rgb;
+    color = mix(color, glass_col, clamp(model_data.surface.y, 0.0, 1.0) * (1.0 - metallic));
     out_alpha = 1.0; // background already composited into `color`
   }
   // Atmospheric fog / aerial perspective (applied to the final lit + glass colour, in linear HDR so

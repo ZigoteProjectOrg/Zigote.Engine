@@ -17,6 +17,16 @@
 
 #define ZEXPORT __attribute__((visibility("default")))
 
+// Remove floating chrome before dismantling the Metal view. A transparent window's
+// cached system shadow can otherwise survive until AppKit processes a later update.
+ZEXPORT void zigote_macwin_prepare_close(void *nswindowPtr) {
+    NSWindow *window = (NSWindow *)nswindowPtr;
+    if (window == nil) return;
+    window.hasShadow = NO;
+    [window invalidateShadow];
+    [window orderOut:nil];
+}
+
 // Diagnostic readback: 1 = unified applied, 0 = not applied, -1 = no NSWindow.
 ZEXPORT int32_t zigote_macwin_get_unified(void *nswindowPtr) {
     NSWindow *window = (NSWindow *)nswindowPtr;
@@ -74,6 +84,14 @@ ZEXPORT void zigote_macwin_set_csd(void *nswindowPtr, int enabled, float radius)
 // running, with no tile and no menu bar — and it is settable at runtime, so the trip back to a
 // visible window restores Regular. Activating on the way back is what actually returns the menu
 // bar; without it the app owns the screen with the previous app's menus still up.
+// True while the event AppKit is dispatching is a scroll from a trackpad or Magic Mouse (pixel
+// deltas, momentum) rather than a notched wheel. SDL folds both into one wheel event and drops
+// the distinction, so the engine asks from its event watch, which SDL runs inside that dispatch.
+ZEXPORT int32_t zigote_macwin_scroll_is_precise(void) {
+    NSEvent *e = [NSApp currentEvent];
+    return e != nil && e.type == NSEventTypeScrollWheel && e.hasPreciseScrollingDeltas;
+}
+
 ZEXPORT void zigote_macwin_set_dock_visible(int visible) {
     NSApplication *app = NSApplication.sharedApplication;
     if (app == nil) return;

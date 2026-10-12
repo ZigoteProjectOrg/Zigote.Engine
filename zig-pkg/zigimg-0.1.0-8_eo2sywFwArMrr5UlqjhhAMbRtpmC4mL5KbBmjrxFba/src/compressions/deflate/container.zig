@@ -43,11 +43,11 @@ pub const Container = enum {
     pub const list = [_]Container{ .raw, .gzip, .zlib };
 
     pub const Error = error{
-    BadGzipHeader,
-    BadZlibHeader,
-    WrongGzipChecksum,
-    WrongGzipSize,
-    WrongZlibChecksum,
+        BadGzipHeader,
+        BadZlibHeader,
+        WrongGzipChecksum,
+        WrongGzipSize,
+        WrongZlibChecksum,
     };
 
     pub fn writeHeader(comptime wrap: Container, writer: *std.Io.Writer) !void {

@@ -583,7 +583,7 @@ pub const Type = enum {
             .assert => c.SDL_HINT_ASSERT,
             .pen_mouse_events => c.SDL_HINT_PEN_MOUSE_EVENTS,
             .pen_touch_events => c.SDL_HINT_PEN_TOUCH_EVENTS,
-        // .debug_logging => c.SDL_HINT_DEBUG_LOGGING,
+            // .debug_logging => c.SDL_HINT_DEBUG_LOGGING,
         };
     }
 };
@@ -798,7 +798,7 @@ pub fn setWithPriority(
     const ret = c.SDL_SetHintWithPriority(
         hint.toSdl(),
         value.ptr,
-        @intFromEnum(priority),
+        @backingInt(priority),
     );
     return errors.wrapCallBool(ret);
 }

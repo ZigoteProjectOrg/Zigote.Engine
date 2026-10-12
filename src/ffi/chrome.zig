@@ -19,6 +19,21 @@ extern fn zigote_macwin_set_unified(nswindow: ?*anyopaque, enabled: i32) void;
 extern fn zigote_macwin_get_unified(nswindow: ?*anyopaque) i32;
 extern fn zigote_macwin_set_csd(nswindow: ?*anyopaque, enabled: i32, radius: f32) void;
 extern fn zigote_macwin_set_dock_visible(visible: i32) void;
+extern fn zigote_macwin_prepare_close(nswindow: ?*anyopaque) void;
+extern fn zigote_macwin_scroll_is_precise() i32;
+
+/// macOS only: whether the scroll event AppKit is dispatching right now came from a trackpad.
+pub fn macScrollIsPrecise() bool {
+    return zigote_macwin_scroll_is_precise() != 0;
+}
+
+/// Remove native chrome while the window and its content view are still intact.
+pub fn prepareClose(window_id: u32) void {
+    if (is_macos) {
+        const win = sdlWindow(window_id) orelse return;
+        zigote_macwin_prepare_close(nsWindowOf(win));
+    }
+}
 
 /// Re-assert a window's chrome if the OS dropped it. macOS clears the FullSizeContentView
 /// styleMask bit on fullscreen/zoom round-trips, silently reverting a unified titlebar to

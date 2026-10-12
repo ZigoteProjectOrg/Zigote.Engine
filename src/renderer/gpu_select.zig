@@ -80,7 +80,7 @@ comptime {
 /// Fill a GpuInfo from a live adapter. `getInfo` allocates the strings, so free them right after.
 fn describe(adapter: *wgpu.Adapter) GpuInfo {
     var out = GpuInfo{
-        .name = [_]u8{0} ** 128,
+        .name = @splat(0),
         .backend = 0,
         .device_type = 0,
         .vendor_id = 0,
@@ -93,8 +93,8 @@ fn describe(adapter: *wgpu.Adapter) GpuInfo {
     const device = info.device.toSlice() orelse return out;
     const len = @min(device.len, out.name.len - 1); // keep the NUL terminator
     @memcpy(out.name[0..len], device[0..len]);
-    out.backend = @intFromEnum(info.backend_type);
-    out.device_type = @intFromEnum(info.adapter_type);
+    out.backend = @backingInt(info.backend_type);
+    out.device_type = @backingInt(info.adapter_type);
     out.vendor_id = info.vendor_id;
     out.device_id = info.device_id;
     return out;
@@ -242,7 +242,7 @@ pub fn select(
 
     var result = Selection{
         .adapter = undefined,
-        .gpus = [_]GpuInfo{std.mem.zeroes(GpuInfo)} ** max_gpus,
+        .gpus = @splat(std.mem.zeroes(GpuInfo)),
         .count = @intCast(found),
         .active = -1,
     };
@@ -264,7 +264,7 @@ pub fn select(
             g.backend,
             g.device_type,
             canPresent(surface, adapter),
-            score(@enumFromInt(g.backend), @enumFromInt(g.device_type), power),
+            score(@fromBackingInt(@intCast(g.backend)), @fromBackingInt(@intCast(g.device_type)), power),
         });
     }
 
@@ -287,8 +287,8 @@ pub fn select(
         }
 
         const s = score(
-            @enumFromInt(result.gpus[i].backend),
-            @enumFromInt(result.gpus[i].device_type),
+            @fromBackingInt(@intCast(result.gpus[i].backend)),
+            @fromBackingInt(@intCast(result.gpus[i].device_type)),
             power,
         );
         if (best == null or s > best_score) {
@@ -310,7 +310,7 @@ pub fn select(
         // Scoring ranks CPU adapters last, so landing on one means it was pinned or it was the only
         // adapter that could present. Either way it is a software rasterizer — say so, because
         // otherwise the only symptom is that everything is inexplicably slow.
-        if (@as(wgpu.AdapterType, @enumFromInt(g.device_type)) == .cpu) {
+        if (@as(wgpu.AdapterType, @fromBackingInt(@intCast(g.device_type))) == .cpu) {
             std.log.warn("zigote: '{s}' is a SOFTWARE renderer — expect very low frame rates", .{
                 std.mem.sliceTo(&g.name, 0),
             });
@@ -405,7 +405,7 @@ test "2x MSAA is only allowed where it is verified" {
 }
 
 test "name matching is case-insensitive and NUL-padded-safe" {
-    var name = [_]u8{0} ** 128;
+    var name: [128]u8 = @splat(0);
     const text = "NVIDIA GeForce RTX 4080";
     @memcpy(name[0..text.len], text);
 

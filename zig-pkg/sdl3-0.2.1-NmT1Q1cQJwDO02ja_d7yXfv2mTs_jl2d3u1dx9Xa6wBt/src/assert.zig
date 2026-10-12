@@ -127,7 +127,7 @@ pub const State = enum(c.SDL_AssertState) {
 pub fn assert(
     condition: bool,
     comptime condition_name: ?[*:0]const u8,
-    comptime location: std.builtin.SourceLocation,
+    comptime location: std.lang.SourceLocation,
 ) bool {
     if (c.SDL_ASSERT_LEVEL >= 2) {
         return assertAlways(condition, condition_name, location);
@@ -161,7 +161,7 @@ pub fn assert(
 pub fn assertAlways(
     condition: bool,
     comptime condition_name: ?[*:0]const u8,
-    comptime location: std.builtin.SourceLocation,
+    comptime location: std.lang.SourceLocation,
 ) bool {
     const AssertDataHolder = getAssertData(condition_name, location);
     if (!condition) {
@@ -205,7 +205,7 @@ pub fn assertAlways(
 pub fn assertParanoid(
     condition: bool,
     comptime condition_name: ?[*:0]const u8,
-    comptime location: std.builtin.SourceLocation,
+    comptime location: std.lang.SourceLocation,
 ) bool {
     if (c.SDL_ASSERT_LEVEL >= 1) {
         return assertAlways(condition, condition_name, location);
@@ -243,7 +243,7 @@ pub fn assertParanoid(
 pub fn assertRelease(
     condition: bool,
     comptime condition_name: ?[*:0]const u8,
-    comptime location: std.builtin.SourceLocation,
+    comptime location: std.lang.SourceLocation,
 ) bool {
     if (c.SDL_ASSERT_LEVEL >= 1) {
         return assertAlways(condition, condition_name, location);
@@ -253,10 +253,10 @@ pub fn assertRelease(
 
 inline fn getAssertData(
     comptime condition_name: ?[*:0]const u8,
-    comptime location: std.builtin.SourceLocation,
+    comptime location: std.lang.SourceLocation,
 ) type {
     return struct {
-        const source_location: std.builtin.SourceLocation = location;
+        const source_location: std.lang.SourceLocation = location;
         var assert_data: AssertData = .{
             .condition = condition_name,
         };
@@ -360,14 +360,14 @@ pub fn getReport() ?AssertData {
 /// This function is available since SDL 3.2.0.
 pub fn report(
     data: *AssertData,
-    location: std.builtin.SourceLocation,
+    location: std.lang.SourceLocation,
 ) State {
-    return @enumFromInt(c.SDL_ReportAssertion(
+    return @fromBackingInt(@intCast(c.SDL_ReportAssertion(
         @ptrCast(data),
         location.fn_name,
         location.file,
         @intCast(location.line),
-    ));
+    )));
 }
 
 /// Clear the list of all assertion failures.
@@ -414,7 +414,7 @@ pub fn setHandler(
 ) void {
     const Cb = struct {
         pub fn run(assert_data_c: [*c]const c.SDL_AssertData, user_data_c: ?*anyopaque) callconv(.c) c.SDL_AssertState {
-            return @intFromEnum(handler.?(@bitCast(assert_data_c.*), @ptrCast(@alignCast(user_data_c))));
+            return @backingInt(handler.?(@bitCast(assert_data_c.*), @ptrCast(@alignCast(user_data_c))));
         }
     };
     c.SDL_SetAssertionHandler(if (handler != null) Cb.run else null, @ptrCast(user_data));

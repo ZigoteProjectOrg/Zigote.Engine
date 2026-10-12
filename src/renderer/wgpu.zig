@@ -786,7 +786,9 @@ const ClipUniformEntry = extern struct {
     center: [2]f32,
     half: [2]f32,
     radius: f32,
-    _pad: [3]f32 = .{ 0, 0, 0 },
+    /// 1 = squircle corners (RoundedClip.radius.y in common_rounded_clip.wgsl).
+    squircle: f32 = 0,
+    _pad: [2]f32 = .{ 0, 0 },
 };
 
 pub const ShapeBatch = struct {
@@ -1838,8 +1840,9 @@ fn copySceneToBackdrop(
 
 /// Region a backdrop capture must cover for the consecutive backdrop-op run starting at
 /// `ops[start]` — the run's device AABBs inflated by the glass shader's maximum sampling reach
-/// (liquid_glass_shader_source.wgsl: |disp| ≤ (h + t·BEND)/0.25 with h ≤ t ⇒ 28·t; frost
-/// ≤ (4 + 2.1·t)·(1 + FROST_RIM); +16 px of AA/fringe slack). Null = copy the whole frame: a
+/// (liquid_glass_shader_source.wgsl: |disp| ≤ 0.86·BEND·t ≈ 2.4·t, up to half as much again
+/// for the dispersion taps at full pinch ⇒ 4·t; frost ≤ FROST_PX + FROST_THICK·t = 3 + 0.9·t;
+/// +16 px of AA slack). Null = copy the whole frame: a
 /// custom shader effect samples the backdrop arbitrarily, the bounds are unknown, or the union
 /// is nearly the frame anyway. ONLY sound on paths that draw every op in order — a path that
 /// culls ops must pass null (a culled op does not stale the capture, so the reuse run can span
@@ -1865,7 +1868,7 @@ fn backdropCopyRegion(
         const aabb = vertexRangeAabb(LiquidGlassVertex, verts, fw, fh) orelse return null;
         var t_max: f32 = 1.0;
         for (verts) |v| t_max = @max(t_max, v.thickness);
-        const reach = 28.0 * t_max + ((4.0 + 2.1 * t_max) * 2.8) + 16.0;
+        const reach = 4.0 * t_max + (3.0 + 0.9 * t_max) + 16.0;
         const r = zg.Rect{
             .x = aabb.x - reach,
             .y = aabb.y - reach,
@@ -2162,6 +2165,7 @@ fn roundedClipSlot(
     frame: *FramePaint,
     rect: zg.Rect,
     radius: f32,
+    squircle: bool,
     scale_factor: f32,
 ) !u32 {
     const entry = ClipUniformEntry{
@@ -2171,6 +2175,7 @@ fn roundedClipSlot(
         },
         .half = .{ rect.width * 0.5 * scale_factor, rect.height * 0.5 * scale_factor },
         .radius = radius * scale_factor,
+        .squircle = if (squircle) 1 else 0,
     };
     for (frame.rounded_clips.items, 0..) |existing, i| {
         if (std.meta.eql(existing, entry)) return @intCast((i + 1) * CLIP_SLOT);
@@ -2254,7 +2259,7 @@ fn appendPaintOps(
                     else
                         true;
                     if (translation_only)
-                        offset = try roundedClipSlot(allocator, frame, screen_rect, clip.radius, scale_factor);
+                        offset = try roundedClipSlot(allocator, frame, screen_rect, clip.radius, clip.squircle, scale_factor);
                 }
                 try clip_stack.append(allocator, .{ .rect = new_clip, .offset = offset });
                 current_clip = new_clip;
@@ -2397,7 +2402,7 @@ fn appendPaintOps(
                         .height = rect.bounds.height * scale_factor,
                     },
                     rect.color,
-                    rect.radius * scale_factor,
+                    shapeRadius(rect.radius * scale_factor, rect.squircle),
                     0.0,
                     0.0,
                     frame_width,
@@ -2446,7 +2451,7 @@ fn appendPaintOps(
                         .height = border.bounds.height * scale_factor,
                     },
                     border.color,
-                    border.radius * scale_factor,
+                    shapeRadius(border.radius * scale_factor, border.squircle),
                     border.width * scale_factor,
                     0.0,
                     frame_width,
@@ -2477,7 +2482,7 @@ fn appendPaintOps(
                         .height = (shadow.bounds.height + expansion * 2.0) * scale_factor,
                     },
                     shadow.color,
-                    (shadow.radius + spread) * scale_factor,
+                    shapeRadius((shadow.radius + spread) * scale_factor, shadow.squircle),
                     0.0,
                     blur * scale_factor,
                     frame_width,
@@ -2561,7 +2566,7 @@ fn appendPaintOps(
                     image.v0,
                     image.u1,
                     image.v1,
-                    .{ 255, 255, 255, 255 },
+                    colorToU8(image.tint),
                     0.0,
                     0.0,
                     frame_width,
@@ -3452,6 +3457,12 @@ fn appendLiquidGlass(
             .adapt = adapt_c,
         },
     });
+}
+
+/// The radius a shape instance carries: negative is the shape shader's squircle flag
+/// (sd_corner_rect in common_corner.wgsl).
+fn shapeRadius(radius: f32, squircle: bool) f32 {
+    return if (squircle) -radius else radius;
 }
 
 fn appendShape(

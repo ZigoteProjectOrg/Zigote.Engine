@@ -159,10 +159,10 @@ pub fn Texture2dRgba8(
                 \\%loaded_image   = OpLoad %img_type %img
                 \\                  OpImageWrite %loaded_image %uv %pixel
                 :
-            : [uv] "" (uv),
-              [pixel] "" (pixel),
-              [set] "c" (set),
-              [bind] "c" (bind),
+                : [uv] "" (uv),
+                  [pixel] "" (pixel),
+                  [set] "c" (set),
+                  [bind] "c" (bind),
             );
         }
     };

@@ -46,7 +46,7 @@ pub const TransientPool = struct {
     fn compat(a: TextureDesc, b: TextureDesc) bool {
         return a.width == b.width and
             a.height == b.height and
-            @intFromEnum(a.format) == @intFromEnum(b.format) and
+            @backingInt(a.format) == @backingInt(b.format) and
             a.usage == b.usage and
             a.sample_count == b.sample_count;
     }

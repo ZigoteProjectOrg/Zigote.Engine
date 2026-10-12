@@ -75,7 +75,7 @@ pub const AudioState = struct {
     allocator: std.mem.Allocator,
     engine: *zaudio.Engine,
 
-    oneshots: [max_oneshots]OneShot = [_]OneShot{.{}} ** max_oneshots,
+    oneshots: [max_oneshots]OneShot = @splat(.{}),
     next_oneshot: usize = 0,
 
     instances: std.AutoHashMap(u32, Instance),
@@ -88,7 +88,7 @@ pub const AudioState = struct {
     next_group_id: u32 = 1,
 
     // Back-compat sustained channels → handle ids in `instances` (0 = empty slot).
-    voices: [voice_channels]u32 = [_]u32{0} ** voice_channels,
+    voices: [voice_channels]u32 = @splat(0),
 
     // Equalizer chains (see the equalizer section). Like buses these are few and long-lived, but
     // unlike buses they *are* destroyable — a music player tears one down when its EQ is disabled.
@@ -356,7 +356,7 @@ pub fn stopAll(self: *AudioState) void {
     var it = self.instances.valueIterator();
     while (it.next()) |inst| destroyInstance(inst.*);
     self.instances.clearRetainingCapacity();
-    self.voices = [_]u32{0} ** voice_channels;
+    self.voices = @splat(0);
 }
 
 // ── addressable source handles (editor AudioSource nodes + scripting Audio API) ──
@@ -423,9 +423,9 @@ pub fn streamFinish(self: *AudioState, id: u32) void {
 
 /// 0 connecting, 1 playing, 2 undecodable, 3 ended; 2 for an id that is not a stream at all.
 pub fn streamState(self: *AudioState, id: u32) u32 {
-    const inst = get(self, id) orelse return @intFromEnum(netstream.State.failed);
-    const ns = inst.stream orelse return @intFromEnum(netstream.State.failed);
-    return @intFromEnum(netstream.state(ns));
+    const inst = get(self, id) orelse return @backingInt(netstream.State.failed);
+    const ns = inst.stream orelse return @backingInt(netstream.State.failed);
+    return @backingInt(netstream.state(ns));
 }
 
 /// Decoded audio held ahead of the mixer, in seconds — what a "Buffering…" indicator shows.
@@ -612,7 +612,7 @@ const Band = struct {
 
 const Equalizer = struct {
     count: u32 = 0,
-    bands: [max_eq_bands]Band = [_]Band{.{}} ** max_eq_bands,
+    bands: [max_eq_bands]Band = @splat(.{}),
     enabled: bool = true,
 };
 
@@ -879,7 +879,7 @@ test "shelfSlope: Q 0.7071 is slope 1 at any gain" {
     // the maximally-steep shelf with no overshoot. If this drifts, every AutoEq profile is subtly
     // wrong in its bass and treble.
     for ([_]f64{ -12, -6, 0, 5.5, 12 }) |gain|
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), shelfSlope(gain, 0.7071067811865476), 1e-9);
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), shelfSlope(gain, 0.7071067811865476), 1e-9);
 }
 
 test "shelfSlope: stays inside the RBJ domain for extreme Q" {

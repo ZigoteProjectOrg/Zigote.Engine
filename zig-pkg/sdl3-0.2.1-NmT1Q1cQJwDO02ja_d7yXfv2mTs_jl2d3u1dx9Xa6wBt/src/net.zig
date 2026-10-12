@@ -69,9 +69,9 @@ pub fn quit() void {
 /// ## Version
 /// This error is provided by zig-sdl3.
 pub const Error = error{
-SdlNetError,
-SdlError,
-OutOfMemory,
+    SdlNetError,
+    SdlError,
+    OutOfMemory,
 };
 
 /// Specifies a timeout for a network operation.

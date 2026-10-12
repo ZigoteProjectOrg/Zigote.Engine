@@ -54,29 +54,29 @@ fn playGame() !bool {
         return false;
     }
 
-        // Purple has been answered, show popup with custom color scheme.
+    // Purple has been answered, show popup with custom color scheme.
     else {
-            _ = try sdl3.message_box.show(.{
-                .flags = .{ .buttons_left_to_right = true },
-                .title = "Correct!",
-                .message = "You have guessed correctly. Yippee!",
-                .parent_window = null,
-                .buttons = &.{
-                    .{
-                        .text = "Bye!",
-                        .value = 0,
-                    },
+        _ = try sdl3.message_box.show(.{
+            .flags = .{ .buttons_left_to_right = true },
+            .title = "Correct!",
+            .message = "You have guessed correctly. Yippee!",
+            .parent_window = null,
+            .buttons = &.{
+                .{
+                    .text = "Bye!",
+                    .value = 0,
                 },
-                .color_scheme = .{
-                    .background = .{ .r = 195, .g = 195, .b = 195 },
-                    .text = try sdl3.message_box.ColorScheme.Color.fromHex("660aa8"),
-                    .button_border = .{ .r = 50, .g = 75, .b = 55 },
-                    .button_background = .{ .r = 20, .g = 160, .b = 20 },
-                    .button_selected = try sdl3.message_box.ColorScheme.Color.fromHex("fdfd22"),
-                },
-            });
-            return true;
-        }
+            },
+            .color_scheme = .{
+                .background = .{ .r = 195, .g = 195, .b = 195 },
+                .text = try sdl3.message_box.ColorScheme.Color.fromHex("660aa8"),
+                .button_border = .{ .r = 50, .g = 75, .b = 55 },
+                .button_background = .{ .r = 20, .g = 160, .b = 20 },
+                .button_selected = try sdl3.message_box.ColorScheme.Color.fromHex("fdfd22"),
+            },
+        });
+        return true;
+    }
 }
 
 pub fn main() !void {

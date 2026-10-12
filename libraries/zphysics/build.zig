@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
             bool,
             "enable_asserts",
             "Enable assertions",
-        ) orelse (optimize == .Debug),
+        ) orelse (optimize == .debug),
         .enable_cross_platform_determinism = b.option(
             bool,
             "enable_cross_platform_determinism",
@@ -55,8 +55,9 @@ pub fn build(b: *std.Build) void {
     ) orelse &.{};
 
     const options_step = b.addOptions();
-    inline for (std.meta.fields(@TypeOf(options))) |field| {
-        options_step.addOption(field.type, field.name, @field(options, field.name));
+    const option_fields = @typeInfo(@TypeOf(options)).@"struct";
+    inline for (option_fields.field_names, option_fields.field_types) |name, T| {
+        options_step.addOption(T, name, @field(options, name));
     }
 
     const options_module = options_step.createModule();
@@ -67,7 +68,17 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zphysics_options", .module = options_module },
         },
     });
-    zjolt.addIncludePath(b.path("libs/JoltC"));
+    // zphysics.zig's view of the JoltC header (zig 0.17 removed @cImport).
+    const joltc_h = b.addTranslateC(.{
+        .root_source_file = b.path("libs/JoltC/JoltPhysicsC.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (options.enable_cross_platform_determinism) joltc_h.defineCMacro("JPH_CROSS_PLATFORM_DETERMINISTIC", "");
+    if (options.enable_debug_renderer) joltc_h.defineCMacro("JPH_DEBUG_RENDERER", "");
+    if (options.use_double_precision) joltc_h.defineCMacro("JPH_DOUBLE_PRECISION", "");
+    if (options.enable_asserts) joltc_h.defineCMacro("JPH_ENABLE_ASSERTS", "");
+    zjolt.addImport("joltc_c", joltc_h.createModule());
 
     const joltc = b.addLibrary(.{
         .name = "joltc",
@@ -278,6 +289,7 @@ pub fn build(b: *std.Build) void {
         tests.root_module.addCMacro("PRINT_OUTPUT", "");
 
     tests.root_module.addImport("zphysics_options", options_module);
+    tests.root_module.addImport("joltc_c", joltc_h.createModule());
     tests.root_module.addIncludePath(b.path("libs/JoltC"));
     tests.root_module.linkLibrary(joltc);
 

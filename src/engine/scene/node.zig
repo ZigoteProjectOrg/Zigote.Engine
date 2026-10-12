@@ -22,8 +22,8 @@ pub const SceneNode = struct {
     normal_matrix: math.Mat4 = math.Mat4.identity,
     dirty_transform: bool = true,
     parent: ?*SceneNode = null,
-    children: std.ArrayListUnmanaged(*SceneNode) = .{ .items = &.{}, .capacity = 0 },
-    components: std.ArrayListUnmanaged(Component) = .{ .items = &.{}, .capacity = 0 },
+    children: std.ArrayListUnmanaged(*SceneNode) = .empty,
+    components: std.ArrayListUnmanaged(Component) = .empty,
     active: bool = true,
     /// The FFI handle this node was issued, or 0 if it was never handed across the C ABI.
     ///

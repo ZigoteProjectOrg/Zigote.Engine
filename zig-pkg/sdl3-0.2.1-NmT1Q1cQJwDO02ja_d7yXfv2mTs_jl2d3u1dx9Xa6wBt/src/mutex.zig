@@ -167,7 +167,7 @@ pub const InitState = struct {
     pub fn getStatus(
         self: *InitState,
     ) InitStatus {
-        return @enumFromInt(c.SDL_GetAtomicInt(&self.value.status));
+        return @fromBackingInt(@intCast(c.SDL_GetAtomicInt(&self.value.status)));
     }
 
     /// Get the thread of the init state.

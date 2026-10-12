@@ -87,13 +87,13 @@ pub const DateTime = struct {
     pub fn fromSdl(data: c.SDL_DateTime) DateTime {
         return .{
             .year = @intCast(data.year),
-            .month = @enumFromInt(data.month),
+            .month = @fromBackingInt(@intCast(data.month)),
             .day = @intCast(data.day),
             .hour = @intCast(data.hour),
             .minute = @intCast(data.minute),
             .second = @intCast(data.second),
             .nanosecond = @intCast(data.nanosecond),
-            .day_of_week = @enumFromInt(data.day_of_week),
+            .day_of_week = @fromBackingInt(@intCast(data.day_of_week)),
             .utc_offset = @intCast(data.utc_offset),
         };
     }
@@ -102,13 +102,13 @@ pub const DateTime = struct {
     pub fn toSdl(self: DateTime) c.SDL_DateTime {
         return .{
             .year = @intCast(self.year),
-            .month = @intFromEnum(self.month),
+            .month = @backingInt(self.month),
             .day = @intCast(self.day),
             .hour = @intCast(self.hour),
             .minute = @intCast(self.minute),
             .second = @intCast(self.second),
             .nanosecond = @intCast(self.nanosecond),
-            .day_of_week = @intFromEnum(self.day_of_week),
+            .day_of_week = @backingInt(self.day_of_week),
             .utc_offset = @intCast(self.utc_offset),
         };
     }
@@ -256,10 +256,10 @@ pub fn getDayOfWeek(
 ) !Day {
     const ret = c.SDL_GetDayOfWeek(
         @intCast(year),
-        @intFromEnum(month),
+        @backingInt(month),
         @intCast(day),
     );
-    return @enumFromInt(try errors.wrapCall(c_int, ret, -1));
+    return @fromBackingInt(@intCast(try errors.wrapCall(c_int, ret, -1)));
 }
 
 /// Get the day of year for a calendar date.
@@ -281,7 +281,7 @@ pub fn getDayOfYear(
 ) !u9 {
     const ret = c.SDL_GetDayOfYear(
         @intCast(year),
-        @intFromEnum(month),
+        @backingInt(month),
         @intCast(day),
     );
     return @intCast(try errors.wrapCall(c_int, ret, -1));
@@ -304,7 +304,7 @@ pub fn getDaysInMonth(
 ) !u5 {
     const ret = c.SDL_GetDaysInMonth(
         @intCast(year),
-        @intFromEnum(month),
+        @backingInt(month),
     );
     return @intCast(try errors.wrapCall(c_int, ret, -1));
 }
@@ -329,7 +329,7 @@ pub fn getLocalePreferences() !struct { DateFormat, TimeFormat } {
         &time_format,
     );
     try errors.wrapCallBool(ret);
-    return .{ @enumFromInt(date_format), @enumFromInt(time_format) };
+    return .{ @fromBackingInt(@intCast(date_format)), @fromBackingInt(@intCast(time_format)) };
 }
 
 // Ensure time and date recognition works.

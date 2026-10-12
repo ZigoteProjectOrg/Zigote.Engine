@@ -50,7 +50,7 @@ test {
 // compare the declarations against the directory itself.
 test "no module in this directory is missing from the re-export list" {
     const std = @import("std");
-    const declared = @typeInfo(@This()).@"struct".decls;
+    const declared = @typeInfo(@This()).@"struct".decl_names;
 
     var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_state.deinit();
@@ -72,7 +72,7 @@ test "no module in this directory is missing from the re-export list" {
         if (std.mem.eql(u8, stem, "root")) continue;
 
         const found = inline for (declared) |d| {
-            if (std.mem.eql(u8, d.name, stem)) break true;
+            if (std.mem.eql(u8, d, stem)) break true;
         } else false;
         if (!found) {
             std.debug.print("src/renderer/{s} is not re-exported from root.zig\n", .{entry.name});

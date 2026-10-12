@@ -65,7 +65,7 @@ pub const Priority = enum(c.SDL_LogPriority) {
     pub fn fromSdl(val: c_uint) ?Priority {
         if (val == c.SDL_LOG_PRIORITY_INVALID)
             return null;
-        return @enumFromInt(val);
+        return @fromBackingInt(@intCast(val));
     }
 
     /// Set the text prepended to log messages of a given priority.
@@ -89,7 +89,7 @@ pub const Priority = enum(c.SDL_LogPriority) {
         prefix: ?[:0]const u8,
     ) !void {
         const ret = c.SDL_SetLogPriorityPrefix(
-            @intFromEnum(self),
+            @backingInt(self),
             if (prefix) |val| val.ptr else null,
         );
         return errors.wrapCallBool(ret);
@@ -123,7 +123,7 @@ pub const Category = enum(c_int) {
 
     /// Get zig representation of a category.
     pub fn fromSdl(val: c_int) Category {
-        return @enumFromInt(val);
+        return @fromBackingInt(@intCast(val));
     }
 
     /// Get the priority of a particular log category.
@@ -142,7 +142,7 @@ pub const Category = enum(c_int) {
     pub fn getPriority(
         self: Category,
     ) Priority {
-        return @enumFromInt(c.SDL_GetLogPriority(@intFromEnum(self)));
+        return @fromBackingInt(@intCast(c.SDL_GetLogPriority(@backingInt(self))));
     }
 
     /// Log a message with the specified category and priority.
@@ -164,13 +164,14 @@ pub const Category = enum(c_int) {
         comptime fmt: []const u8,
         args: anytype,
     ) !void {
-        var fallback = std.heap.stackFallback(options.log_message_stack_size, sdl3.allocator);
-        const allocator = fallback.get();
+        var fallback_buf: [options.log_message_stack_size]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buf, sdl3.allocator);
+        const allocator = fallback.allocator();
         const msg = try std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
         defer allocator.free(msg);
         c.SDL_LogMessage(
-            @intFromEnum(self),
-            @intFromEnum(priority),
+            @backingInt(self),
+            @backingInt(priority),
             "%s",
             msg.ptr,
         );
@@ -193,12 +194,13 @@ pub const Category = enum(c_int) {
         comptime fmt: []const u8,
         args: anytype,
     ) !void {
-        var fallback = std.heap.stackFallback(options.log_message_stack_size, sdl3.allocator);
-        const allocator = fallback.get();
+        var fallback_buf: [options.log_message_stack_size]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buf, sdl3.allocator);
+        const allocator = fallback.allocator();
         const msg = try std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
         defer allocator.free(msg);
         c.SDL_LogCritical(
-            @intFromEnum(self),
+            @backingInt(self),
             "%s",
             msg.ptr,
         );
@@ -221,12 +223,13 @@ pub const Category = enum(c_int) {
         comptime fmt: []const u8,
         args: anytype,
     ) !void {
-        var fallback = std.heap.stackFallback(options.log_message_stack_size, sdl3.allocator);
-        const allocator = fallback.get();
+        var fallback_buf: [options.log_message_stack_size]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buf, sdl3.allocator);
+        const allocator = fallback.allocator();
         const msg = try std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
         defer allocator.free(msg);
         c.SDL_LogDebug(
-            @intFromEnum(self),
+            @backingInt(self),
             "%s",
             msg.ptr,
         );
@@ -249,12 +252,13 @@ pub const Category = enum(c_int) {
         comptime fmt: []const u8,
         args: anytype,
     ) !void {
-        var fallback = std.heap.stackFallback(options.log_message_stack_size, sdl3.allocator);
-        const allocator = fallback.get();
+        var fallback_buf: [options.log_message_stack_size]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buf, sdl3.allocator);
+        const allocator = fallback.allocator();
         const msg = try std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
         defer allocator.free(msg);
         c.SDL_LogError(
-            @intFromEnum(self),
+            @backingInt(self),
             "%s",
             msg.ptr,
         );
@@ -277,12 +281,13 @@ pub const Category = enum(c_int) {
         comptime fmt: []const u8,
         args: anytype,
     ) !void {
-        var fallback = std.heap.stackFallback(options.log_message_stack_size, sdl3.allocator);
-        const allocator = fallback.get();
+        var fallback_buf: [options.log_message_stack_size]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buf, sdl3.allocator);
+        const allocator = fallback.allocator();
         const msg = try std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
         defer allocator.free(msg);
         c.SDL_LogInfo(
-            @intFromEnum(self),
+            @backingInt(self),
             "%s",
             msg.ptr,
         );
@@ -305,12 +310,13 @@ pub const Category = enum(c_int) {
         comptime fmt: []const u8,
         args: anytype,
     ) !void {
-        var fallback = std.heap.stackFallback(options.log_message_stack_size, sdl3.allocator);
-        const allocator = fallback.get();
+        var fallback_buf: [options.log_message_stack_size]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buf, sdl3.allocator);
+        const allocator = fallback.allocator();
         const msg = try std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
         defer allocator.free(msg);
         c.SDL_LogTrace(
-            @intFromEnum(self),
+            @backingInt(self),
             "%s",
             msg.ptr,
         );
@@ -333,12 +339,13 @@ pub const Category = enum(c_int) {
         comptime fmt: []const u8,
         args: anytype,
     ) !void {
-        var fallback = std.heap.stackFallback(options.log_message_stack_size, sdl3.allocator);
-        const allocator = fallback.get();
+        var fallback_buf: [options.log_message_stack_size]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buf, sdl3.allocator);
+        const allocator = fallback.allocator();
         const msg = try std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
         defer allocator.free(msg);
         c.SDL_LogVerbose(
-            @intFromEnum(self),
+            @backingInt(self),
             "%s",
             msg.ptr,
         );
@@ -361,12 +368,13 @@ pub const Category = enum(c_int) {
         comptime fmt: []const u8,
         args: anytype,
     ) !void {
-        var fallback = std.heap.stackFallback(options.log_message_stack_size, sdl3.allocator);
-        const allocator = fallback.get();
+        var fallback_buf: [options.log_message_stack_size]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buf, sdl3.allocator);
+        const allocator = fallback.allocator();
         const msg = try std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
         defer allocator.free(msg);
         c.SDL_LogWarn(
-            @intFromEnum(self),
+            @backingInt(self),
             "%s",
             msg.ptr,
         );
@@ -388,8 +396,8 @@ pub const Category = enum(c_int) {
         priority: Priority,
     ) void {
         const ret = c.SDL_SetLogPriority(
-            @intFromEnum(self),
-            @intFromEnum(priority),
+            @backingInt(self),
+            @backingInt(priority),
         );
         _ = ret;
     }
@@ -445,8 +453,9 @@ pub fn log(
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
-    var fallback = std.heap.stackFallback(options.log_message_stack_size, sdl3.allocator);
-    const allocator = fallback.get();
+    var fallback_buf: [options.log_message_stack_size]u8 = undefined;
+    var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buf, sdl3.allocator);
+    const allocator = fallback.allocator();
     const msg = try std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
     defer allocator.free(msg);
     c.SDL_Log(
@@ -483,7 +492,7 @@ pub fn setAllPriorities(
     priority: Priority,
 ) void {
     c.SDL_SetLogPriorities(
-        @intFromEnum(priority),
+        @backingInt(priority),
     );
 }
 

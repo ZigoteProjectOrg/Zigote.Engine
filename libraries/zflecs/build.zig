@@ -589,7 +589,7 @@ pub fn build(b: *std.Build) void {
                 .debug => "-DFLECS_DEBUG",
                 .sanitize => "-DFLECS_SANITIZE",
                 .none => "",
-                .depends_on_build => if (builtin.mode == .Debug) "-DFLECS_SANITIZE" else "",
+                .depends_on_build => if (builtin.mode == .debug) "-DFLECS_SANITIZE" else "",
             },
             "-DFLECS_CUSTOM_BUILD",
             if (addons.includeAddon(.alerts)) "-DFLECS_ALERTS" else "",
@@ -675,6 +675,16 @@ pub fn build(b: *std.Build) void {
     tests_module.addOptions("build-options", options);
     tests_module.addIncludePath(b.path("libs/flecs"));
     tests_module.linkLibrary(lib);
+    // tests.zig compares its extern structs against the real header (zig 0.17 removed @cImport).
+    const flecs_h = b.addTranslateC(.{
+        .root_source_file = b.path("libs/flecs/flecs.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (optimize == .debug) flecs_h.defineCMacro("FLECS_SANITIZE", "1");
+    flecs_h.defineCMacro("FLECS_USE_OS_ALLOC", "1");
+    flecs_h.defineCMacro("FLECS_NO_CPP", "1");
+    tests_module.addImport("flecs_c", flecs_h.createModule());
 
     const tests = b.addTest(.{
         .name = "zflecs-tests",

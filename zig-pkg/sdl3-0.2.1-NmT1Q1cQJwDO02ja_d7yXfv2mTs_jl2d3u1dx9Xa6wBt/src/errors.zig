@@ -14,7 +14,7 @@ pub threadlocal var error_callback: ?*const fn (
 
 /// An SDL error.
 pub const Error = error{
-SdlError,
+    SdlError,
 };
 
 /// Ensure two structs are equal in memory.
@@ -33,11 +33,11 @@ pub inline fn assertStructsEqual(
         std.debug.assert(@sizeOf(A) == @sizeOf(B));
         const info_a = @typeInfo(A).@"struct";
         const info_b = @typeInfo(B).@"struct";
-        const num_fields = info_a.fields.len;
-        std.debug.assert(info_b.fields.len == num_fields);
+        const num_fields = info_a.field_names.len;
+        std.debug.assert(info_b.field_names.len == num_fields);
         for (0..num_fields) |ind| {
-            std.debug.assert(@offsetOf(A, info_a.fields[ind].name) == @offsetOf(B, info_b.fields[ind].name));
-            std.debug.assert(@sizeOf(@FieldType(A, info_a.fields[ind].name)) == @sizeOf(@FieldType(B, info_b.fields[ind].name)));
+            std.debug.assert(@offsetOf(A, info_a.field_names[ind]) == @offsetOf(B, info_b.field_names[ind]));
+            std.debug.assert(@sizeOf(@FieldType(A, info_a.field_names[ind])) == @sizeOf(@FieldType(B, info_b.field_names[ind])));
         }
     }
 }

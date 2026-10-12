@@ -424,7 +424,7 @@ pub const Scancode = enum(c.SDL_Scancode) {
     /// This function is provided by zig-sdl3.
     pub fn toSdl(self: ?Scancode) c.SDL_Scancode {
         if (self) |val|
-            return @intFromEnum(val);
+            return @backingInt(val);
         return c.SDL_SCANCODE_UNKNOWN;
     }
 
@@ -444,7 +444,7 @@ pub const Scancode = enum(c.SDL_Scancode) {
     pub fn fromSdl(key_code: c.SDL_Scancode) ?Scancode {
         if (key_code == c.SDL_SCANCODE_UNKNOWN)
             return null;
-        return @enumFromInt(key_code);
+        return @fromBackingInt(@intCast(key_code));
     }
 };
 

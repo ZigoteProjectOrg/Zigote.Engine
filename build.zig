@@ -5,20 +5,33 @@ const std = @import("std");
 /// the sysroot the way a native build auto-detects them, so every module that compiles against or
 /// links Apple frameworks needs them added explicitly. No-op when no `--sysroot` is passed
 /// (native builds). iOS builds are always cross builds and always need this.
+/// The SDK / NDK root (`-Dsysroot`), null when not given. Set once at the top of `build`.
+var sysroot: ?[]const u8 = null;
+
 fn addAppleSdkPaths(b: *std.Build, mod: *std.Build.Module) void {
-    const sysroot = b.sysroot orelse return;
-    mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) });
+    const sdk = sysroot orelse return;
+    // Sysroot-relative, like the library path below: since zig 0.17 the sysroot is prepended to
+    // framework search paths as well, so an absolute SDK path would be doubled.
+    mod.addSystemFrameworkPath(.{ .cwd_relative = "/System/Library/Frameworks" });
     // Xcode 26 SDKs split some framework dependencies (e.g. UIKit's UIUtilities) into a separate
     // SubFrameworks directory that is on the default search path in Xcode but not for us.
-    mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/SubFrameworks" }) });
+    mod.addSystemFrameworkPath(.{ .cwd_relative = "/System/Library/SubFrameworks" });
     // macOS libc headers come from Zig's libc discovery (or --libc). Adding them as
     // -isystem puts SDK float.h ahead of Clang's wrapper and breaks libc++'s INFINITY.
     // iOS cross builds still need the explicit path for module C imports.
     if (mod.resolved_target.?.result.os.tag == .ios)
-        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "usr/include" }) });
+        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
     // The linker prepends the sysroot to -L paths itself, so this one stays sysroot-relative
     // (an absolute path would be doubled into <sdk>/<sdk>/usr/lib).
     mod.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+}
+
+fn androidArchDir(target: std.Build.ResolvedTarget) []const u8 {
+    return switch (target.result.cpu.arch) {
+        .aarch64 => "aarch64-linux-android",
+        .x86_64 => "x86_64-linux-android",
+        else => std.debug.panic("android: unsupported arch {s}", .{@tagName(target.result.cpu.arch)}),
+    };
 }
 
 /// Point a module at the NDK sysroot's per-architecture pieces — neither is derived from
@@ -26,26 +39,53 @@ fn addAppleSdkPaths(b: *std.Build, mod: *std.Build.Module) void {
 /// to -L paths itself (same trap as addAppleSdkPaths). The API level must match the one the
 /// target triple pins (…-android.34).
 fn addAndroidSysrootPaths(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    // Two bionic-isms clang's C-header translation cannot parse, neutralized for translation
-    // only (the C sources still compile against the real headers): the _FORTIFY_SOURCE overload
-    // set redefines sprintf & co with different types, and the nullability qualifiers are
-    // rejected where bionic applies them to array parameters. Every module that @cImports an
-    // NDK header needs these, so they live with the rest of the android module setup.
     // Android shared objects must be position-independent throughout; zig only infers PIC for
     // the compilation that produces the .so, not for statically-built dependencies.
     mod.pic = true;
-    mod.addCMacro("_FORTIFY_SOURCE", "0");
-    mod.addCMacro("_Nullable", "");
-    mod.addCMacro("_Nonnull", "");
-    mod.addCMacro("_Null_unspecified", "");
-    if (b.sysroot == null) return;
-    const arch_dir = switch (target.result.cpu.arch) {
-        .aarch64 => "aarch64-linux-android",
-        .x86_64 => "x86_64-linux-android",
-        else => std.debug.panic("android: unsupported arch {s}", .{@tagName(target.result.cpu.arch)}),
-    };
-    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ b.sysroot.?, "usr/include", arch_dir }) });
+    const ndk = sysroot orelse return;
+    const arch_dir = androidArchDir(target);
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ndk, "usr/include", arch_dir }) });
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ "/usr/lib", arch_dir, "34" }) });
+}
+
+/// Translate a set of C headers into a Zig module (`step.createModule()`), the replacement for
+/// `@cImport`, which zig 0.17 removed. The caller adds the include paths the headers need.
+/// ponytail: `addTranslateC` is itself deprecated for the external translate-c package; move
+/// there when std drops it — until then this costs no fetched dependency.
+fn translateHeaders(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    comptime headers: []const []const u8,
+) *std.Build.Step.TranslateC {
+    comptime var source: []const u8 = "";
+    inline for (headers) |h| source = source ++ "#include <" ++ h ++ ">\n";
+    const tc = b.addTranslateC(.{
+        .root_source_file = b.addWriteFiles().add("c.h", source),
+        .target = target,
+        .optimize = optimize,
+    });
+    const t = target.result;
+    // Windows/MinGW: std.Build defines _FORTIFY_SOURCE=2 outside Debug, and translate-c
+    // mistranslates the fortified wcscat/wcscpy wrappers (an extern in a local scope, then a call
+    // to the bare name — ziglang/zig #23275). They exist only when the macro is > 0, and they are
+    // bounds checks on C string calls the engine never makes.
+    if (t.os.tag == .windows) tc.defineCMacro("_FORTIFY_SOURCE", "0");
+    const sdk = sysroot orelse return tc;
+    // Translation does not inherit `--libc`, so the SDK / NDK headers are spelled out.
+    if (t.os.tag == .ios or t.abi.isAndroid())
+        tc.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+    if (t.abi.isAndroid()) {
+        tc.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include", androidArchDir(target) }) });
+        // Two bionic-isms translate-c cannot parse: the _FORTIFY_SOURCE overload set redefines
+        // sprintf & co with different types, and the nullability qualifiers are rejected where
+        // bionic applies them to array parameters.
+        tc.defineCMacro("_FORTIFY_SOURCE", "0");
+        tc.defineCMacro("_Nullable", "");
+        tc.defineCMacro("_Nonnull", "");
+        tc.defineCMacro("_Null_unspecified", "");
+    }
+    return tc;
 }
 
 /// One row per target the engine builds for: which prebuilt wgpu-native archive it needs, and what
@@ -76,25 +116,38 @@ const apple_wgpu_frameworks = [_][]const u8{ "Metal", "QuartzCore", "Foundation"
 const target_specs = [_]TargetSpec{
     // macOS: Metal/QuartzCore/Foundation/CoreFoundation + libobjc + libiconv.
     .{
-        .name = "macos-aarch64",       .os = .macos, .arch = .aarch64,
+        .name = "macos-aarch64",
+        .os = .macos,
+        .arch = .aarch64,
         .wgpu_dep = "wgpu_macos_aarch64",
-        .frameworks = &apple_wgpu_frameworks, .system_libs = &.{ "objc", "iconv" },
+        .frameworks = &apple_wgpu_frameworks,
+        .system_libs = &.{ "objc", "iconv" },
     },
     .{
-        .name = "macos-x86_64",        .os = .macos, .arch = .x86_64,
+        .name = "macos-x86_64",
+        .os = .macos,
+        .arch = .x86_64,
         .wgpu_dep = "wgpu_macos_x86_64",
-        .frameworks = &apple_wgpu_frameworks, .system_libs = &.{ "objc", "iconv" },
+        .frameworks = &apple_wgpu_frameworks,
+        .system_libs = &.{ "objc", "iconv" },
     },
     // iOS: the same Metal stack, no iconv — the iOS archive does not pull it.
     .{
-        .name = "ios-aarch64",         .os = .ios,   .arch = .aarch64,
+        .name = "ios-aarch64",
+        .os = .ios,
+        .arch = .aarch64,
         .wgpu_dep = "wgpu_ios_aarch64",
-        .frameworks = &apple_wgpu_frameworks, .system_libs = &.{"objc"},
+        .frameworks = &apple_wgpu_frameworks,
+        .system_libs = &.{"objc"},
     },
     .{
-        .name = "ios-aarch64-sim",     .os = .ios,   .arch = .aarch64, .simulator = true,
+        .name = "ios-aarch64-sim",
+        .os = .ios,
+        .arch = .aarch64,
+        .simulator = true,
         .wgpu_dep = "wgpu_ios_aarch64_simulator",
-        .frameworks = &apple_wgpu_frameworks, .system_libs = &.{"objc"},
+        .frameworks = &apple_wgpu_frameworks,
+        .system_libs = &.{"objc"},
     },
     // Android: Vulkan is dlopen'd at runtime; the hard deps are the NDK log and android
     // (ANativeWindow) libs. bionic keeps dlopen in its own library, which SDL's loadso path needs
@@ -102,28 +155,42 @@ const target_specs = [_]TargetSpec{
     // and the final link would warn. bionic does not export the _Unwind_* set the Rust panic path
     // references, so zig supplies it from its bundled LLVM libunwind.
     .{
-        .name = "android-aarch64",     .os = .linux, .arch = .aarch64, .android = true,
+        .name = "android-aarch64",
+        .os = .linux,
+        .arch = .aarch64,
+        .android = true,
         .wgpu_dep = "wgpu_android_aarch64",
         .system_libs = &.{ "log", "android", "dl", "unwind" },
     },
     .{
-        .name = "android-x86_64",      .os = .linux, .arch = .x86_64,  .android = true,
+        .name = "android-x86_64",
+        .os = .linux,
+        .arch = .x86_64,
+        .android = true,
         .wgpu_dep = "wgpu_android_x86_64", // emulator
         .system_libs = &.{ "log", "android", "dl", "unwind" },
     },
     // Linux: link_libc already covers pthread/dl/m; Rust's panic path needs unwind.
     .{
-        .name = "linux-x86_64",        .os = .linux, .arch = .x86_64,
-        .wgpu_dep = "wgpu_linux_x86_64",  .system_libs = &.{"unwind"},
+        .name = "linux-x86_64",
+        .os = .linux,
+        .arch = .x86_64,
+        .wgpu_dep = "wgpu_linux_x86_64",
+        .system_libs = &.{"unwind"},
     },
     .{
-        .name = "linux-aarch64",       .os = .linux, .arch = .aarch64,
-        .wgpu_dep = "wgpu_linux_aarch64", .system_libs = &.{"unwind"},
+        .name = "linux-aarch64",
+        .os = .linux,
+        .arch = .aarch64,
+        .wgpu_dep = "wgpu_linux_aarch64",
+        .system_libs = &.{"unwind"},
     },
     // Windows links wgpu_native.dll's import lib, so the DLL resolves its own d3d12/dxgi/WinRT/CRT
     // dependencies at load and there is nothing extra to link statically.
     .{
-        .name = "windows-x86_64",      .os = .windows, .arch = .x86_64,
+        .name = "windows-x86_64",
+        .os = .windows,
+        .arch = .x86_64,
         .wgpu_dep = "wgpu_windows_x86_64",
     },
 };
@@ -208,7 +275,7 @@ const webp_decode_srcs = [_][]const u8{
 fn vendoredStaticLib(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     opts: struct {
         name: []const u8,
         /// Include root added to the compile — for libwebp this must be the library root, since
@@ -234,7 +301,7 @@ fn vendoredStaticLib(
 /// Build the vendored libwebp (libraries/libwebp) as a self-contained static decode library. Replaces
 /// the Homebrew `webp` system lib. Hand-rolled (no upstream build.zig) — libwebp uses root-relative
 /// includes ("src/dsp/dsp.h"), so the compile include root is the libwebp root.
-fn buildWebp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+fn buildWebp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Step.Compile {
     const lib = vendoredStaticLib(b, target, optimize, .{
         .name = "webp",
         .include = "libraries/libwebp",
@@ -256,7 +323,7 @@ fn buildWebp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 /// `extern fn`, so it only needs link-time symbol resolution against this archive. Defines mirror
 /// upstream zaudio's build.zig (drop WebAudio/null/JACK/DSound/WinMM backends; macOS uses CoreAudio, so
 /// no runtime backend loading there).
-fn buildMiniaudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+fn buildMiniaudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Step.Compile {
     const lib = vendoredStaticLib(b, target, optimize, .{
         .name = "miniaudio",
         .include = "libraries/zaudio/libs/miniaudio",
@@ -316,7 +383,7 @@ fn buildMiniaudio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
 /// META (runtime component registration), SYSTEM+PIPELINE+MODULE (systems/progress/phases),
 /// QUERY_DSL+PARSER (cached queries), OS_API_IMPL (default OS timer/threads), TIMER (pipeline needs it).
 /// Mirrors buildMiniaudio/buildWebp — single C file, no Homebrew, no remote deps.
-fn buildFlecs(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+fn buildFlecs(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Step.Compile {
     const lib = vendoredStaticLib(b, target, optimize, .{
         .name = "flecs",
         .include = "libraries/zflecs/libs/flecs",
@@ -354,7 +421,7 @@ fn buildFlecs(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 /// library. Only the meshoptimizer C++ TUs are compiled — par_shapes/cgltf (the rest of zmesh) are not
 /// referenced by the engine, so they're omitted (lean). Backs the `zmesh_opt` binding used at mesh
 /// upload to reorder indices/vertices for GPU cache locality.
-fn buildMeshoptimizer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+fn buildMeshoptimizer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Step.Compile {
     const lib = vendoredStaticLib(b, target, optimize, .{
         .name = "meshoptimizer",
         .include = "libraries/zmesh/libs/meshoptimizer",
@@ -405,17 +472,26 @@ fn collectNamedStaticLib(b: *std.Build, dep: *std.Build.Dependency, name: []cons
 }
 
 /// Wire the renderer/core native dependencies onto `mod`: freetype + harfbuzz (allyourcodebase, built
-/// from source) and the pinned static wgpu-native. linkLibrary propagates freetype/harfbuzz headers for
-/// freetype_text.zig's @cImport. Image decode (webp) and model import (assimp) are wired on the FFI
+/// from source) and the pinned static wgpu-native. freetype_text.zig reaches their headers through
+/// the translated `freetype_c` / `harfbuzz_c` modules. Image decode (webp) and model import (assimp) are wired on the FFI
 /// module instead — `src/ffi/root.zig`/`assimp_loader.zig` are their only consumers. Nothing Homebrew.
-fn linkNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+fn linkNativeDeps(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
     // freetype + harfbuzz. `enable-libpng = true` matches the option harfbuzz passes to its own freetype
     // dependency, so both resolve to a single shared freetype artifact (no duplicate symbols). harfbuzz
     // is built with freetype support (default), providing the hb_ft_* used by freetype_text.zig.
     const freetype_dep = b.dependency("freetype", .{ .target = target, .optimize = optimize, .@"enable-libpng" = true });
     const harfbuzz_dep = b.dependency("harfbuzz", .{ .target = target, .optimize = optimize });
-    linkAndCollect(b, mod, freetype_dep.artifact("freetype"));
-    linkAndCollect(b, mod, harfbuzz_dep.artifact("harfbuzz"));
+    const freetype_lib = freetype_dep.artifact("freetype");
+    const harfbuzz_lib = harfbuzz_dep.artifact("harfbuzz");
+    linkAndCollect(b, mod, freetype_lib);
+    linkAndCollect(b, mod, harfbuzz_lib);
+    // freetype_text.zig's view of the two libraries' headers.
+    const freetype_h = translateHeaders(b, target, optimize, &.{ "ft2build.h", "freetype/freetype.h", "freetype/tttables.h", "freetype/ftoutln.h" });
+    freetype_h.addIncludePath(freetype_lib.getEmittedIncludeTree());
+    mod.addImport("freetype_c", freetype_h.createModule());
+    const harfbuzz_h = translateHeaders(b, target, optimize, &.{"hb.h"});
+    harfbuzz_h.addIncludePath(harfbuzz_lib.getEmittedIncludeTree());
+    mod.addImport("harfbuzz_c", harfbuzz_h.createModule());
     // freetype's own dependencies: libpng (embedded-bitmap decode) and zlib. They are separate
     // archives — freetype.a does not absorb them — so a static consumer needs them listed too.
     // Reached through freetype's OWN builder with the same arguments its build.zig passes, so
@@ -453,6 +529,9 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    if (b.option([]const u8, "sysroot", "SDK / NDK root. Pass the same path as --sysroot: since zig 0.17 a build script cannot read that flag.")) |s| {
+        if (s.len > 0) sysroot = s;
+    }
 
     // ── Build options ─────────────────────────────────────────────────────────
     // enable_3d gates the Assimp model importer — an editor-only subsystem (games load
@@ -477,7 +556,7 @@ pub fn build(b: *std.Build) void {
     // modes (what game exports ship), keep symbols in Debug/ReleaseSafe dev builds. Override with
     // -Dstrip=false for a symbolized ReleaseFast (profiling) build.
     const strip = b.option(bool, "strip", "Strip debug info from the shared library (default: true for ReleaseFast/ReleaseSmall).") orelse
-        (optimize == .ReleaseFast or optimize == .ReleaseSmall);
+        (optimize == .fast or optimize == .small);
 
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "enable_3d", enable_3d);
@@ -491,17 +570,19 @@ pub fn build(b: *std.Build) void {
     // with SIGILL. Every distro ships SDL without UBSan; so do we. Our own C deps already pass
     // -fno-sanitize=undefined (buildWebp/buildMiniaudio/buildFlecs) — this makes SDL consistent.
     // Android rides the linux ABI, so it needs the same treatment as desktop Linux.
-    const sdl3_dep = if ((target.result.os.tag == .ios or target.result.abi.isAndroid()) and b.sysroot != null) b.dependency("sdl3", .{
+    const sdl3_dep = if ((target.result.os.tag == .ios or target.result.abi.isAndroid()) and sysroot != null) b.dependency("sdl3", .{
         .target = target,
         .optimize = optimize,
         .c_sdl_sanitize_c = std.zig.SanitizeC.off,
+        .sysroot = @as([]const u8, sysroot orelse ""),
         // The binding's translate-c of the SDL headers needs the SDK's libc headers
         // (AvailabilityMacros.h & co) — same paths addAppleSdkPaths supplies to compiles.
-        .sdl_system_include_path = @as(std.Build.LazyPath, .{ .cwd_relative = b.pathJoin(&.{ b.sysroot.?, "usr/include" }) }),
+        .sdl_system_include_path = @as(std.Build.LazyPath, .{ .cwd_relative = b.pathJoin(&.{ sysroot.?, "usr/include" }) }),
     }) else b.dependency("sdl3", .{
         .target = target,
         .optimize = optimize,
         .c_sdl_sanitize_c = std.zig.SanitizeC.off,
+        .sysroot = @as([]const u8, sysroot orelse ""),
     });
     // The SDL3 C library itself (the binding module links it internally) — needed by the
     // static-lib merge just like the rest. Not via `artifact("SDL3")`: the binding registers the
@@ -527,7 +608,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── zig-gamedev SIMD math, handle pools, job system ─────────────────────────
-    // All vendored under libraries/ (pure-Zig, Zig-0.16-native, no system deps).
+    // All vendored under libraries/ (pure-Zig, no system deps).
     //   zmath — @Vector(4,f32) linear algebra backing the engine math hot paths
     //           (Mat4.mul / mulVec4 / inverse). (Frustum.intersectsSphere uses a plain 6-lane
     //           @Vector dot-and-compare in engine/math/frustum.zig, not zmath.)
@@ -634,52 +715,70 @@ pub fn build(b: *std.Build) void {
     ffi_mod.addOptions("build_options", build_opts);
     // miniaudio static archive — backs `src/ffi/audio.zig`'s zaudio.Device usage.
     linkAndCollect(b, ffi_mod, buildMiniaudio(b, target, optimize));
-    // flecs static archive — backs `src/ffi/ecs.zig`'s @cImport("flecs.h") usage. Gated by -Decs:
+    // flecs static archive — backs `src/ffi/ecs.zig` (header translated as `flecs_c`). Gated by -Decs:
     // when off, ecs.zig isn't compiled (see root.zig) so neither the header nor the archive is needed.
     if (enable_ecs) {
         linkAndCollect(b, ffi_mod, buildFlecs(b, target, optimize));
-        ffi_mod.addIncludePath(b.path("libraries/zflecs/libs/flecs"));
+        const flecs_h = translateHeaders(b, target, optimize, &.{"flecs.h"});
+        flecs_h.addIncludePath(b.path("libraries/zflecs/libs/flecs"));
+        ffi_mod.addImport("flecs_c", flecs_h.createModule());
     }
     // meshoptimizer static archive — backs `zmesh_opt`'s mesh-upload cache optimization.
-    linkAndCollect(b, ffi_mod, buildMeshoptimizer(b, target, optimize));
+    const meshoptimizer_lib = buildMeshoptimizer(b, target, optimize);
+    linkAndCollect(b, ffi_mod, meshoptimizer_lib);
     // Jolt (JoltC) 3D physics — backs `src/ffi/physics.zig`. Gated by -Dphysics3d: when off, root.zig
     // swaps in physics_stub.zig, so neither the JoltC header nor its archive is needed.
     if (enable_physics3d) {
         const zphysics_dep = b.dependency("zphysics", .{
             .target = target,
             .optimize = optimize,
-            .enable_asserts = optimize == .Debug,
+            .enable_asserts = optimize == .debug,
         });
-        ffi_mod.addIncludePath(zphysics_dep.path("libs/JoltC"));
+        const joltc_h = translateHeaders(b, target, optimize, &.{"JoltPhysicsC.h"});
+        joltc_h.addIncludePath(zphysics_dep.path("libs/JoltC"));
+        ffi_mod.addImport("joltc_c", joltc_h.createModule());
         linkAndCollect(b, ffi_mod, zphysics_dep.artifact("joltc"));
     }
     // freetype/harfbuzz + wgpu-native arrive (statically, from source) via `zigote_mod` which this
     // module imports — no Homebrew link here. webp + assimp are this module's own loaders:
     // webp decode (vendored libraries/libwebp, from source) — root.zig's image loader is its only
-    // consumer; the src/ include resolves @cInclude("webp/decode.h").
+    // consumer, through the translated `webp_c` module.
     linkAndCollect(b, ffi_mod, buildWebp(b, target, optimize));
-    ffi_mod.addIncludePath(b.path("libraries/libwebp/src"));
+    const webp_h = translateHeaders(b, target, optimize, &.{ "webp/decode.h", "webp/types.h" });
+    webp_h.addIncludePath(b.path("libraries/libwebp/src"));
+    ffi_mod.addImport("webp_c", webp_h.createModule());
+    // execinfo.h (backtrace) for root.zig's crash handler, where libc has it. The module always
+    // exists, empty elsewhere, because an import must resolve even from an untaken branch.
+    const has_execinfo = target.result.os.tag == .macos or (target.result.os.tag == .linux and target.result.abi.isGnu());
+    ffi_mod.addImport("execinfo_c", if (has_execinfo)
+        translateHeaders(b, target, optimize, &.{"execinfo.h"}).createModule()
+    else
+        b.createModule(.{ .root_source_file = b.addWriteFiles().add("execinfo_c.zig", "") }));
     // Assimp (Open Asset Import Library) — model import for every supported format. Built from source
-    // (allyourcodebase/assimp), formats trimmed to what GltfLoader imports. linkLibrary propagates its
-    // headers for assimp_loader.zig's @cImport. Gated by -Denable3d: lean 2D builds skip the C++ build.
+    // (allyourcodebase/assimp), formats trimmed to what GltfLoader imports. assimp_loader.zig reaches its
+    // headers through the translated `assimp_c` module. Gated by -Denable3d: lean 2D builds skip the C++ build.
     if (enable_3d) {
         const assimp_dep = b.dependency("zig_assimp", .{
             .target = target,
             .optimize = optimize,
             .formats = @as([]const u8, "glTF2,glTF,FBX,Obj,Collada,Ply,STL"),
         });
-        linkAndCollect(b, ffi_mod, assimp_dep.artifact("assimp"));
+        const assimp_lib = assimp_dep.artifact("assimp");
+        linkAndCollect(b, ffi_mod, assimp_lib);
+        const assimp_h = translateHeaders(b, target, optimize, &.{ "assimp/cimport.h", "assimp/scene.h", "assimp/postprocess.h", "assimp/material.h" });
+        assimp_h.addIncludePath(assimp_lib.getEmittedIncludeTree());
+        ffi_mod.addImport("assimp_c", assimp_h.createModule());
     }
     // Every module the engine builds. Two separate hand-ordered copies of this list used to sit
     // in the Android and Windows blocks below, so adding a module meant remembering both.
     const all_modules = [_]*std.Build.Module{
-        abi_mod,  core_mod,   ui_mod,     engine_mod, zigote_mod,
-        ffi_mod,  wgpu_mod,   zaudio_mod, zmath_mod,  zmesh_opt_mod,
+        abi_mod, core_mod, ui_mod,     engine_mod, zigote_mod,
+        ffi_mod, wgpu_mod, zaudio_mod, zmath_mod,  zmesh_opt_mod,
     };
 
     if (target.result.abi.isAndroid()) {
-        // Every module that reaches an NDK header through @cImport needs the bionic translation
-        // workarounds and the sysroot's per-architecture paths.
+        // Every module needs PIC and the sysroot's per-architecture paths (header translation gets
+        // its bionic workarounds in translateHeaders).
         for (all_modules) |mod| addAndroidSysrootPaths(b, mod, target);
     }
 
@@ -718,31 +817,6 @@ pub fn build(b: *std.Build) void {
         // through Metal on macOS) — no explicit links needed now the native Metal backend is gone.
     }
 
-    // Windows/MinGW: undo the _FORTIFY_SOURCE=2 that std.Build defines for every non-Debug build.
-    // zig 0.16 moved translate-c out of the compiler, and the standalone one mistranslates MinGW's
-    // fortified string wrappers — for wcscat/wcscpy it emits the extern in a local struct and then
-    // calls the bare name, leaving the local unused, which is a hard error. Those wrappers exist
-    // ONLY when _FORTIFY_SOURCE > 0, so defining it back to 0 removes them and the miscompile with
-    // them. Nothing is lost: they are bounds checks on C string calls this engine never makes.
-    // ponytail: delete this block once translate-c handles extern-in-local-scope (ziglang/zig #23275,
-    // PR #23384). It is a toolchain bug, not something the engine can fix properly.
-    if (target.result.os.tag == .windows) {
-        for (all_modules) |m| m.addCMacro("_FORTIFY_SOURCE", "0");
-
-        // The sdl3 package builds its `c` module with its own TranslateC step and exposes no option
-        // to touch its macros, so reach the step through the generated file it owns. The id check
-        // keeps the @fieldParentPtr honest if that package ever generates `c` some other way.
-        if (sdl3_dep.module("sdl3").import_table.get("c")) |c_mod| {
-            if (c_mod.root_source_file) |lp| switch (lp) {
-                .generated => |g| if (g.file.step.id == .translate_c) {
-                    const tc: *std.Build.Step.TranslateC = @fieldParentPtr("step", g.file.step);
-                    tc.defineCMacro("_FORTIFY_SOURCE", "0");
-                },
-                else => {},
-            };
-        }
-    }
-
     const shared_lib = b.addLibrary(.{
         .name = "zigote",
         .root_module = ffi_mod,
@@ -755,8 +829,9 @@ pub fn build(b: *std.Build) void {
     // Linux — `zig build shared-lib` in Debug dies with "process terminated with signal SEGV", so the
     // whole C# Debug workflow is unbuildable there. LLVM handles it. Release modes already use LLVM,
     // so this only costs Debug build time.
-    // ponytail: unconditional — re-test with a newer Zig and drop this line when the self-hosted
-    // backend stops crashing.
+    // ponytail: unconditional. On zig 0.17 a Debug x86_64-linux cross build from macOS links
+    // without this line, but the result was never run — drop it after a Debug build passes the
+    // tests on a Linux x86_64 machine.
     shared_lib.use_llvm = true;
     // Android 16 (API 36) requires every packaged .so to load on a 16 KB-page device, and the NDK's
     // own default is still 4 KB — so the loader rejects a library laid out at 4 KB alignment outright.
@@ -866,8 +941,7 @@ pub fn build(b: *std.Build) void {
                     "\"android\":{},\"simulator\":{},\"wgpu_dep\":\"{s}\"}}{s}",
                 .{
                     json,         spec.name,      @tagName(spec.os), @tagName(spec.arch),
-                    spec.android, spec.simulator, spec.wgpu_dep,
-                    if (i + 1 < target_specs.len) ",\n" else "\n",
+                    spec.android, spec.simulator, spec.wgpu_dep,     if (i + 1 < target_specs.len) ",\n" else "\n",
                 },
             );
         }
@@ -915,10 +989,11 @@ pub fn build(b: *std.Build) void {
     const shader_check = b.addExecutable(.{ .name = "check-gpu", .root_module = shader_check_mod });
     shader_check.use_llvm = true; // same self-hosted-backend crash the shared library works around
     linkWgpuNative(b, shader_check_mod, target);
+    shader_check_mod.linkLibrary(meshoptimizer_lib);
     const run_shader_check = b.addRunArtifact(shader_check);
     // Reads src/renderer/shaders/ in its own test; run from the build root either way.
     run_shader_check.setCwd(b.path("."));
-    const shader_check_step = b.step("check-gpu", "Headless GPU checks: compile every WGSL shader, verify the texture row-pitch contract");
+    const shader_check_step = b.step("check-gpu", "Headless GPU checks: shaders, renderer pipelines, instanced draws, texture row pitch");
     shader_check_step.dependOn(&run_shader_check.step);
 
     const shader_check_tests = b.addTest(.{ .root_module = shader_check_mod });

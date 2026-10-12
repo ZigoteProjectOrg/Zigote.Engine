@@ -101,11 +101,11 @@ pub const ShaderFiles = struct {
         // Write each source.
         var file_iter = self.files.iterator();
         while (file_iter.next()) |file|
-        try writer.writer.print("pub const {s} = @import(\"{s}.zig\");\n", .{ @tagName(file.key), file.value.name });
+            try writer.writer.print("pub const {s} = @import(\"{s}.zig\");\n", .{ @tagName(file.key), file.value.name });
         const zig_shim = b.createModule(.{ .root_source_file = write_files.add(b.fmt("{s}.zig", .{self.base_name}), try writer.toOwnedSlice()) });
         file_iter = self.files.iterator();
         while (file_iter.next()) |file|
-        file.value.addSource(b, zig_shim, write_files, file.key != .zon);
+            file.value.addSource(b, zig_shim, write_files, file.key != .zon);
         module.addImport(b.fmt("{s}.zig", .{self.base_name}), zig_shim);
     }
 
@@ -487,7 +487,7 @@ pub fn compileShaderMetadata2Zon(
                 .{
                     .root_source_file = b.path("build/tools/shader_metadata2zon.zig"),
                     .target = b.graph.host,
-                    .optimize = .ReleaseFast,
+                    .optimize = .fast,
                 },
             ),
         },
@@ -518,7 +518,7 @@ pub fn compileSpirvExecutionMode(
                 .{
                     .root_source_file = b.path("build/tools/spirv_execution_mode.zig"),
                     .target = b.graph.host,
-                    .optimize = .ReleaseFast,
+                    .optimize = .fast,
                 },
             ),
         },
