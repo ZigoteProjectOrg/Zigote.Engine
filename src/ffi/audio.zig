@@ -222,6 +222,15 @@ fn destroyOneShot(os: *OneShot) void {
 }
 
 /// Age + reap fire-and-forget one-shots. Called once per frame by the host (PlaySession / App.Frame).
+/// Whether any fire-and-forget one-shot is still playing — i.e. whether `update` has anything to
+/// age. The host loop uses it to decide if it may sleep longer than a frame.
+pub fn anyOneShotActive(self: *const AudioState) bool {
+    for (&self.oneshots) |*os| {
+        if (os.active) return true;
+    }
+    return false;
+}
+
 pub fn update(self: *AudioState, dt: f32) void {
     for (&self.oneshots) |*os| {
         if (!os.active) continue;

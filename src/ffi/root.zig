@@ -2190,6 +2190,17 @@ export fn zigote_audio_update(dt: f32) ZgStatus {
     return .ok;
 }
 
+/// Whether a fire-and-forget one-shot is still sounding and so still needs `zigote_audio_update`
+/// at frame cadence. False when audio was never opened.
+export fn zigote_audio_has_active_oneshots() bool {
+    const state = engineState() orelse return false;
+    if (state.audio == null) return false;
+    state.audio_lock.lock();
+    defer state.audio_lock.unlock();
+    if (state.audio) |a| return audio_ffi.anyOneShotActive(a);
+    return false;
+}
+
 /// Set the spatial listener pose (position + forward + world-up). All sounds spatialise against it.
 export fn zigote_audio_set_listener(px: f32, py: f32, pz: f32, fx: f32, fy: f32, fz: f32, ux: f32, uy: f32, uz: f32) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
