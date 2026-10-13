@@ -691,6 +691,31 @@ pub const GpuUi = struct {
         return true;
     }
 
+    /// Take a texture that was rendered rather than uploaded — a capture of the UI — and make it
+    /// an image a paint command can draw by `key`. Pinned, and owned by the cache from here on:
+    /// releaseCachedImage frees the texture and the view like any uploaded image's.
+    pub fn adoptImageTexture(
+        self: *GpuUi,
+        device: *wgpu.Device,
+        key: u64,
+        texture: *wgpu.Texture,
+        texture_view: *wgpu.TextureView,
+    ) !void {
+        const bind_group = createImageBindGroup(
+            device,
+            self.text.bindGroupLayout(),
+            texture_view,
+            self.text.getSampler(),
+        ) orelse return error.WgpuImageBindGroupUnavailable;
+        errdefer bind_group.release();
+        try self.image_cache.put(key, .{
+            .texture = texture,
+            .texture_view = texture_view,
+            .bind_group = bind_group,
+            .pinned = true,
+        });
+    }
+
     /// Drop a cached image's GPU resources. Only valid between frames — mid-frame the texture may
     /// still be recorded in an open command encoder. Returns true if an entry was removed.
     pub fn releaseCachedImage(self: *GpuUi, key: u64) bool {

@@ -4574,6 +4574,66 @@ export fn zigote_capture_ui_bmp(
     return if (captureTextureBmp(state, tex, path)) .ok else .err;
 }
 
+/// Render the currently-submitted main UI paint list into a texture and hand it back as an image
+/// handle, ready to draw with an image paint command and freed with zigote_release_texture like
+/// any other. The pixels never leave the GPU — no readback, no CPU copy, no upload — which is what
+/// makes it cheap enough to do in the middle of an interaction (a theme dissolve lays the old
+/// frame over the new one this way). Main window only: the texture lives in its image cache.
+/// Submit the paint commands first, as for zigote_capture_ui_bmp. Returns 0 on failure.
+export fn zigote_capture_ui_texture(width: u32, height: u32, scale: f32) u64 {
+    const state = engineState() orelse return 0;
+    if (width == 0 or height == 0) return 0;
+
+    // The swapchain format, so the UI pipelines match. It is an sRGB format wherever one exists
+    // (pickSurfaceFormat), the same family image textures use, so it samples like one.
+    const tex = state.device.createTexture(&.{
+        .label = wgpu.StringView.fromSlice("zigote ui capture texture"),
+        .usage = wgpu.TextureUsages.render_attachment | wgpu.TextureUsages.texture_binding,
+        .dimension = .@"2d",
+        .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
+        .format = state.wgpu_config.format,
+        .mip_level_count = 1,
+        .sample_count = 1,
+    }) orelse return 0;
+    const view = tex.createView(null) orelse {
+        tex.release();
+        return 0;
+    };
+
+    wgpu_renderer.wgpu.renderToTexture(
+        state.device,
+        state.queue,
+        &state.gpu_ui,
+        state.paint_list,
+        view,
+        width,
+        height,
+        scale,
+    ) catch |err| {
+        std.log.err("zigote_capture_ui_texture render failed: {}", .{err});
+        view.release();
+        tex.release();
+        return 0;
+    };
+
+    const handle = nextGpuHandle(state);
+    state.gpu_ui.adoptImageTexture(state.device, handle, tex, view) catch {
+        view.release();
+        tex.release();
+        return 0;
+    };
+
+    // An empty pixel slice is the registry's "already resident on the GPU" — see LoadedImage.
+    state.image_lock.lock();
+    const registered = state.image_registry.put(handle, .{ .width = width, .height = height, .pixels = &.{} });
+    state.image_lock.unlock();
+    registered catch {
+        _ = state.gpu_ui.releaseCachedImage(handle);
+        return 0;
+    };
+    return handle;
+}
+
 /// Dump the main window's persistent scene texture — the pixels partial repaint accumulates into
 /// and every frame composites from — to a BMP. Unlike zigote_capture_ui_bmp this re-renders
 /// nothing, so it shows what is actually retained, stale regions included. Fails until the first
