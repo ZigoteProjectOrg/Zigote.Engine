@@ -879,8 +879,8 @@ fn createNativeSurface(instance: *wgpu.Instance, window: sdl3.video.Window, meta
     const props = sdl3.c.SDL_GetWindowProperties(window.value);
 
     switch (@import("builtin").os.tag) {
-        // iOS shares the macOS path: SDL's MetalView wraps a CAMetalLayer on both (the comment
-        // at the MetalView creation site notes it exists exactly for macOS/iOS).
+    // iOS shares the macOS path: SDL's MetalView wraps a CAMetalLayer on both (the comment
+    // at the MetalView creation site notes it exists exactly for macOS/iOS).
         .macos, .ios => {
             var src = wgpu.SurfaceSourceMetalLayer{ .layer = metal_layer orelse return error.MetalLayerUnavailable };
             return instance.createSurface(&.{ .next_in_chain = @ptrCast(&src.chain), .label = label }) orelse error.WgpuSurfaceUnavailable;
@@ -1031,12 +1031,12 @@ fn zigote_init_impl(
         else switch (@import("builtin").os.tag) {
             // iOS is Metal-only — falling into the generic arm would ask for Vulkan/GL and
             // find neither.
-            .macos, .ios => wgpu.InstanceBackends.metal,
-            .windows => wgpu.InstanceBackends.dx12 | wgpu.InstanceBackends.vulkan,
-            // Desktop Linux (and anything else): Vulkan with the GL fallback wgpu would
-            // resolve anyway.
-            else => wgpu.InstanceBackends.vulkan | wgpu.InstanceBackends.gl,
-        },
+                .macos, .ios => wgpu.InstanceBackends.metal,
+                .windows => wgpu.InstanceBackends.dx12 | wgpu.InstanceBackends.vulkan,
+                // Desktop Linux (and anything else): Vulkan with the GL fallback wgpu would
+                // resolve anyway.
+                else => wgpu.InstanceBackends.vulkan | wgpu.InstanceBackends.gl,
+            },
     };
     // Route wgpu's diagnostics into the engine log before anything can fail: on Android a fatal
     // surface/adapter error otherwise aborts with no message at all.
@@ -4776,9 +4776,9 @@ fn createSecondaryWindowImpl(
         .alpha_mode = if (pending_transparent_window or custom_role)
             pickAlphaMode(&capabilities, true)
         else if (capabilities.alpha_mode_count > 0)
-            capabilities.alpha_modes[0]
-        else
-            .auto,
+                capabilities.alpha_modes[0]
+            else
+                .auto,
     };
     surface.configure(&config);
 
@@ -5325,9 +5325,9 @@ export fn zigote_window_native_parent(window_handle: u64, out_kind: *u32, out_pt
     const window = if (window_handle == 0)
         state.window
     else if (windowFromHandle(state, window_handle)) |win|
-        win.window
-    else
-        return .ok;
+            win.window
+        else
+            return .ok;
     const props = sdl3.c.SDL_GetWindowProperties(window.value);
 
     switch (@import("builtin").os.tag) {
@@ -6482,7 +6482,7 @@ var pending_transparent_window: bool = false;
 fn pickAlphaMode(caps: *const wgpu.SurfaceCapabilities, want_transparent: bool) wgpu.CompositeAlphaMode {
     if (want_transparent) {
         for (caps.alpha_modes[0..caps.alpha_mode_count]) |m|
-            if (m == .premultiplied) return m;
+        if (m == .premultiplied) return m;
     }
     return if (caps.alpha_mode_count > 0) caps.alpha_modes[0] else .auto;
 }
@@ -7728,16 +7728,16 @@ export fn zigote_set_render_settings_3d(settings: ZgRenderSettings3D) ZgStatus {
     const ns = g.settings;
     const env_changed =
         old.ambient_intensity != ns.ambient_intensity or
-        !std.meta.eql(old.sky_horizon, ns.sky_horizon) or
-        !std.meta.eql(old.sky_zenith, ns.sky_zenith) or
-        !std.meta.eql(old.sky_ground, ns.sky_ground) or
-        !std.meta.eql(old.env_avg, ns.env_avg) or
-        old.sun_azimuth_deg != ns.sun_azimuth_deg or
-        old.sun_elevation_deg != ns.sun_elevation_deg or
-        old.sun_intensity != ns.sun_intensity or
-        old.overhead != ns.overhead or
-        old.horizon_glow != ns.horizon_glow or
-        old.sun_sharpness != ns.sun_sharpness;
+            !std.meta.eql(old.sky_horizon, ns.sky_horizon) or
+            !std.meta.eql(old.sky_zenith, ns.sky_zenith) or
+            !std.meta.eql(old.sky_ground, ns.sky_ground) or
+            !std.meta.eql(old.env_avg, ns.env_avg) or
+            old.sun_azimuth_deg != ns.sun_azimuth_deg or
+            old.sun_elevation_deg != ns.sun_elevation_deg or
+            old.sun_intensity != ns.sun_intensity or
+            old.overhead != ns.overhead or
+            old.horizon_glow != ns.horizon_glow or
+            old.sun_sharpness != ns.sun_sharpness;
     if (env_changed) g.env_dirty = true;
     return .ok;
 }

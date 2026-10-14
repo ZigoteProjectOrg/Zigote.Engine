@@ -1891,8 +1891,8 @@ fn copySceneToBackdrop(
 
 /// Region a backdrop capture must cover for the consecutive backdrop-op run starting at
 /// `ops[start]` — the run's device AABBs inflated by the glass shader's maximum sampling reach
-/// (liquid_glass_shader_source.wgsl: |disp| ≤ 0.86·BEND·t ≈ 2.4·t, up to half as much again
-/// for the dispersion taps at full pinch ⇒ 4·t; frost ≤ FROST_PX + FROST_THICK·t = 3 + 0.9·t;
+/// (liquid_glass_shader_source.wgsl: |disp| ≤ 0.86·BEND·t < 1.55·t, dispersion adds at most
+/// 9.5%, conservatively retained inside 4·t; frost ≤ FROST_PX + FROST_THICK·t = 3 + 0.9·t;
 /// +16 px of AA slack). Null = copy the whole frame: a
 /// custom shader effect samples the backdrop arbitrarily, the bounds are unknown, or the union
 /// is nearly the frame anyway. ONLY sound on paths that draw every op in order — a path that

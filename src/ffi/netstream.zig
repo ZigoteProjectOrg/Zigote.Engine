@@ -391,12 +391,12 @@ fn onDecoderRead(
     // was O(n²) over the stream's life; amortized it is now O(n).
     if (self.decoder != null and self.read_pos > probe_bytes and
         self.read_pos > self.encoded.items.len / 2)
-    {
-        const remaining = self.encoded.items.len - self.read_pos;
-        std.mem.copyForwards(u8, self.encoded.items[0..remaining], self.encoded.items[self.read_pos..]);
-        self.encoded.shrinkRetainingCapacity(remaining);
-        self.read_pos = 0;
-    }
+        {
+            const remaining = self.encoded.items.len - self.read_pos;
+            std.mem.copyForwards(u8, self.encoded.items[0..remaining], self.encoded.items[self.read_pos..]);
+            self.encoded.shrinkRetainingCapacity(remaining);
+            self.read_pos = 0;
+        }
 
     return .success;
 }
