@@ -251,6 +251,37 @@ export fn zigote_window_chrome_toggle_maximize(window_id: u32) ZgStatus {
     return .ok;
 }
 
+/// Enter or leave desktop fullscreen (borderless, on the window's current display, no mode
+/// change). SDL answers with the normal resize events, so the swapchain follows on its own.
+export fn zigote_window_set_fullscreen(window_id: u32, on: bool) ZgStatus {
+    const win = sdlWindow(window_id) orelse return .ok;
+    _ = sdl3.c.SDL_SetWindowFullscreenMode(win, null);
+    _ = sdl3.c.SDL_SetWindowFullscreen(win, on);
+    return .ok;
+}
+
+/// Whether the window is fullscreen right now — the OS can leave it on its own (macOS green
+/// button, Esc in a Space), so callers ask rather than remember.
+export fn zigote_window_is_fullscreen(window_id: u32) bool {
+    const win = sdlWindow(window_id) orelse return false;
+    return sdl3.c.SDL_GetWindowFlags(win) & sdl3.c.SDL_WINDOW_FULLSCREEN != 0;
+}
+
+/// Float the window above every other application's windows (picture-in-picture), or release it.
+export fn zigote_window_set_always_on_top(window_id: u32, on: bool) ZgStatus {
+    const win = sdlWindow(window_id) orelse return .ok;
+    _ = sdl3.c.SDL_SetWindowAlwaysOnTop(win, on);
+    return .ok;
+}
+
+/// Lock the window's width/height ratio while the user resizes it; 0 unlocks. A video window
+/// resized off its aspect would only grow letterbox bars.
+export fn zigote_window_set_aspect_ratio(window_id: u32, aspect: f32) ZgStatus {
+    const win = sdlWindow(window_id) orelse return .ok;
+    _ = sdl3.c.SDL_SetWindowAspectRatio(win, aspect, aspect);
+    return .ok;
+}
+
 const edge = 8; // CSD resize border, logical px
 const corner = 16;
 
