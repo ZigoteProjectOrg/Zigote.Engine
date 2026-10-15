@@ -2691,8 +2691,10 @@ fn fillPaintList(
                 } });
             },
             @backingInt(abi.ZgPaintOp.liquid_glass) => {
-                if (rec.len < @sizeOf(abi.ZgPaintLiquidGlass)) continue;
+                // The probe words are optional: a shorter record is an older host's, probe 0.
+                if (rec.len < @offsetOf(abi.ZgPaintLiquidGlass, "probe")) continue;
                 const op: *const abi.ZgPaintLiquidGlass = @ptrCast(@alignCast(rec.ptr));
+                const has_probe = rec.len >= @sizeOf(abi.ZgPaintLiquidGlass);
                 try current.append(alloc, .{ .liquid_glass = .{
                     .bounds = xywh(op.bounds),
                     .color = rgba(op.color),
@@ -2702,6 +2704,7 @@ fn fillPaintList(
                     .glow_y = op.glow_y,
                     .pinch = op.pinch,
                     .adapt = op.adapt,
+                    .probe = if (has_probe) op.probe else 0,
                 } });
             },
             @backingInt(abi.ZgPaintOp.text) => {
@@ -4643,6 +4646,14 @@ export fn zigote_capture_scene_bmp(path_ptr: [*c]const u8, path_len: usize) ZgRe
     if (path_ptr == null) return .err;
     const tex = state.gpu_ui.scene_texture orelse return .err;
     return if (captureTextureBmp(state, tex, path_ptr[0..path_len])) .ok else .err;
+}
+
+/// Mean perceptual luminance (0..1) of the content under the glass pane painted with probe `slot`
+/// on the main window, from the latest finished measurement — a frame or two behind. Negative
+/// until the slot has been measured once.
+export fn zigote_glass_probe(slot: u32) f32 {
+    if (slot >= wgpu_renderer.wgpu.probe_slots) return -1.0;
+    return wgpu_renderer.wgpu.probe_luma[slot];
 }
 
 /// Get the current surface pixel dimensions.

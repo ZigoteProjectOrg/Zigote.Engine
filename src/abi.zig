@@ -455,6 +455,11 @@ pub const ZgPaintLiquidGlass = extern struct {
     glow_y: f32,
     pinch: f32,
     adapt: f32,
+    /// Adaptive-glass probe slot (1..63; 0 = none): the renderer measures the backdrop's mean
+    /// luminance under this pane and reports it through zigote_glass_probe. Optional — a host that
+    /// predates it sends the record without these two words and is decoded as probe 0.
+    probe: u32 = 0,
+    pad: u32 = 0,
 };
 
 /// One text run. `is_shadow` selects the drop-shadow variant, which used to be signalled by

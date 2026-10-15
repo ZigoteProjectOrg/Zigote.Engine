@@ -79,6 +79,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let blur_start = -in.blur_radius;
     let blur_end = in.blur_radius;
     alpha = 1.0 - smoothstep(blur_start, blur_end, dist);
+    // Outer-only shadow (glass casters): border_width = 1 + the caster's inset from this SDF.
+    if (in.border_width > 0.0) {
+      alpha *= smoothstep(-aa, aa, dist + in.border_width - 1.0);
+    }
   } else if (in.border_width > 0.0) {
     let inside_outer = smoothstep(aa, -aa, dist);
     let inside_inner = smoothstep(aa, -aa, dist + in.border_width);

@@ -197,6 +197,8 @@ pub const GpuUi = struct {
     rt_blit_bind_group: ?*wgpu.BindGroup = null,
     rt_scene_width: u32 = 0,
     rt_scene_height: u32 = 0,
+    /// Adaptive-glass luminance probes — lazily created the first frame a pane asks for one.
+    probe: GlassProbe = .{},
 
     /// GPU memory held by this window's 2D renderer, in bytes, attributed per subsystem. Diagnostic
     /// only (no allocation). scene/backdrop are the (lazy) glass-backdrop capture targets — null on a
@@ -746,6 +748,7 @@ pub const GpuUi = struct {
     }
 
     pub fn deinit(self: *GpuUi) void {
+        self.probe.deinit();
         if (self.clip_staging.len != 0) self.allocator.free(self.clip_staging);
         releaseBuffer(self.shape_vertex_buffer);
         releaseBuffer(self.shape_instance_buffer);
@@ -882,6 +885,8 @@ const FramePaint = struct {
     shape_vertices: std.ArrayList(ShapeVertex) = .empty,
     shape_instances: std.ArrayList(ShapeInstance) = .empty,
     liquid_glass_vertices: std.ArrayList(LiquidGlassVertex) = .empty,
+    /// Probed glass panes, in op order (see GlassProbe).
+    probe_vertices: std.ArrayList(ProbeVertex) = .empty,
     text_vertices: std.ArrayList(ft_text.TextVertex) = .empty,
     image_vertices: std.ArrayList(ImageVertex) = .empty,
     shader_effect_vertices: std.ArrayList(ShaderEffectVertex) = .empty,
@@ -902,6 +907,7 @@ const FramePaint = struct {
         self.image_vertices.deinit(allocator);
         self.text_vertices.deinit(allocator);
         self.liquid_glass_vertices.deinit(allocator);
+        self.probe_vertices.deinit(allocator);
         self.shape_vertices.deinit(allocator);
         self.shape_instances.deinit(allocator);
     }
@@ -1047,6 +1053,11 @@ pub fn renderFrame(
     const backdrop_bg = gpu_ui.backdrop_bind_group;
 
     const uploaded = try uploadFrameVertices(device, queue, gpu_ui, &frame);
+    // Both reset every frame: `uploaded` bounds the slice probeBackdropRun reads from THIS
+    // frame's probe list, and a stale count over an empty list reads out of bounds.
+    gpu_ui.probe.frame_mask = 0;
+    gpu_ui.probe.uploaded = 0;
+    if (frame.probe_vertices.items.len > 0) gpu_ui.probe.upload(device, queue, gpu_ui.backdrop_bgl, frame.probe_vertices.items);
 
     const encoder = device.createCommandEncoder(&.{
         .label = wgpu.StringView.fromSlice("zigote ui command encoder"),
@@ -1114,6 +1125,7 @@ pub fn renderFrame(
     // Either path just repainted the full frame (or valid damage over intact contents) — the
     // persistence baseline is whole again.
     gpu_ui.scene_contents_lost = false;
+    const probe_readback = gpu_ui.probe.copyOut(encoder);
 
     // Blit scene_texture -> swapchain. Skipped in direct mode — the ops were rendered straight into the
     // swapchain view above, so there is nothing to copy.
@@ -1155,7 +1167,9 @@ pub fn renderFrame(
         return error.WgpuPresentFailed;
     }
 
+    if (probe_readback) |rb| gpu_ui.probe.map(rb);
     _ = device.poll(false, &submission);
+    gpu_ui.probe.harvest();
     last_present_ns = nowNs() -% t_submitted;
 }
 
@@ -1446,6 +1460,7 @@ fn replayFramePaint(
                     frame_height,
                 );
                 copySceneToBackdrop(encoder, st, bt, frame_width, frame_height, region);
+                probeBackdropRun(encoder, gpu_ui, frame, op_idx);
                 pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
                 backdrop_fresh = true;
             }
@@ -1780,6 +1795,7 @@ fn replayFramePaintDamage(
                     // stale the capture — so the op-order run scan backdropCopyRegion does is
                     // not sound here (the reuse run can span past a culled non-backdrop op).
                     copySceneToBackdrop(encoder, st, bt, frame_width, frame_height, null);
+                    probeBackdropRun(encoder, gpu_ui, frame, op_idx);
                     pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
                     backdrop_fresh = true;
                 }
@@ -2366,6 +2382,15 @@ fn appendPaintOps(
                     .clip_rect = current_clip,
                     .clip_offset = current_clip_offset,
                 });
+                // Glass ops never merge, so the op just appended is this pane's.
+                if (lg.probe > 0 and lg.probe < probe_slots and added > 0) {
+                    try frame.probe_vertices.append(allocator, .{
+                        .position = .{ (@as(f32, @floatFromInt(lg.probe)) + 0.5) / @as(f32, probe_slots) * 2.0 - 1.0, 0.0 },
+                        .rect = .{ lg.bounds.x * scale_factor, lg.bounds.y * scale_factor, lg.bounds.width * scale_factor, lg.bounds.height * scale_factor },
+                        .op_index = @intCast(frame.ops.items.len - 1),
+                        .slot = lg.probe,
+                    });
+                }
             },
 
             .shader_effect => |se| shader_effect: {
@@ -2534,7 +2559,11 @@ fn appendPaintOps(
                     },
                     shadow.color,
                     shapeRadius((shadow.radius + spread) * scale_factor, shadow.squircle),
-                    0.0,
+                    // A squircle shadow is cast by a glass pane, and glass shows what is under it:
+                    // a shadow filling the caster's interior would be refracted into the lens and
+                    // grey it. The border slot (unused by shadows) carries 1 + the caster's inset
+                    // so the shader can cut the interior out, as a CSS box-shadow is.
+                    if (shadow.squircle) 1.0 + spread * scale_factor else 0.0,
                     blur * scale_factor,
                     frame_width,
                     frame_height,
@@ -3399,6 +3428,222 @@ fn createTexturePipelineLayout(
         .bind_group_layout_count = bind_group_layouts.len,
         .bind_group_layouts = &bind_group_layouts,
     });
+}
+
+// ── Adaptive-glass probes ─────────────────────────────────────────────────────
+// A pane that asks for a probe (ZgPaintLiquidGlass.probe = slot 1..63) gets the mean perceptual
+// luminance of the backdrop under it measured right after its capture — before any glass of its run
+// draws — by one point in a 64×1 r32float target (glass_probe_shader_source.wgsl). The target is
+// copied to one of three map-read buffers and mapped asynchronously; a finished map lands in
+// `probe_luma` a frame or two later, which the host polls. No probe on screen = none of this runs.
+// Main window only: the overlay-over-3D path (replayFramePaintLoad) does not probe.
+
+pub const probe_slots = 64;
+
+/// Latest mean perceptual backdrop luminance per probe slot; < 0 = not measured yet.
+pub var probe_luma: [probe_slots]f32 = @splat(-1.0);
+
+pub const ProbeVertex = extern struct {
+    position: [2]f32, // NDC centre of the slot's texel
+    rect: [4]f32, // pane rect, device px
+    op_index: u32, // the glass op it belongs to — selects the capture run (not a shader input)
+    slot: u32,
+};
+
+const ProbeReadback = struct {
+    buffer: ?*wgpu.Buffer = null,
+    state: enum { idle, copied, mapping, ready } = .idle,
+    mask: u64 = 0,
+};
+
+const GlassProbe = struct {
+    shader: ?*wgpu.ShaderModule = null,
+    layout: ?*wgpu.PipelineLayout = null,
+    pipeline: ?*wgpu.RenderPipeline = null,
+    texture: ?*wgpu.Texture = null,
+    view: ?*wgpu.TextureView = null,
+    vbuf: ?*wgpu.Buffer = null,
+    readbacks: [3]ProbeReadback = .{ .{}, .{}, .{} },
+    /// Slots measured this frame.
+    frame_mask: u64 = 0,
+    /// Probe vertices uploaded this frame (capped at probe_slots).
+    uploaded: u32 = 0,
+
+    fn deinit(self: *GlassProbe) void {
+        for (&self.readbacks) |*rb| {
+            if (rb.state == .ready) if (rb.buffer) |b| b.unmap();
+            releaseBuffer(rb.buffer);
+        }
+        releaseBuffer(self.vbuf);
+        if (self.view) |v| v.release();
+        if (self.texture) |t| t.release();
+        if (self.pipeline) |p| p.release();
+        if (self.layout) |l| l.release();
+        if (self.shader) |sh| sh.release();
+        self.* = .{};
+    }
+
+    /// Create everything on first use; on failure probing simply stays off.
+    fn ensure(self: *GlassProbe, device: *wgpu.Device, backdrop_bgl: *wgpu.BindGroupLayout) bool {
+        if (self.pipeline != null) return true;
+        var desc = wgpu.shaderModuleWGSLDescriptor(.{
+            .label = "zigote glass probe shader",
+            .code = ui_shaders.glass_probe_shader_source,
+        });
+        self.shader = device.createShaderModule(&desc) orelse return self.fail();
+        self.layout = createTexturePipelineLayout(device, backdrop_bgl) orelse return self.fail();
+        const attributes = [_]wgpu.VertexAttribute{
+            .{ .format = .float32x2, .offset = @offsetOf(ProbeVertex, "position"), .shader_location = 0 },
+            .{ .format = .float32x4, .offset = @offsetOf(ProbeVertex, "rect"), .shader_location = 1 },
+        };
+        const vbl = wgpu.VertexBufferLayout{
+            .array_stride = @sizeOf(ProbeVertex),
+            .attribute_count = attributes.len,
+            .attributes = &attributes,
+        };
+        const target = wgpu.ColorTargetState{ .format = .r32_float };
+        const fragment = wgpu.FragmentState{
+            .module = self.shader.?,
+            .entry_point = wgpu.StringView.fromSlice("fs_main"),
+            .target_count = 1,
+            .targets = @ptrCast(&target),
+        };
+        self.pipeline = device.createRenderPipeline(&.{
+            .label = wgpu.StringView.fromSlice("zigote glass probe pipeline"),
+            .layout = self.layout,
+            .vertex = .{
+                .module = self.shader.?,
+                .entry_point = wgpu.StringView.fromSlice("vs_main"),
+                .buffer_count = 1,
+                .buffers = @ptrCast(&vbl),
+            },
+            .primitive = .{ .topology = .point_list },
+            .multisample = .{},
+            .fragment = &fragment,
+        }) orelse return self.fail();
+        self.texture = device.createTexture(&.{
+            .label = wgpu.StringView.fromSlice("zigote glass probe target"),
+            .usage = wgpu.TextureUsages.render_attachment | wgpu.TextureUsages.copy_src,
+            .dimension = .@"2d",
+            .size = .{ .width = probe_slots, .height = 1, .depth_or_array_layers = 1 },
+            .format = .r32_float,
+            .mip_level_count = 1,
+            .sample_count = 1,
+        }) orelse return self.fail();
+        self.view = self.texture.?.createView(null) orelse return self.fail();
+        self.vbuf = device.createBuffer(&.{
+            .label = wgpu.StringView.fromSlice("zigote glass probe points"),
+            .usage = wgpu.BufferUsages.vertex | wgpu.BufferUsages.copy_dst,
+            .size = probe_slots * @sizeOf(ProbeVertex),
+        }) orelse return self.fail();
+        for (&self.readbacks) |*rb| {
+            rb.buffer = device.createBuffer(&.{
+                .label = wgpu.StringView.fromSlice("zigote glass probe readback"),
+                .usage = wgpu.BufferUsages.map_read | wgpu.BufferUsages.copy_dst,
+                .size = probe_slots * 4, // one f32 row = 256 bytes, already copy-aligned
+            }) orelse return self.fail();
+        }
+        return true;
+    }
+
+    fn fail(self: *GlassProbe) bool {
+        self.deinit();
+        return false;
+    }
+
+    fn upload(self: *GlassProbe, device: *wgpu.Device, queue: *wgpu.Queue, backdrop_bgl: *wgpu.BindGroupLayout, vertices: []const ProbeVertex) void {
+        self.uploaded = 0;
+        if (!self.ensure(device, backdrop_bgl)) return;
+        const n = @min(vertices.len, probe_slots);
+        queue.writeBuffer(self.vbuf.?, 0, vertices.ptr, n * @sizeOf(ProbeVertex));
+        self.uploaded = @intCast(n);
+    }
+
+    /// Copy this frame's measurements to an idle readback buffer. Null when nothing was measured
+    /// or every buffer is still in flight (that frame's numbers are dropped; the next one comes).
+    fn copyOut(self: *GlassProbe, encoder: *wgpu.CommandEncoder) ?*ProbeReadback {
+        if (self.frame_mask == 0) return null;
+        const tex = self.texture orelse return null;
+        for (&self.readbacks) |*rb| {
+            if (rb.state != .idle) continue;
+            encoder.copyTextureToBuffer(
+                &.{ .texture = tex, .mip_level = 0, .origin = .{ .x = 0, .y = 0, .z = 0 }, .aspect = .all },
+                &.{ .buffer = rb.buffer.?, .layout = .{ .offset = 0, .bytes_per_row = probe_slots * 4, .rows_per_image = 1 } },
+                &.{ .width = probe_slots, .height = 1, .depth_or_array_layers = 1 },
+            );
+            rb.state = .copied;
+            rb.mask = self.frame_mask;
+            return rb;
+        }
+        return null;
+    }
+
+    /// After submit: start the async map. The callback only flips state; harvest reads.
+    fn map(_: *GlassProbe, rb: *ProbeReadback) void {
+        const cb = struct {
+            fn f(status: wgpu.MapAsyncStatus, _: wgpu.StringView, ud1: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+                const r: *ProbeReadback = @ptrCast(@alignCast(ud1.?));
+                r.state = if (status == .success) .ready else .idle;
+            }
+        }.f;
+        rb.state = .mapping;
+        _ = rb.buffer.?.mapAsync(wgpu.MapModes.read, 0, probe_slots * 4, .{ .callback = cb, .userdata1 = rb });
+    }
+
+    fn harvest(self: *GlassProbe) void {
+        for (&self.readbacks) |*rb| {
+            if (rb.state != .ready) continue;
+            if (rb.buffer.?.getConstMappedRange(0, probe_slots * 4)) |mapped| {
+                const values: [*]const f32 = @ptrCast(@alignCast(mapped));
+                for (0..probe_slots) |i| {
+                    if (rb.mask & (@as(u64, 1) << @intCast(i)) != 0) probe_luma[i] = values[i];
+                }
+            }
+            rb.buffer.?.unmap();
+            rb.state = .idle;
+        }
+    }
+};
+
+/// Measure the probed panes of the backdrop run starting at `ops[start]`, against the capture
+/// just taken for it. Its own render pass, between the copy and the scene pass resuming.
+fn probeBackdropRun(encoder: *wgpu.CommandEncoder, gpu_ui: *GpuUi, frame: *const FramePaint, start: usize) void {
+    const probe = &gpu_ui.probe;
+    if (probe.uploaded == 0) return;
+    const pipeline = probe.pipeline orelse return;
+    const view = probe.view orelse return;
+    const bg = gpu_ui.backdrop_bind_group orelse return;
+    var end = start;
+    while (end < frame.ops.items.len and drawOpNeedsBackdrop(frame.ops.items[end])) end += 1;
+
+    var first: ?u32 = null;
+    var count: u32 = 0;
+    const n = @min(probe.uploaded, frame.probe_vertices.items.len);
+    for (frame.probe_vertices.items[0..n], 0..) |v, i| {
+        if (v.op_index < start or v.op_index >= end) continue;
+        if (first == null) first = @intCast(i);
+        count += 1;
+        probe.frame_mask |= @as(u64, 1) << @intCast(v.slot);
+    }
+    const f = first orelse return;
+
+    const attachment = wgpu.ColorAttachment{
+        .view = view,
+        .load_op = .load,
+        .store_op = .store,
+        .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    };
+    const pass = encoder.beginRenderPass(&.{
+        .color_attachment_count = 1,
+        .color_attachments = @ptrCast(&attachment),
+    }) orelse return;
+    defer pass.release();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bg, 0, null);
+    pass.setVertexBuffer(0, probe.vbuf.?, 0, probe.uploaded * @sizeOf(ProbeVertex));
+    // Probes of one run are contiguous: they were appended in op order.
+    pass.draw(count, 1, f, 0);
+    pass.end();
 }
 
 fn appendLiquidGlass(

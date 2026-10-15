@@ -14,3 +14,6 @@ pub const shape_instanced_shader_source = prelude.roundedClip(0) ++ prelude.colo
 pub const liquid_glass_shader_source = prelude.corner ++ @embedFile("shaders/liquid_glass_shader_source.wgsl");
 
 pub const image_shader_source = prelude.roundedClip(1) ++ @embedFile("shaders/image_shader_source.wgsl");
+
+/// Adaptive-glass probe: mean backdrop luminance under a pane, one point per pane (see wgpu.zig).
+pub const glass_probe_shader_source = @embedFile("shaders/glass_probe_shader_source.wgsl");

@@ -72,6 +72,7 @@ const BACKLIGHT   = 0.70;
 const SHEEN       = 0.045;
 const AMBIENT     = 0.08;
 const CONTACT     = 0.045;
+const LIFT_GAIN   = 4.0;    // light glass: max exposure lift (2 stops) before it fills with white
 
 const LUMA = vec3<f32>(0.2126, 0.7152, 0.0722);
 
@@ -114,7 +115,13 @@ fn adapt_luminance(rgb: vec3<f32>, adapt: f32) -> vec3<f32> {
   if (aim < lum) {
     return mix(rgb * (aim / max(lum, 1e-4)), vec3<f32>(aim), s * 0.15);
   }
-  return mix(rgb, vec3<f32>(1.0), (aim - lum) / max(1.0 - lum, 1e-4));
+  // Lift by exposure first (up to LIFT_GAIN, never past a clipping channel), then fill the rest
+  // with white. A straight mix toward white turns dark blue into lilac grey; Apple's light glass
+  // over a deep picture stays that picture's colour, only paler.
+  let gain = min(min(aim / max(lum, 1e-4), LIFT_GAIN), 1.0 / max(max(rgb.r, max(rgb.g, rgb.b)), 1e-4));
+  let lifted = rgb * max(gain, 1.0);
+  let l2 = dot(lifted, LUMA);
+  return mix(lifted, vec3<f32>(1.0), clamp((aim - l2) / max(1.0 - l2, 1e-4), 0.0, 1.0));
 }
 
 // Tint. `amount` (0 = clear glass, 1 = strongest) is independent of edge coverage: dark tints

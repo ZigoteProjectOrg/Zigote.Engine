@@ -105,6 +105,8 @@ pub const LiquidGlass = struct {
     /// Adaptive luminance: <0 anchors the backdrop dark (for light content),
     /// >0 anchors it light (for dark content), 0 = off. Magnitude is strength.
     adapt: f32 = 0,
+    /// Adaptive-glass probe slot; 0 = none (see GlassProbe in wgpu.zig).
+    probe: u32 = 0,
 };
 
 pub const Shadow = struct {
