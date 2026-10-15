@@ -3,17 +3,20 @@
 
 const prelude = @import("shader_prelude.zig");
 
-pub const shape_shader_source = prelude.roundedClip(0) ++ prelude.color ++ @embedFile("shaders/shape_shader_source.wgsl");
+/// VertexOut + fs_main shared by both shape pipelines — one SDF, so they cannot drift apart.
+const shape_fragment = @embedFile("shaders/common_shape.wgsl") ++ "\n";
+
+pub const shape_shader_source = prelude.roundedClip(0) ++ prelude.color ++ shape_fragment ++ @embedFile("shaders/shape_shader_source.wgsl");
 /// Instanced rect/border/shadow — same fragment stage, corners derived from the vertex index.
-pub const shape_instanced_shader_source = prelude.roundedClip(0) ++ prelude.color ++ @embedFile("shaders/shape_instanced_shader_source.wgsl");
+pub const shape_instanced_shader_source = prelude.roundedClip(0) ++ prelude.color ++ shape_fragment ++ @embedFile("shaders/shape_instanced_shader_source.wgsl");
 
 // Liquid glass shader: physically-based refraction + rim lighting.
 // Samples a backdrop texture (captured before glass pass) at refracted UV offsets
 // to create the real "looking through glass" effect. Ported from the
 // reference implementation (whynotmake.it / Tim Lehmann, 2025).
-pub const liquid_glass_shader_source = prelude.corner ++ @embedFile("shaders/liquid_glass_shader_source.wgsl");
+pub const liquid_glass_shader_source = prelude.corner ++ prelude.color ++ @embedFile("shaders/liquid_glass_shader_source.wgsl");
 
-pub const image_shader_source = prelude.roundedClip(1) ++ @embedFile("shaders/image_shader_source.wgsl");
+pub const image_shader_source = prelude.roundedClip(1) ++ prelude.color ++ @embedFile("shaders/image_shader_source.wgsl");
 
 /// Adaptive-glass probe: mean backdrop luminance under a pane, one point per pane (see wgpu.zig).
 pub const glass_probe_shader_source = @embedFile("shaders/glass_probe_shader_source.wgsl");

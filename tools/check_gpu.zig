@@ -42,6 +42,7 @@ const shaders = [_]Shader{
     .{ .name = "shape_instanced", .source = ui_shaders.shape_instanced_shader_source },
     .{ .name = "image", .source = ui_shaders.image_shader_source },
     .{ .name = "liquid_glass", .source = ui_shaders.liquid_glass_shader_source },
+    .{ .name = "glass_probe", .source = ui_shaders.glass_probe_shader_source },
     .{ .name = "text", .source = freetype_text.text_shader_source },
     .{ .name = "blur_h", .source = wgpu_blur.h_wgsl },
     .{ .name = "blur_v", .source = wgpu_blur.v_wgsl },

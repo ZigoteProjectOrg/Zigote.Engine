@@ -5403,7 +5403,6 @@ fn renderSecondaryWindow(window_handle: u64) ZgStatus {
         win.config.width,
         win.config.height,
         win.pending_scale,
-        win.frame_index,
         &[_]zg.Rect{},
         false, // secondary window: no partial repaint, no glass → render straight to its swapchain
     ) catch |err| {
@@ -7237,7 +7236,6 @@ fn passCompositePresent(ctx: *PassContext) anyerror!void {
             w,
             h,
             scale,
-            state.frame_index,
         );
 
         if (state.overlay_paint_list.commands.items.len > 0) {
@@ -7251,7 +7249,6 @@ fn passCompositePresent(ctx: *PassContext) anyerror!void {
                 w,
                 h,
                 scale,
-                state.frame_index,
             );
         }
 
@@ -7277,7 +7274,6 @@ fn passCompositePresent(ctx: *PassContext) anyerror!void {
             w,
             h,
             scale,
-            state.frame_index,
             state.pending_damage[0..state.pending_damage_count],
             true, // main window: keeps a persistent scene texture for partial repaint + glass backdrop
         );

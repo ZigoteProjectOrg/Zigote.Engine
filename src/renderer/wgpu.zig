@@ -275,41 +275,13 @@ pub const GpuUi = struct {
         errdefer shape_shader.release();
 
         const attributes = [_]wgpu.VertexAttribute{
-            .{
-                .format = .float32x2,
-                .offset = @offsetOf(ShapeVertex, "position"),
-                .shader_location = 0,
-            },
-            .{
-                .format = .unorm8x4,
-                .offset = @offsetOf(ShapeVertex, "color"),
-                .shader_location = 1,
-            },
-            .{
-                .format = .float32x2,
-                .offset = @offsetOf(ShapeVertex, "local_pos"),
-                .shader_location = 2,
-            },
-            .{
-                .format = .float32x2,
-                .offset = @offsetOf(ShapeVertex, "rect_size"),
-                .shader_location = 3,
-            },
-            .{
-                .format = .float32,
-                .offset = @offsetOf(ShapeVertex, "radius"),
-                .shader_location = 4,
-            },
-            .{
-                .format = .float32,
-                .offset = @offsetOf(ShapeVertex, "border_width"),
-                .shader_location = 5,
-            },
-            .{
-                .format = .float32,
-                .offset = @offsetOf(ShapeVertex, "blur_radius"),
-                .shader_location = 6,
-            },
+            .{ .format = .float32x2, .offset = @offsetOf(ShapeVertex, "position"), .shader_location = 0 },
+            .{ .format = .unorm8x4, .offset = @offsetOf(ShapeVertex, "color"), .shader_location = 1 },
+            .{ .format = .float32x2, .offset = @offsetOf(ShapeVertex, "local_pos"), .shader_location = 2 },
+            .{ .format = .float32x2, .offset = @offsetOf(ShapeVertex, "rect_size"), .shader_location = 3 },
+            .{ .format = .float32, .offset = @offsetOf(ShapeVertex, "radius"), .shader_location = 4 },
+            .{ .format = .float32, .offset = @offsetOf(ShapeVertex, "border_width"), .shader_location = 5 },
+            .{ .format = .float32, .offset = @offsetOf(ShapeVertex, "blur_radius"), .shader_location = 6 },
         };
 
         const vertex_buffer_layout = wgpu.VertexBufferLayout{
@@ -417,56 +389,16 @@ pub const GpuUi = struct {
         errdefer liquid_glass_shader.release();
 
         const attributes_lg = [_]wgpu.VertexAttribute{
-            .{
-                .format = .float32x2,
-                .offset = @offsetOf(LiquidGlassVertex, "position"),
-                .shader_location = 0,
-            },
-            .{
-                .format = .unorm8x4,
-                .offset = @offsetOf(LiquidGlassVertex, "color"),
-                .shader_location = 1,
-            },
-            .{
-                .format = .float32x2,
-                .offset = @offsetOf(LiquidGlassVertex, "local_pos"),
-                .shader_location = 2,
-            },
-            .{
-                .format = .float32x2,
-                .offset = @offsetOf(LiquidGlassVertex, "rect_size"),
-                .shader_location = 3,
-            },
-            .{
-                .format = .float32,
-                .offset = @offsetOf(LiquidGlassVertex, "radius"),
-                .shader_location = 4,
-            },
-            .{
-                .format = .float32,
-                .offset = @offsetOf(LiquidGlassVertex, "thickness"),
-                .shader_location = 5,
-            },
-            .{
-                .format = .float32x2,
-                .offset = @offsetOf(LiquidGlassVertex, "glow_pos"),
-                .shader_location = 6,
-            },
-            .{
-                .format = .float32,
-                .offset = @offsetOf(LiquidGlassVertex, "pinch_strength"),
-                .shader_location = 7,
-            },
-            .{
-                .format = .float32,
-                .offset = @offsetOf(LiquidGlassVertex, "clear_tint"),
-                .shader_location = 8,
-            },
-            .{
-                .format = .float32,
-                .offset = @offsetOf(LiquidGlassVertex, "adapt"),
-                .shader_location = 9,
-            },
+            .{ .format = .float32x2, .offset = @offsetOf(LiquidGlassVertex, "position"), .shader_location = 0 },
+            .{ .format = .unorm8x4, .offset = @offsetOf(LiquidGlassVertex, "color"), .shader_location = 1 },
+            .{ .format = .float32x2, .offset = @offsetOf(LiquidGlassVertex, "local_pos"), .shader_location = 2 },
+            .{ .format = .float32x2, .offset = @offsetOf(LiquidGlassVertex, "rect_size"), .shader_location = 3 },
+            .{ .format = .float32, .offset = @offsetOf(LiquidGlassVertex, "radius"), .shader_location = 4 },
+            .{ .format = .float32, .offset = @offsetOf(LiquidGlassVertex, "thickness"), .shader_location = 5 },
+            .{ .format = .float32x2, .offset = @offsetOf(LiquidGlassVertex, "glow_pos"), .shader_location = 6 },
+            .{ .format = .float32, .offset = @offsetOf(LiquidGlassVertex, "pinch_strength"), .shader_location = 7 },
+            .{ .format = .float32, .offset = @offsetOf(LiquidGlassVertex, "clear_tint"), .shader_location = 8 },
+            .{ .format = .float32, .offset = @offsetOf(LiquidGlassVertex, "adapt"), .shader_location = 9 },
         };
 
         const vertex_buffer_layout_lg = wgpu.VertexBufferLayout{
@@ -547,21 +479,9 @@ pub const GpuUi = struct {
         errdefer image_shader.release();
 
         const image_attributes = [_]wgpu.VertexAttribute{
-            .{
-                .format = .float32x2,
-                .offset = @offsetOf(ImageVertex, "position"),
-                .shader_location = 0,
-            },
-            .{
-                .format = .float32x2,
-                .offset = @offsetOf(ImageVertex, "uv"),
-                .shader_location = 1,
-            },
-            .{
-                .format = .unorm8x4,
-                .offset = @offsetOf(ImageVertex, "color"),
-                .shader_location = 2,
-            },
+            .{ .format = .float32x2, .offset = @offsetOf(ImageVertex, "position"), .shader_location = 0 },
+            .{ .format = .float32x2, .offset = @offsetOf(ImageVertex, "uv"), .shader_location = 1 },
+            .{ .format = .unorm8x4, .offset = @offsetOf(ImageVertex, "color"), .shader_location = 2 },
         };
 
         const image_vertex_buffer_layout = wgpu.VertexBufferLayout{
@@ -570,16 +490,11 @@ pub const GpuUi = struct {
             .attributes = &image_attributes,
         };
 
-        const image_color_target = wgpu.ColorTargetState{
-            .format = format,
-            .blend = &wgpu.BlendState.alpha_blending,
-        };
-
         const image_fragment = wgpu.FragmentState{
             .module = image_shader,
             .entry_point = wgpu.StringView.fromSlice("fs_main"),
             .target_count = 1,
-            .targets = @ptrCast(&image_color_target),
+            .targets = @ptrCast(&color_target),
         };
 
         const text = try ft_text.FreeTypeTextRenderer.init(
@@ -777,6 +692,8 @@ pub const GpuUi = struct {
         var it = self.image_cache.valueIterator();
         while (it.next()) |cached| {
             cached.bind_group.release();
+            // Same ownership rule as releaseCachedImage: a borrowed entry's owner frees the rest.
+            if (cached.borrowed) continue;
             cached.texture_view.release();
             cached.texture.release();
         }
@@ -958,7 +875,6 @@ pub fn renderFrame(
     frame_width: u32,
     frame_height: u32,
     scale_factor: f32,
-    frame_index: u32,
     // Sub-rectangle partial-repaint regions (absolute logical px). When non-empty AND the frame has no
     // backdrop-sampling op (Liquid Glass / custom shader), the scene texture is preserved (loadOp=load)
     // and only these disjoint rects are redrawn. Empty = full clear + redraw (the default).
@@ -1068,7 +984,6 @@ pub fn renderFrame(
     // violated (or transiently while a live resize outruns relayout) — it used to be animated as a
     // debug tell, but the color cycling read as a rainbow shimmer around every window during
     // resizes. A fixed dark fill still exposes contract violations without flashing.
-    _ = frame_index;
     // Transparent windows clear to alpha 0 — the rounded-corner cutouts the app's clip leaves
     // uncovered composite as see-through instead of the debug fill.
     const clear = if (gpu_ui.transparent_clear)
@@ -1126,6 +1041,9 @@ pub fn renderFrame(
     // persistence baseline is whole again.
     gpu_ui.scene_contents_lost = false;
     const probe_readback = gpu_ui.probe.copyOut(encoder);
+    // The uploaded probe points belong to THIS frame's ops. Left set, the next renderToTexture or
+    // overlay replay would draw them against its own frame's op indices and a stale backdrop.
+    gpu_ui.probe.uploaded = 0;
 
     // Blit scene_texture -> swapchain. Skipped in direct mode — the ops were rendered straight into the
     // swapchain view above, so there is nothing to copy.
@@ -1366,57 +1284,37 @@ fn uploadFrameVertices(
     const quad_count = @max(frame.text_vertices.items.len / 4, @max(frame.image_vertices.items.len / 4, 1));
     try ensureQuadIndexBuffer(device, queue, gpu_ui, quad_count);
 
-    if (frame.shape_vertices.items.len > 0) {
-        const bytes = std.mem.sliceAsBytes(frame.shape_vertices.items);
-        const buffer = try ensureVertexBuffer(device, &gpu_ui.shape_vertex_buffer, &gpu_ui.shape_vertex_buffer_size, "zigote shape vertices", bytes.len);
-        queue.writeBuffer(buffer, 0, bytes.ptr, bytes.len);
-        uploaded.shape = buffer;
-        uploaded.shape_bytes_len = bytes.len;
-    }
-
-    if (frame.liquid_glass_vertices.items.len > 0) {
-        const bytes = std.mem.sliceAsBytes(frame.liquid_glass_vertices.items);
-        const buffer = try ensureVertexBuffer(device, &gpu_ui.liquid_glass_vertex_buffer, &gpu_ui.liquid_glass_vertex_buffer_size, "zigote liquid glass vertices", bytes.len);
-        queue.writeBuffer(buffer, 0, bytes.ptr, bytes.len);
-        uploaded.liquid_glass = buffer;
-        uploaded.liquid_glass_bytes_len = bytes.len;
-    }
-
-    if (frame.shape_instances.items.len > 0) {
-        const bytes = std.mem.sliceAsBytes(frame.shape_instances.items);
-        const buffer = try ensureVertexBuffer(device, &gpu_ui.shape_instance_buffer, &gpu_ui.shape_instance_buffer_size, "zigote shape instances", bytes.len);
-        queue.writeBuffer(buffer, 0, bytes.ptr, bytes.len);
-        uploaded.shape_instances = buffer;
-        uploaded.shape_instances_bytes_len = bytes.len;
-    }
-
-    if (frame.text_vertices.items.len > 0) {
-        const bytes = std.mem.sliceAsBytes(frame.text_vertices.items);
-        const buffer = try ensureVertexBuffer(device, &gpu_ui.text_vertex_buffer, &gpu_ui.text_vertex_buffer_size, "zigote text vertices", bytes.len);
-        queue.writeBuffer(buffer, 0, bytes.ptr, bytes.len);
-        uploaded.text = buffer;
-        uploaded.text_bytes_len = bytes.len;
-    }
-
-    if (frame.image_vertices.items.len > 0) {
-        const bytes = std.mem.sliceAsBytes(frame.image_vertices.items);
-        const buffer = try ensureVertexBuffer(device, &gpu_ui.image_vertex_buffer, &gpu_ui.image_vertex_buffer_size, "zigote image vertices", bytes.len);
-        queue.writeBuffer(buffer, 0, bytes.ptr, bytes.len);
-        uploaded.image = buffer;
-        uploaded.image_bytes_len = bytes.len;
-    }
-
-    if (frame.shader_effect_vertices.items.len > 0) {
-        const bytes = std.mem.sliceAsBytes(frame.shader_effect_vertices.items);
-        const buffer = try ensureVertexBuffer(device, &gpu_ui.shader_effect_vertex_buffer, &gpu_ui.shader_effect_vertex_buffer_size, "zigote shader effect vertices", bytes.len);
-        queue.writeBuffer(buffer, 0, bytes.ptr, bytes.len);
-        uploaded.shader_effect = buffer;
-        uploaded.shader_effect_bytes_len = bytes.len;
-    }
+    uploaded.shape_bytes_len = try uploadList(device, queue, &gpu_ui.shape_vertex_buffer, &gpu_ui.shape_vertex_buffer_size, "zigote shape vertices", frame.shape_vertices.items, &uploaded.shape);
+    uploaded.liquid_glass_bytes_len = try uploadList(device, queue, &gpu_ui.liquid_glass_vertex_buffer, &gpu_ui.liquid_glass_vertex_buffer_size, "zigote liquid glass vertices", frame.liquid_glass_vertices.items, &uploaded.liquid_glass);
+    uploaded.shape_instances_bytes_len = try uploadList(device, queue, &gpu_ui.shape_instance_buffer, &gpu_ui.shape_instance_buffer_size, "zigote shape instances", frame.shape_instances.items, &uploaded.shape_instances);
+    uploaded.text_bytes_len = try uploadList(device, queue, &gpu_ui.text_vertex_buffer, &gpu_ui.text_vertex_buffer_size, "zigote text vertices", frame.text_vertices.items, &uploaded.text);
+    uploaded.image_bytes_len = try uploadList(device, queue, &gpu_ui.image_vertex_buffer, &gpu_ui.image_vertex_buffer_size, "zigote image vertices", frame.image_vertices.items, &uploaded.image);
+    uploaded.shader_effect_bytes_len = try uploadList(device, queue, &gpu_ui.shader_effect_vertex_buffer, &gpu_ui.shader_effect_vertex_buffer_size, "zigote shader effect vertices", frame.shader_effect_vertices.items, &uploaded.shader_effect);
 
     return uploaded;
 }
 
+/// Grow `slot` to fit `items` and write them. Returns the byte length; `out` stays null when empty.
+fn uploadList(
+    device: *wgpu.Device,
+    queue: *wgpu.Queue,
+    slot: *?*wgpu.Buffer,
+    capacity: *usize,
+    label: []const u8,
+    items: anytype,
+    out: *?*wgpu.Buffer,
+) !usize {
+    if (items.len == 0) return 0;
+    const bytes = std.mem.sliceAsBytes(items);
+    const buffer = try ensureVertexBuffer(device, slot, capacity, label, bytes.len);
+    queue.writeBuffer(buffer, 0, bytes.ptr, bytes.len);
+    out.* = buffer;
+    return bytes.len;
+}
+
+/// Replay every op in order into `scene_view`. `clear` = null loads the existing contents instead:
+/// that is the game/editor overlay path, where the caller first copied the viewport into the scene
+/// texture and the UI draws on top (glass then refracts the game).
 fn replayFramePaint(
     encoder: *wgpu.CommandEncoder,
     scene_view: *wgpu.TextureView,
@@ -1429,12 +1327,15 @@ fn replayFramePaint(
     gpu_ui: *GpuUi,
     frame: *const FramePaint,
     uploaded: UploadedFrameVertices,
-    clear: wgpu.Color,
+    clear: ?wgpu.Color,
     scale_factor: f32,
     frame_width: u32,
     frame_height: u32,
 ) !void {
-    var pass = try beginScenePassClear(encoder, scene_view, clear, frame_width, frame_height);
+    var pass = if (clear) |c|
+        try beginScenePassClear(encoder, scene_view, c, frame_width, frame_height)
+    else
+        try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
 
     // One capture serves every consecutive backdrop-sampling op: the capture only goes stale when
     // a NON-backdrop op has drawn into the scene since. Glass deliberately never refracts sibling
@@ -1461,74 +1362,6 @@ fn replayFramePaint(
                 );
                 copySceneToBackdrop(encoder, st, bt, frame_width, frame_height, region);
                 probeBackdropRun(encoder, gpu_ui, frame, op_idx);
-                pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
-                backdrop_fresh = true;
-            }
-        } else backdrop_fresh = false;
-
-        try drawOp(
-            pass,
-            gpu_ui,
-            op,
-            uploaded,
-            backdrop_bind_group,
-            scale_factor,
-            frame_width,
-            frame_height,
-            null, // full-frame path: no damage scissor
-        );
-
-        // A chained filter must see the previous pass's output, or a multi-pass pipeline
-        // (tone -> LUT -> grain) silently collapses to whichever pass ran last. Only effects
-        // that ask for it pay the refresh: Liquid Glass and backdrop blur share one capture on
-        // purpose, and a copy per op is what made a row of glass capsules drop frames.
-        if (op.* == .shader_effect and op.shader_effect.chains_backdrop) backdrop_fresh = false;
-    }
-
-    pass.end();
-    pass.release();
-}
-
-/// Replays an already-built UI frame over the existing contents of scene_texture.
-///
-/// This is the path used by game/editor overlays: the caller first copies the
-/// game viewport into scene_texture, then this function draws UI commands on top.
-/// Liquid Glass and custom shader effects still work because every backdrop
-/// command acts as a barrier: end pass -> copy scene_texture to backdrop_texture
-/// -> resume pass and sample that backdrop.
-fn replayFramePaintLoad(
-    encoder: *wgpu.CommandEncoder,
-    scene_view: *wgpu.TextureView,
-    scene_tex: *wgpu.Texture,
-    // Optional for the same reason as replayFramePaint — see there.
-    backdrop_tex: ?*wgpu.Texture,
-    backdrop_bind_group: ?*wgpu.BindGroup,
-    gpu_ui: *GpuUi,
-    frame: *const FramePaint,
-    uploaded: UploadedFrameVertices,
-    scale_factor: f32,
-    frame_width: u32,
-    frame_height: u32,
-) !void {
-    var pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
-
-    // Same consecutive-op capture sharing as replayFramePaint — see the comment there.
-    var backdrop_fresh = false;
-    for (frame.ops.items, 0..) |*op, op_idx| {
-        if (drawOpNeedsBackdrop(op.*)) {
-            if (!backdrop_fresh) {
-                const bt = backdrop_tex orelse return error.WgpuBackdropUnavailable;
-                pass.end();
-                pass.release();
-                const region = backdropCopyRegion(
-                    frame,
-                    op_idx,
-                    @floatFromInt(frame_width),
-                    @floatFromInt(frame_height),
-                    frame_width,
-                    frame_height,
-                );
-                copySceneToBackdrop(encoder, scene_tex, bt, frame_width, frame_height, region);
                 pass = try beginScenePassLoad(encoder, scene_view, frame_width, frame_height);
                 backdrop_fresh = true;
             }
@@ -1590,8 +1423,6 @@ fn vertexRangeAabb(comptime V: type, verts: []const V, fw: f32, fh: f32) ?zg.Rec
     };
 }
 
-/// Device-space bounds of one draw op, from its vertex range in the per-kind list. Null = no
-/// vertices (the op draws nothing anywhere).
 /// Device-space bounds of an instance range. Each instance names its own clip-space rect, so the
 /// AABB is a min/max over corners rather than over expanded vertices.
 fn instanceRangeAabb(instances: []const ShapeInstance, fw: f32, fh: f32) ?zg.Rect {
@@ -1618,6 +1449,8 @@ fn instanceRangeAabb(instances: []const ShapeInstance, fw: f32, fh: f32) ?zg.Rec
     };
 }
 
+/// Device-space bounds of one draw op, from its vertex range in the per-kind list. Null = no
+/// vertices (the op draws nothing anywhere).
 fn opDeviceAabb(frame: *const FramePaint, op: *const DrawOp, fw: f32, fh: f32) ?zg.Rect {
     return switch (op.*) {
         .shape => |b| vertexRangeAabb(ShapeVertex, frame.shape_vertices.items[b.vertex_offset..][0..b.vertex_count], fw, fh),
@@ -1642,6 +1475,14 @@ fn aabbHitsDamage(aabb: zg.Rect, region: zg.Rect, scale_factor: f32) bool {
         aabb.y + aabb.height >= ry - 1.0 and aabb.y <= ry + rh + 1.0;
 }
 
+fn damageUnion(a: zg.Rect, b: zg.Rect) zg.Rect {
+    const x0 = @min(a.x, b.x);
+    const y0 = @min(a.y, b.y);
+    const x1 = @max(a.x + a.width, b.x + b.width);
+    const y1 = @max(a.y + a.height, b.y + b.height);
+    return .{ .x = x0, .y = y0, .width = x1 - x0, .height = y1 - y0 };
+}
+
 /// Partial-repaint replay: preserve the persistent scene texture (loadOp=load) and redraw the frame's
 /// ops scissored to each damaged rect. Runs one op sweep per damage rect; because C# keeps the rects
 /// pairwise non-overlapping, no pixel is drawn twice (which for alpha-blended ops would be wrong).
@@ -1656,13 +1497,6 @@ fn aabbHitsDamage(aabb: zg.Rect, region: zg.Rect, scale_factor: f32) bool {
 /// the usual barrier applies (end pass → capture scene → resume), taken AFTER the ops under the
 /// glass redrew, so the refraction source is current everywhere the glass can tap. A ticking label
 /// inside a glass bar therefore costs a bar-sized redraw, not a full-window one.
-fn damageUnion(a: zg.Rect, b: zg.Rect) zg.Rect {
-    const x0 = @min(a.x, b.x);
-    const y0 = @min(a.y, b.y);
-    const x1 = @max(a.x + a.width, b.x + b.width);
-    const y1 = @max(a.y + a.height, b.y + b.height);
-    return .{ .x = x0, .y = y0, .width = x1 - x0, .height = y1 - y0 };
-}
 fn replayFramePaintDamage(
     encoder: *wgpu.CommandEncoder,
     scene_view: *wgpu.TextureView,
@@ -2032,7 +1866,7 @@ fn drawShapeInstancedOp(
     pass.setPipeline(gpu_ui.shape_instanced_pipeline);
     pass.setBindGroup(0, clip_bg, 1, @ptrCast(&batch.clip_offset));
     pass.setVertexBuffer(0, buffer, 0, uploaded.shape_instances_bytes_len);
-    pass.setIndexBuffer(index_buffer, .uint32, 0, gpu_ui.quad_index_quads * 6 * @sizeOf(u32));
+    pass.setIndexBuffer(index_buffer, .uint32, 0, quadIndexBytes(gpu_ui));
     // Six indices over the shared quad pattern, once per instance.
     pass.drawIndexed(6, batch.vertex_count, 0, 0, batch.vertex_offset);
 }
@@ -2201,8 +2035,6 @@ fn applyNdcTransform(comptime V: type, verts: []V, m: Affine2) void {
     }
 }
 
-/// Shader-effect vertices also carry the screen UV the backdrop is sampled at — recompute it from
-/// the transformed NDC position so the effect keeps sampling the pixels it covers.
 /// Instances carry four corners, so a rotation transforms all four — the reason corners are
 /// stored instead of an axis-aligned rect.
 fn applyNdcTransformInstances(instances: []ShapeInstance, m: Affine2) void {
@@ -2216,6 +2048,8 @@ fn applyNdcTransformInstances(instances: []ShapeInstance, m: Affine2) void {
     }
 }
 
+/// Shader-effect vertices also carry the screen UV the backdrop is sampled at — recompute it from
+/// the transformed NDC position so the effect keeps sampling the pixels it covers.
 fn applyNdcTransformFx(verts: []ShaderEffectVertex, m: Affine2) void {
     for (verts) |*v| {
         const p = m.apply(v.position[0], v.position[1]);
@@ -2370,7 +2204,8 @@ fn appendPaintOps(
                     lg.glow_x * scale_factor,
                     lg.glow_y * scale_factor,
                     lg.pinch,
-                    liquidGlassClearTint(lg, lg.color),
+                    // Tint amount (0 = clear, 1 = full colour) rides the colour's alpha.
+                    @as(f32, @floatFromInt(lg.color.a)) / 255.0,
                     lg.adapt,
                     frame_width,
                     frame_height,
@@ -2604,29 +2439,7 @@ fn appendPaintOps(
                     .clip_offset = current_clip_offset,
                 });
 
-                // Flush any color emoji quads produced by appendText. A quad only exists after a
-                // successful color-glyph bake, which implies the lazy color atlas was created —
-                // the else arm is unreachable by construction and just drops the quads.
-                if (text_renderer.pending_color_quads.items.len > 0) {
-                    if (text_renderer.color_gpu) |cg| {
-                        const color_start = frame.image_vertices.items.len;
-                        for (text_renderer.pending_color_quads.items) |pq| {
-                            try appendImage(allocator, &frame.image_vertices, .{ .x = pq.x, .y = pq.y, .width = pq.w, .height = pq.h }, pq.u0, pq.v0, pq.u1, pq.v1, .{ 255, 255, 255, 255 }, 0.0, 0.0, frame_width, frame_height);
-                        }
-                        const color_added = frame.image_vertices.items.len - color_start;
-                        try appendOrMergeImageOp(allocator, frame, .{
-                            .vertex_offset = @intCast(color_start),
-                            .vertex_count = @intCast(color_added),
-                            .clip_rect = current_clip,
-                            .clip_offset = current_clip_offset,
-                            .texture = cg.texture,
-                            .texture_view = cg.view,
-                            .bind_group = cg.bind_group,
-                            .owns_resources = false,
-                        });
-                    }
-                    text_renderer.pending_color_quads.clearRetainingCapacity();
-                }
+                try flushColorQuads(allocator, frame, text_renderer, current_clip, current_clip_offset, frame_width, frame_height);
             },
 
             .image => |image| {
@@ -2680,28 +2493,7 @@ fn appendPaintOps(
                     .clip_offset = current_clip_offset,
                 });
 
-                // Cached layouts bake color-emoji quads too; flush them exactly like the
-                // immediate-text path above (same lazily-created atlas, same image pipeline).
-                if (text_renderer.pending_color_quads.items.len > 0) {
-                    if (text_renderer.color_gpu) |cg| {
-                        const color_start = frame.image_vertices.items.len;
-                        for (text_renderer.pending_color_quads.items) |pq| {
-                            try appendImage(allocator, &frame.image_vertices, .{ .x = pq.x, .y = pq.y, .width = pq.w, .height = pq.h }, pq.u0, pq.v0, pq.u1, pq.v1, .{ 255, 255, 255, 255 }, 0.0, 0.0, frame_width, frame_height);
-                        }
-                        const color_added = frame.image_vertices.items.len - color_start;
-                        try appendOrMergeImageOp(allocator, frame, .{
-                            .vertex_offset = @intCast(color_start),
-                            .vertex_count = @intCast(color_added),
-                            .clip_rect = current_clip,
-                            .clip_offset = current_clip_offset,
-                            .texture = cg.texture,
-                            .texture_view = cg.view,
-                            .bind_group = cg.bind_group,
-                            .owns_resources = false,
-                        });
-                    }
-                    text_renderer.pending_color_quads.clearRetainingCapacity();
-                }
+                try flushColorQuads(allocator, frame, text_renderer, current_clip, current_clip_offset, frame_width, frame_height);
             },
 
             .glyph_run => |gr| {
@@ -2751,58 +2543,65 @@ fn appendPaintOps(
     }
 }
 
+/// Flush the color-emoji quads the last text command baked, as one image op over the color atlas.
+/// A quad only exists after a successful color-glyph bake, which implies the lazy color atlas was
+/// created — the null arm is unreachable by construction and just drops the quads.
+fn flushColorQuads(
+    allocator: std.mem.Allocator,
+    frame: *FramePaint,
+    text_renderer: *ft_text.FreeTypeTextRenderer,
+    clip_rect: ?zg.Rect,
+    clip_offset: u32,
+    frame_width: f32,
+    frame_height: f32,
+) !void {
+    const quads = &text_renderer.pending_color_quads;
+    if (quads.items.len == 0) return;
+    defer quads.clearRetainingCapacity();
+    const cg = text_renderer.color_gpu orelse return;
+    const start = frame.image_vertices.items.len;
+    for (quads.items) |pq| {
+        try appendImage(allocator, &frame.image_vertices, .{ .x = pq.x, .y = pq.y, .width = pq.w, .height = pq.h }, pq.u0, pq.v0, pq.u1, pq.v1, .{ 255, 255, 255, 255 }, 0.0, 0.0, frame_width, frame_height);
+    }
+    try appendOrMergeImageOp(allocator, frame, .{
+        .vertex_offset = @intCast(start),
+        .vertex_count = @intCast(frame.image_vertices.items.len - start),
+        .clip_rect = clip_rect,
+        .clip_offset = clip_offset,
+        .texture = cg.texture,
+        .texture_view = cg.view,
+        .bind_group = cg.bind_group,
+    });
+}
+
 // Adjacent same-kind ops with the same clip write into one monotonically-growing per-kind vertex
 // list, so their vertex ranges are always contiguous — coalescing them into one op collapses N
 // setPipeline+setVertexBuffer+draw calls into one. This is the whole point of the "OrMerge" names.
 // liquid_glass / shader_effect ops are deliberately NOT merged: each is a scene→backdrop copy
 // barrier in replayFramePaint, and merging two would make the second sample a stale backdrop.
 fn appendOrMergeShapeOp(allocator: std.mem.Allocator, frame: *FramePaint, batch: ShapeBatch) !void {
-    if (batch.vertex_count == 0) return;
-    if (frame.ops.items.len > 0) {
-        const last = &frame.ops.items[frame.ops.items.len - 1];
-        if (last.* == .shape) {
-            const prev = &last.shape;
-            if (prev.vertex_offset + prev.vertex_count == batch.vertex_offset and
-                prev.clip_offset == batch.clip_offset and
-                std.meta.eql(prev.clip_rect, batch.clip_rect))
-            {
-                prev.vertex_count += batch.vertex_count;
-                return;
-            }
-        }
-    }
-    try frame.ops.append(allocator, .{ .shape = batch });
+    try appendOrMergeOp(.shape, allocator, frame, batch);
 }
 /// As `appendOrMergeShapeOp`, for the instanced path. Merging consecutive runs is what makes the
 /// instancing pay: a list of adjacent rects becomes one drawIndexed with a high instance count.
 fn appendOrMergeShapeInstancedOp(allocator: std.mem.Allocator, frame: *FramePaint, batch: ShapeBatch) !void {
-    if (batch.vertex_count == 0) return;
-    if (frame.ops.items.len > 0) {
-        const last = &frame.ops.items[frame.ops.items.len - 1];
-        if (last.* == .shape_instanced) {
-            const prev = &last.shape_instanced;
-            if (prev.vertex_offset + prev.vertex_count == batch.vertex_offset and
-                prev.clip_offset == batch.clip_offset and
-                std.meta.eql(prev.clip_rect, batch.clip_rect))
-            {
-                prev.vertex_count += batch.vertex_count;
-                return;
-            }
-        }
-    }
-    try frame.ops.append(allocator, .{ .shape_instanced = batch });
+    try appendOrMergeOp(.shape_instanced, allocator, frame, batch);
 }
-
+fn appendOrMergeTextOp(allocator: std.mem.Allocator, frame: *FramePaint, batch: TextBatch) !void {
+    try appendOrMergeOp(.text, allocator, frame, batch);
+}
 fn appendOrMergeLiquidGlassOp(allocator: std.mem.Allocator, frame: *FramePaint, batch: ShapeBatch) !void {
     if (batch.vertex_count == 0) return;
     try frame.ops.append(allocator, .{ .liquid_glass = batch });
 }
-fn appendOrMergeTextOp(allocator: std.mem.Allocator, frame: *FramePaint, batch: TextBatch) !void {
+
+/// Extend the last op when it is the same kind, same clip, and its range ends where `batch` starts.
+fn appendOrMergeOp(comptime tag: std.meta.Tag(DrawOp), allocator: std.mem.Allocator, frame: *FramePaint, batch: anytype) !void {
     if (batch.vertex_count == 0) return;
     if (frame.ops.items.len > 0) {
         const last = &frame.ops.items[frame.ops.items.len - 1];
-        if (last.* == .text) {
-            const prev = &last.text;
+        if (last.* == tag) {
+            const prev = &@field(last, @tagName(tag));
             if (prev.vertex_offset + prev.vertex_count == batch.vertex_offset and
                 prev.clip_offset == batch.clip_offset and
                 std.meta.eql(prev.clip_rect, batch.clip_rect))
@@ -2812,7 +2611,7 @@ fn appendOrMergeTextOp(allocator: std.mem.Allocator, frame: *FramePaint, batch: 
             }
         }
     }
-    try frame.ops.append(allocator, .{ .text = batch });
+    try frame.ops.append(allocator, @unionInit(DrawOp, @tagName(tag), batch));
 }
 // Image ops only merge when they share the same GPU bind group (same atlas/texture) and neither
 // owns its resources — an owning batch has a unique texture and its own deinit, so it is never
@@ -3436,7 +3235,8 @@ fn createTexturePipelineLayout(
 // draws — by one point in a 64×1 r32float target (glass_probe_shader_source.wgsl). The target is
 // copied to one of three map-read buffers and mapped asynchronously; a finished map lands in
 // `probe_luma` a frame or two later, which the host polls. No probe on screen = none of this runs.
-// Main window only: the overlay-over-3D path (replayFramePaintLoad) does not probe.
+// Main window only: renderFrame clears `uploaded` after its replay, so the overlay and
+// render-texture paths never probe.
 
 pub const probe_slots = 64;
 
@@ -3662,97 +3462,34 @@ fn appendLiquidGlass(
     frame_height: f32,
 ) !void {
     if (rect.width <= 0 or rect.height <= 0) return;
-    const adapt_c = std.math.clamp(adapt, -1.0, 1.0);
 
     const x0 = rect.x / frame_width * 2.0 - 1.0;
     const y0 = 1.0 - rect.y / frame_height * 2.0;
     const x1 = (rect.x + rect.width) / frame_width * 2.0 - 1.0;
     const y1 = 1.0 - (rect.y + rect.height) / frame_height * 2.0;
 
-    const c = colorToU8(color);
-
     const w2 = rect.width / 2.0;
     const h2 = rect.height / 2.0;
-    const size = [2]f32{ rect.width, rect.height };
-
-    const glow_pos = [2]f32{ glow_x, glow_y };
-
-    try vertices.appendSlice(allocator, &.{
-        // Triangle 1
-        .{
-            .position = .{ x0, y0 },
-            .color = c,
-            .local_pos = .{ -w2, -h2 },
-            .rect_size = size,
-            .radius = radius,
-            .thickness = thickness,
-            .glow_pos = glow_pos,
-            .pinch_strength = pinch,
-            .clear_tint = clamp01(clear_tint),
-            .adapt = adapt_c,
-        },
-        .{
-            .position = .{ x1, y0 },
-            .color = c,
-            .local_pos = .{ w2, -h2 },
-            .rect_size = size,
-            .radius = radius,
-            .thickness = thickness,
-            .glow_pos = glow_pos,
-            .pinch_strength = pinch,
-            .clear_tint = clamp01(clear_tint),
-            .adapt = adapt_c,
-        },
-        .{
-            .position = .{ x0, y1 },
-            .color = c,
-            .local_pos = .{ -w2, h2 },
-            .rect_size = size,
-            .radius = radius,
-            .thickness = thickness,
-            .glow_pos = glow_pos,
-            .pinch_strength = pinch,
-            .clear_tint = clamp01(clear_tint),
-            .adapt = adapt_c,
-        },
-        // Triangle 2
-        .{
-            .position = .{ x1, y0 },
-            .color = c,
-            .local_pos = .{ w2, -h2 },
-            .rect_size = size,
-            .radius = radius,
-            .thickness = thickness,
-            .glow_pos = glow_pos,
-            .pinch_strength = pinch,
-            .clear_tint = clamp01(clear_tint),
-            .adapt = adapt_c,
-        },
-        .{
-            .position = .{ x1, y1 },
-            .color = c,
-            .local_pos = .{ w2, h2 },
-            .rect_size = size,
-            .radius = radius,
-            .thickness = thickness,
-            .glow_pos = glow_pos,
-            .pinch_strength = pinch,
-            .clear_tint = clamp01(clear_tint),
-            .adapt = adapt_c,
-        },
-        .{
-            .position = .{ x0, y1 },
-            .color = c,
-            .local_pos = .{ -w2, h2 },
-            .rect_size = size,
-            .radius = radius,
-            .thickness = thickness,
-            .glow_pos = glow_pos,
-            .pinch_strength = pinch,
-            .clear_tint = clamp01(clear_tint),
-            .adapt = adapt_c,
-        },
-    });
+    const v = LiquidGlassVertex{
+        .position = undefined,
+        .color = colorToU8(color),
+        .local_pos = undefined,
+        .rect_size = .{ rect.width, rect.height },
+        .radius = radius,
+        .thickness = thickness,
+        .glow_pos = .{ glow_x, glow_y },
+        .pinch_strength = pinch,
+        .clear_tint = clamp01(clear_tint),
+        .adapt = std.math.clamp(adapt, -1.0, 1.0),
+    };
+    // Two triangles: TL TR BL, TR BR BL.
+    const corners = [6][2]bool{ .{ false, false }, .{ true, false }, .{ false, true }, .{ true, false }, .{ true, true }, .{ false, true } };
+    for (corners) |c| {
+        var out = v;
+        out.position = .{ if (c[0]) x1 else x0, if (c[1]) y1 else y0 };
+        out.local_pos = .{ if (c[0]) w2 else -w2, if (c[1]) h2 else -h2 };
+        try vertices.append(allocator, out);
+    }
 }
 
 /// The radius a shape instance carries: negative is the shape shader's squircle flag
@@ -4007,41 +3744,6 @@ fn clamp01(value: f32) f32 {
     return @min(1.0, @max(0.0, value));
 }
 
-/// Returns Liquid Glass tint amount as 0..1.
-///
-/// Backward-compatible behavior:
-/// - If the paint command has a float field named `clear_tint`, `clearTint`,
-///   `tint_strength`, `tint`, or `color_tint`, that value is used.
-/// - Otherwise the old API behavior is preserved: `color.a / 255.0` controls tint.
-///
-/// Recommended command field:
-///
-/// ```zig
-/// clear_tint: f32 = 0.0, // 0 clear, 1 fully color-tinted
-/// color: zg.Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
-/// ```
-fn liquidGlassClearTint(lg: anytype, color: zg.Color) f32 {
-    const T = @TypeOf(lg);
-
-    if (@hasField(T, "clear_tint")) {
-        return clamp01(@as(f32, @floatCast(@field(lg, "clear_tint"))));
-    }
-    if (@hasField(T, "clearTint")) {
-        return clamp01(@as(f32, @floatCast(@field(lg, "clearTint"))));
-    }
-    if (@hasField(T, "tint_strength")) {
-        return clamp01(@as(f32, @floatCast(@field(lg, "tint_strength"))));
-    }
-    if (@hasField(T, "tint")) {
-        return clamp01(@as(f32, @floatCast(@field(lg, "tint"))));
-    }
-    if (@hasField(T, "color_tint")) {
-        return clamp01(@as(f32, @floatCast(@field(lg, "color_tint"))));
-    }
-
-    return @as(f32, @floatFromInt(color.a)) / 255.0;
-}
-
 fn colorToU8(color: zg.Color) [4]u8 {
     return .{ color.r, color.g, color.b, color.a };
 }
@@ -4059,9 +3761,9 @@ fn colorToU8(color: zg.Color) [4]u8 {
 /// 3. before each Liquid Glass/custom shader op, copy scene_texture -> backdrop_texture
 /// 4. blit final scene_texture -> target color_view
 ///
-/// Use this for game/editor composition. The older renderFrameOverlay() only
-/// receives a TextureView, so it cannot copy the already-rendered game pixels
-/// into the Liquid Glass backdrop.
+/// Use this for game/editor composition. renderFrameOverlay() only receives a
+/// TextureView, so it cannot copy the already-rendered game pixels into the
+/// Liquid Glass backdrop.
 pub fn renderFrameOverlayWithBaseTexture(
     encoder: *wgpu.CommandEncoder,
     base_texture: *wgpu.Texture,
@@ -4073,10 +3775,7 @@ pub fn renderFrameOverlayWithBaseTexture(
     frame_width: u32,
     frame_height: u32,
     scale_factor: f32,
-    frame_index: u32,
 ) !void {
-    _ = frame_index;
-
     const scratch_allocator = gpu_ui.scratch.allocator();
     defer _ = gpu_ui.scratch.reset(.retain_capacity);
 
@@ -4117,7 +3816,7 @@ pub fn renderFrameOverlayWithBaseTexture(
     // the critical step that makes Liquid Glass sample the game behind it.
     copyTextureToScene(encoder, base_texture, scene_tex, frame_width, frame_height);
 
-    try replayFramePaintLoad(
+    try replayFramePaint(
         encoder,
         scene_view,
         scene_tex,
@@ -4126,6 +3825,7 @@ pub fn renderFrameOverlayWithBaseTexture(
         gpu_ui,
         &frame,
         uploaded,
+        null, // load: the scene already holds the game viewport
         scale_factor,
         frame_width,
         frame_height,
@@ -4161,9 +3861,7 @@ pub fn renderFrameOverlay(
     frame_width: u32,
     frame_height: u32,
     scale_factor: f32,
-    frame_index: u32,
 ) !void {
-    _ = frame_index;
 
     const scratch_allocator = gpu_ui.scratch.allocator();
     defer _ = gpu_ui.scratch.reset(.retain_capacity);
@@ -4336,21 +4034,6 @@ pub fn renderToTexture(
     const rt_cmd = encoder.finish(&.{}) orelse return error.RtCmdFailed;
     defer rt_cmd.release();
     queue.submit(&.{rt_cmd});
-}
-
-pub const Backend = struct {
-    pub const name = "wgpu";
-};
-
-pub const RendererPlan = struct {
-    batches_rectangles: bool = true,
-    batches_glyphs: bool = true,
-    supports_custom_passes: bool = true,
-};
-
-test "wgpu binding is visible" {
-    try std.testing.expectEqualStrings("wgpu", Backend.name);
-    _ = wgpu.StringView;
 }
 
 test "vertexRangeAabb maps NDC vertex bounds to device pixels" {

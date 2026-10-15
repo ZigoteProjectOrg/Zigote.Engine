@@ -25,8 +25,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   // The sampled texel is already linear (sRGB texture view decodes on sample); the tint arrives
   // sRGB-encoded like every UI color, so decode it before multiplying (see shape shader).
   let c = textureSample(image_tex, image_sampler, in.uv);
-  let tint = pow(max(in.color.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
-  var out = vec4<f32>(c.rgb * tint, c.a * in.color.a);
+  var out = vec4<f32>(c.rgb * srgb_decode(in.color.rgb), c.a * in.color.a);
   out.a = out.a * rounded_clip_coverage(in.position.xy);
   return out;
 }

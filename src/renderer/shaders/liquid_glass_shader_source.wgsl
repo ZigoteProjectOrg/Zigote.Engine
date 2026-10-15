@@ -128,7 +128,7 @@ fn adapt_luminance(rgb: vec3<f32>, adapt: f32) -> vec3<f32> {
 // multiply (deepen), light tints screen (brighten). The tint arrives sRGB-encoded like every UI
 // colour while the backdrop sample is linear — decode so the blend happens in one space.
 fn apply_tint(rgb: vec3<f32>, tint_srgb: vec3<f32>, amount: f32) -> vec3<f32> {
-  let gc = pow(clamp(tint_srgb, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.2));
+  let gc = srgb_decode(min(tint_srgb, vec3<f32>(1.0)));
   if (dot(gc, LUMA) < 0.5) {
     return mix(rgb, rgb * (gc * 2.0), amount);
   }
