@@ -845,11 +845,7 @@ const UploadedFrameVertices = struct {
     shader_effect_bytes_len: usize = 0,
 };
 
-/// Set by `renderFrame` when the swapchain image could not be acquired (timeout, outdated, lost,
-/// occluded) and the frame was skipped without drawing. The caller clears it before the call.
-pub var surface_skipped: bool = false;
-
-/// Where the last `renderFrame` spent its wall time, in nanoseconds: waiting for the swapchain
+/// Where the main window's last UI-only frame spent its wall time, in nanoseconds: waiting for the swapchain
 /// image, building + encoding + submitting the frame (the CPU work), and presenting. Zero until a
 /// caller installs `clock_ns`. CPU-side durations only — none of these is GPU execution time.
 pub var last_acquire_ns: u64 = 0;
@@ -858,12 +854,32 @@ pub var last_present_ns: u64 = 0;
 /// Monotonic nanosecond clock, installed by the host layer (this module has no clock of its own).
 pub var clock_ns: ?*const fn () u64 = null;
 
-fn nowNs() u64 {
+pub fn nowNs() u64 {
     return if (clock_ns) |clock| clock() else 0;
 }
 
+/// Acquire the surface's next image. null = the surface refused it this frame (timeout, outdated,
+/// lost, occluded) and the caller skips the frame. Releasing the texture without presenting it
+/// discards it.
+pub fn acquireSurfaceTexture(surface: *wgpu.Surface) !?*wgpu.Texture {
+    var surface_texture = wgpu.SurfaceTexture{
+        .next_in_chain = null,
+        .texture = null,
+        .status = .@"error",
+    };
+    surface.getCurrentTexture(&surface_texture);
+    return switch (surface_texture.status) {
+        .success_optimal, .success_suboptimal => surface_texture.texture orelse error.WgpuSurfaceTextureUnavailable,
+        .timeout, .outdated, .lost, .occluded => null,
+        else => error.WgpuSurfaceTextureUnavailable,
+    };
+}
+
+/// Draw the paint lists and present. `texture` is the surface image from `acquireSurfaceTexture`;
+/// this takes ownership and releases it.
 pub fn renderFrame(
     surface: *wgpu.Surface,
+    texture: *wgpu.Texture,
     device: *wgpu.Device,
     queue: *wgpu.Queue,
     gpu_ui: *GpuUi,
@@ -885,28 +901,7 @@ pub fn renderFrame(
     // the swapchain, skipping the per-window offscreen scene texture + blit pass.
     persistent_scene: bool,
 ) !void {
-    var surface_texture = wgpu.SurfaceTexture{
-        .next_in_chain = null,
-        .texture = null,
-        .status = .@"error",
-    };
-
-    const t_start = nowNs();
-    surface.getCurrentTexture(&surface_texture);
     const t_acquired = nowNs();
-    last_acquire_ns = t_acquired -% t_start;
-
-    switch (surface_texture.status) {
-        .success_optimal, .success_suboptimal => {},
-        .timeout, .outdated, .lost, .occluded => {
-            surface_skipped = true;
-            return;
-        },
-        .@"error" => return error.WgpuSurfaceTextureUnavailable,
-        else => return error.WgpuSurfaceTextureUnavailable,
-    }
-
-    const texture = surface_texture.texture orelse return error.WgpuSurfaceTextureUnavailable;
     defer texture.release();
 
     const view = texture.createView(null) orelse return error.WgpuTextureViewUnavailable;

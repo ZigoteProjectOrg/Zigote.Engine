@@ -562,6 +562,11 @@ const EngineState = struct {
     // Set by the composite pass when the swapchain was unavailable, so the frame tail
     // skips advancing frame_index / clearing the overlay (matches pre-graph behaviour).
     frame_dropped: bool = false,
+    // Surface image taken early by zigote_frame_acquire, consumed by the frame's present. Any
+    // surface configure must drop it first: configuring with an image outstanding is an error.
+    held_texture: ?*wgpu.Texture = null,
+    // zigote_frame_acquire found the surface refusing images; the frame drops without retrying.
+    acquire_skipped: bool = false,
     // Pending frame data accumulated between begin_frame / render_frame_v2
     pending_scene_w: u32,
     pending_scene_h: u32,
@@ -786,6 +791,7 @@ export fn zigote_set_vsync(enabled: u8) ZgStatus {
 
     if (state.wgpu_config.present_mode == desired) return .ok;
     state.wgpu_config.present_mode = desired;
+    releaseHeldTexture(state);
     state.surface.configure(&state.wgpu_config);
     return .ok;
 }
@@ -1152,8 +1158,13 @@ fn zigote_init_impl(
     if (capabilities.format_count == 0) return error.WgpuNoSurfaceFormats;
     const preferred_format = pickSurfaceFormat(capabilities.formats[0..capabilities.format_count]);
 
+    // Set before the first configure; every later configure of any window reuses it.
+    surface_extras.desired_maximum_frame_latency =
+        if (gpu_select.Power.fromU32(gpu_power) == .efficiency) 1 else 2;
+
     const pixel_size = try window.getSizeInPixels();
     var wgpu_config = wgpu.SurfaceConfiguration{
+        .next_in_chain = &surface_extras.chain,
         .device = device,
         .format = preferred_format,
         .width = @intCast(pixel_size[0]),
@@ -1162,6 +1173,7 @@ fn zigote_init_impl(
         .alpha_mode = pickAlphaMode(&capabilities, pending_transparent_window),
     };
     surface.configure(&wgpu_config);
+    wgpu_renderer.wgpu.clock_ns = frameClockNs;
 
     const font_asset = zg.FontAsset.fromPlatform(resolved_font_name, resolved_font_path);
     const fonts: []const zg.FontAsset = &.{font_asset};
@@ -1267,6 +1279,7 @@ fn recreateAndroidSurface(state: *EngineState) void {
         return;
     };
 
+    releaseHeldTexture(state);
     state.surface.unconfigure();
     state.surface.release();
     state.surface = new_surface;
@@ -1291,6 +1304,7 @@ fn reconfigureSurfaceForWindow(state: *EngineState, win_id: u32, new_w: u32, new
         if (state.wgpu_config.width == new_w and state.wgpu_config.height == new_h) return;
         state.wgpu_config.width = new_w;
         state.wgpu_config.height = new_h;
+        releaseHeldTexture(state);
         state.surface.configure(&state.wgpu_config);
     } else if (windowFromSdlId(state, win_id)) |win| {
         if (win.config.width == new_w and win.config.height == new_h) return;
@@ -4779,6 +4793,7 @@ fn createSecondaryWindowImpl(
 
     const pixel_size = try window.getSizeInPixels();
     var config = wgpu.SurfaceConfiguration{
+        .next_in_chain = &surface_extras.chain,
         .device = state.device,
         .format = format,
         .width = @intCast(pixel_size[0]),
@@ -5393,8 +5408,13 @@ fn renderSecondaryWindow(window_handle: u64) ZgStatus {
     // lives in secondary ones, so every released texture stayed queued — ~19 MB per rebuilt
     // panel, forever. Drain here too.
     drainImageReleases(state);
+    const texture = (wgpu_renderer.wgpu.acquireSurfaceTexture(win.surface) catch |err| {
+        std.log.err("secondary window render failed: {}", .{err});
+        return .gpu_failure;
+    }) orelse return .ok;
     wgpu_renderer.wgpu.renderFrame(
         win.surface,
+        texture,
         state.device,
         state.queue,
         &win.gpu_ui,
@@ -5617,6 +5637,7 @@ export fn zigote_shutdown() ZgStatus {
         state.gpu_3d = null;
     }
     state.gpu_ui.deinit();
+    releaseHeldTexture(state);
     state.surface.unconfigure();
     state.queue.release();
     state.device.release();
@@ -7199,26 +7220,19 @@ fn passCompositePresent(ctx: *PassContext) anyerror!void {
     const w = state.wgpu_config.width;
     const h = state.wgpu_config.height;
 
-    if (state.scene_rendered) {
-        const base_tex = state.offscreen_3d_texture orelse return error.SceneColorMissing;
-        var surface_texture = wgpu.SurfaceTexture{
-            .next_in_chain = null,
-            .texture = null,
-            .status = .@"error",
-        };
-        state.surface.getCurrentTexture(&surface_texture);
-        switch (surface_texture.status) {
-            .success_optimal, .success_suboptimal => {},
-            .timeout, .outdated, .lost, .occluded => {
-                state.frame_dropped = true;
-                return;
-            },
-            .@"error" => return error.WgpuSurfaceTextureUnavailable,
-            else => return error.WgpuSurfaceTextureUnavailable,
-        }
-        defer if (surface_texture.texture) |t| t.release();
+    const texture = (try takeMainSurfaceTexture(state)) orelse {
+        state.frame_dropped = true;
+        return;
+    };
 
-        const color_view = surface_texture.texture.?.createView(null) orelse
+    if (state.scene_rendered) {
+        const base_tex = state.offscreen_3d_texture orelse {
+            texture.release();
+            return error.SceneColorMissing;
+        };
+        defer texture.release();
+
+        const color_view = texture.createView(null) orelse
             return error.WgpuTextureViewUnavailable;
         defer color_view.release();
 
@@ -7262,10 +7276,9 @@ fn passCompositePresent(ctx: *PassContext) anyerror!void {
             state.overlay_paint_list
         else
             null;
-        wgpu_renderer.wgpu.surface_skipped = false;
-        wgpu_renderer.wgpu.clock_ns = frameClockNs;
         try wgpu_renderer.wgpu.renderFrame(
             state.surface,
+            texture,
             state.device,
             state.queue,
             &state.gpu_ui,
@@ -7277,8 +7290,29 @@ fn passCompositePresent(ctx: *PassContext) anyerror!void {
             state.pending_damage[0..state.pending_damage_count],
             true, // main window: keeps a persistent scene texture for partial repaint + glass backdrop
         );
-        if (wgpu_renderer.wgpu.surface_skipped) state.frame_dropped = true;
     }
+}
+
+/// The main surface's image for this frame: the one zigote_frame_acquire holds, else a fresh
+/// acquire. null = the surface refused it and the frame drops.
+fn takeMainSurfaceTexture(state: *EngineState) !?*wgpu.Texture {
+    if (state.held_texture) |t| {
+        state.held_texture = null;
+        return t;
+    }
+    if (state.acquire_skipped) {
+        state.acquire_skipped = false;
+        return null;
+    }
+    const t0 = wgpu_renderer.wgpu.nowNs();
+    defer wgpu_renderer.wgpu.last_acquire_ns = wgpu_renderer.wgpu.nowNs() -% t0;
+    return wgpu_renderer.wgpu.acquireSurfaceTexture(state.surface);
+}
+
+fn releaseHeldTexture(state: *EngineState) void {
+    if (state.held_texture) |t| t.release();
+    state.held_texture = null;
+    state.acquire_skipped = false;
 }
 
 /// The per-frame pipeline, executed in this order:
@@ -7521,6 +7555,12 @@ export fn zigote_frame_begin(window: u64, scene_w: u32, scene_h: u32, scale: f32
     return zigote_begin_frame(scene_w, scene_h, scale, delta_time);
 }
 
+/// How many frames the swapchain may queue ahead of the display. A UI app (efficiency intent) takes 1:
+/// it renders in a millisecond or two, so a second queued frame only adds a refresh interval of input
+/// latency. Games and the editor keep wgpu's default of 2 so the GPU never idles waiting for the CPU.
+/// File-scope so the configs that chain it (stored and re-configured on resize) never dangle.
+var surface_extras = wgpu.SurfaceConfigurationExtras{ .desired_maximum_frame_latency = 2 };
+
 fn frameClockNs() u64 {
     return sdl3.c.SDL_GetTicksNS();
 }
@@ -7542,6 +7582,26 @@ export fn zigote_frame_timings(out_acquire_ns: *u64, out_encode_ns: *u64, out_pr
 export fn zigote_frame_was_dropped() bool {
     const state = engineState() orelse return false;
     return state.frame_dropped;
+}
+
+/// Block until the main surface has an image to draw into, and hold it for zigote_frame_end. With
+/// vsync this is where the frame waits for the display; calling it before reading input (rather than
+/// letting frame_end wait after the frame is built) keeps that wait out of input-to-photon latency.
+/// False when the surface refused the image (occluded, minimised, outdated); frame_end then drops
+/// the frame without waiting again. Optional: frame_end acquires itself when nothing is held.
+export fn zigote_frame_acquire() bool {
+    const state = engineState() orelse return false;
+    if (state.held_texture != null) return true;
+    const t0 = wgpu_renderer.wgpu.nowNs();
+    defer wgpu_renderer.wgpu.last_acquire_ns = wgpu_renderer.wgpu.nowNs() -% t0;
+    const texture = wgpu_renderer.wgpu.acquireSurfaceTexture(state.surface) catch |err| {
+        // A hard error: leave nothing held so frame_end retries and reports it.
+        std.log.err("frame acquire failed: {}", .{err});
+        return false;
+    };
+    state.held_texture = texture;
+    state.acquire_skipped = texture == null;
+    return texture != null;
 }
 
 /// Execute the render graph and present; then clear per-frame state (see zigote_frame_begin).
