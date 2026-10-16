@@ -1172,14 +1172,14 @@ pub const FreeTypeTextRenderer = struct {
         // frame, and per-glyph appendSlice paid a capacity check (and possible realloc) per glyph.
         try vertices.ensureUnusedCapacity(allocator, run.glyphs.len * 4);
         for (run.glyphs, 0..) |shaped, i| {
-            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, pixel_size, style, blur);
+            const origin = subpixelSplit(pen_x.* + shaped.x_offset);
+            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, pixel_size, style, blur, origin.phase);
             if (glyph.width > 0 and glyph.height > 0) {
-                // Snap the quad origin to the physical pixel grid: each glyph exists as ONE
-                // integer-origin raster in the atlas, so a fractional origin makes the linear
-                // sampler resample every texel — uniform blur, worst at 1x DPI. The pen itself
-                // stays fractional (shaping accuracy); only the emitted quad is snapped, giving
-                // a 1:1 texel↔pixel mapping.
-                const x0 = @round(pen_x.* + shaped.x_offset + glyph.bearing_x);
+                // Snap the quad origin to the physical pixel grid: a fractional origin makes the
+                // linear sampler resample every texel — uniform blur, worst at 1x DPI. The pen's
+                // fraction isn't lost: it picks a quarter-pixel raster phase (subpixelSplit), so
+                // spacing stays even while the texel↔pixel mapping stays 1:1.
+                const x0 = origin.px + glyph.bearing_x;
                 const y0 = @round(baseline_y.* - shaped.y_offset - glyph.bearing_y);
                 const x1 = x0 + @as(f32, @floatFromInt(glyph.width));
                 const y1 = y0 + @as(f32, @floatFromInt(glyph.height));
@@ -1690,7 +1690,7 @@ pub const FreeTypeTextRenderer = struct {
             // bitmap width up to float fuzz), restoring the 1:1 texel↔pixel mapping that the
             // linear atlas sampler needs to stay crisp — the cached-layout path is what the
             // code editor and every CachedText widget render through.
-            const x0 = @round((g.x0 + draw_x) * scale_factor);
+            const x0 = @round(draw_x * scale_factor) + @round(g.x0 * scale_factor);
             const y0 = @round((g.y0 + draw_y) * scale_factor);
             const x1 = x0 + @round((g.x1 - g.x0) * scale_factor);
             const y1 = y0 + @round((g.y1 - g.y0) * scale_factor);
@@ -1841,10 +1841,13 @@ pub const FreeTypeTextRenderer = struct {
         const run = try self.getShapedRun(face, text, font_family, shape_pixel_size, style, spaced);
 
         for (run.glyphs, 0..) |shaped, i| {
-            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, raster_pixel_size, style, 0);
+            // Phase is picked in device pixels; x0 lands on a whole device pixel, which the
+            // replay keeps by snapping the draw origin and the glyph offset separately.
+            const origin = subpixelSplit((pen_x.* + shaped.x_offset) / inv_raster_scale);
+            const glyph = try self.getGlyph(face, font_family, shaped.glyph_index, raster_pixel_size, style, 0, origin.phase);
 
             if (glyph.width > 0 and glyph.height > 0) {
-                const x0 = pen_x.* + shaped.x_offset + glyph.bearing_x * inv_raster_scale;
+                const x0 = (origin.px + glyph.bearing_x) * inv_raster_scale;
                 const y0 = baseline_y.* - shaped.y_offset - glyph.bearing_y * inv_raster_scale;
                 const x1 = x0 + @as(f32, @floatFromInt(glyph.width)) * inv_raster_scale;
                 const y1 = y0 + @as(f32, @floatFromInt(glyph.height)) * inv_raster_scale;
@@ -1965,13 +1968,14 @@ pub const FreeTypeTextRenderer = struct {
         size: u16,
         style: FaceStyle,
         blur: f32,
+        phase: u8,
     ) !Glyph {
         // Keyed by what is actually rasterized (the synth result), not by the request: every
         // (weight, italic) combination the face satisfies natively shares one atlas entry.
         // Blur is quantized to quarter-pixel buckets so shadow passes bake once per radius.
         const synth = synthFor(face, style, size);
         const blur_q: u16 = if (blur > 0) @intFromFloat(@min(@round(blur * 4.0), 4096.0)) else 0;
-        const key = glyphKey(self.familyHash(font_family), glyph_index, size, synth, blur_q);
+        const key = glyphKey(self.familyHash(font_family), glyph_index, size, synth, blur_q, phase);
 
         if (self.glyphs.get(key)) |glyph| {
             return glyph;
@@ -1990,6 +1994,10 @@ pub const FreeTypeTextRenderer = struct {
             return error.FreeTypeLoadGlyphFailed;
 
         const slot = face.*.glyph;
+        // Light hinting only touches the y axis, so shifting the outline right by the phase
+        // (quarter pixels, 26.6) is exact — bitmap_left absorbs any whole-pixel carry.
+        if (phase > 0 and slot.*.format == ft.FT_GLYPH_FORMAT_OUTLINE)
+            ft.FT_Outline_Translate(&slot.*.outline, @as(ft.FT_Pos, phase) * (64 / subpixel_steps), 0);
         if (!synth.none() and slot.*.format == ft.FT_GLYPH_FORMAT_OUTLINE) {
             if (synth.embolden > 0) {
                 const s = synth.strength266();
@@ -2418,7 +2426,7 @@ pub const FreeTypeTextRenderer = struct {
         want_px: u16,
     ) ?EmojiRaster {
         const sel = emojiSelectSize(face, want_px) catch return null;
-        const key = glyphKey(self.familyHash(emoji_family), glyph_index, sel.actual_px, .{}, 0);
+        const key = glyphKey(self.familyHash(emoji_family), glyph_index, sel.actual_px, .{}, 0, 0);
 
         if (self.color_glyphs.get(key)) |glyph| {
             return .{ .glyph = glyph, .scale = sel.scale };
@@ -2706,10 +2714,11 @@ fn boxBlurCols(src: []const u8, dst: []u8, w: u32, h: u32, r: u32) void {
 
 // `family_hash` is the memoized FreeTypeTextRenderer.familyHash of the family name — hashing the
 // string itself here ran once per glyph per frame.
-fn glyphKey(family_hash: u64, glyph_index: u32, size: u16, synth: Synth, blur_q: u16) u64 {
+fn glyphKey(family_hash: u64, glyph_index: u32, size: u16, synth: Synth, blur_q: u16, phase: u8) u64 {
     var hasher = std.hash.Wyhash.init(family_hash);
     hasher.update(std.mem.asBytes(&size));
     hasher.update(std.mem.asBytes(&glyph_index));
+    if (phase > 0) hasher.update(&[_]u8{phase});
     if (!synth.none()) {
         const strength: i32 = synth.strength266();
         hasher.update(std.mem.asBytes(&strength));
@@ -2717,6 +2726,26 @@ fn glyphKey(family_hash: u64, glyph_index: u32, size: u16, synth: Synth, blur_q:
     }
     if (blur_q > 0) hasher.update(std.mem.asBytes(&blur_q));
     return hasher.final();
+}
+
+/// Horizontal raster phases per pixel (Skia/Chrome use 4). Each glyph bakes once per phase,
+/// so pens advance by their true fractional widths instead of drifting to whole pixels.
+const subpixel_steps = 4;
+
+const SubpixelOrigin = struct { px: f32, phase: u8 };
+
+/// Splits a device x into the whole pixel a glyph quad snaps to and the raster phase that
+/// carries the remainder.
+fn subpixelSplit(x: f32) SubpixelOrigin {
+    const q = @round(x * subpixel_steps);
+    const px = @floor(q / subpixel_steps);
+    return .{ .px = px, .phase = @intFromFloat(q - px * subpixel_steps) };
+}
+
+test "subpixelSplit rounds to the nearest quarter and carries whole pixels" {
+    try std.testing.expectEqual(SubpixelOrigin{ .px = 3, .phase = 1 }, subpixelSplit(3.26));
+    try std.testing.expectEqual(SubpixelOrigin{ .px = 4, .phase = 0 }, subpixelSplit(3.9));
+    try std.testing.expectEqual(SubpixelOrigin{ .px = -2, .phase = 3 }, subpixelSplit(-1.3));
 }
 
 fn hbPositionToPixels(value: c_int) f32 {
@@ -2886,14 +2915,16 @@ pub const text_shader_source = prelude.color ++ prelude.roundedClip(1) ++
     \\  //     light loses it — half-covered edges and translucent ink (the Label tokens: black at
     \\  //     85%) come out far lighter than their alpha says (#686868 where ~#252525 was meant).
     \\  // So alpha follows the ink's own luminance. Dark ink is remapped so the result matches a
-    \\  // gamma-space blend over a light backdrop (1 - (1-a)^2.2); bright ink keeps a mild coverage
-    \\  // boost (~1/1.2) that holds thin strokes together at 1x. Mid-tones mix the two. Both curves
-    \\  // fix 0 and 1, so solid pixels never fatten and holes never fill. Quad origins are
-    \\  // pixel-snapped at emit, so the linear filter only smooths genuine sub-glyph detail.
+    \\  // gamma-space blend over a light backdrop (1 - (1-a)^2.2); bright ink is thinned (a^1.6),
+    \\  // since linear blending already fattens it — tuned so light-on-dark carries the same ink
+    \\  // weight as Skia (Chrome/Flutter) at 1x, where the old a^(1/1.2) boost ran ~17% heavier.
+    \\  // Mid-tones mix the two. Both curves fix 0 and 1, so solid pixels never fatten and holes
+    \\  // never fill. Quad origins are pixel-snapped at emit, so the linear filter only smooths
+    \\  // genuine sub-glyph detail.
     \\  let lum = dot(in.color.rgb, vec3<f32>(0.299, 0.587, 0.114));
     \\  let coverage = textureSample(text_tex, text_sampler, in.uv).r;
     \\  let dark_ink = 1.0 - pow(1.0 - in.color.a * coverage, 2.2);
-    \\  let light_ink = in.color.a * pow(coverage, 1.0 / 1.2);
+    \\  let light_ink = in.color.a * pow(coverage, 1.6);
     \\  let alpha = mix(dark_ink, light_ink, lum);
     \\  return vec4<f32>(srgb_decode(in.color.rgb), alpha * rounded_clip_coverage(in.position.xy));
     \\}
