@@ -985,11 +985,13 @@ pub const FreeTypeTextRenderer = struct {
     /// hit), or null after making room for the caller's insert — at capacity the current
     /// generation demotes and the old one is dropped, so a spike frame never re-shapes every
     /// visible run at once (the old wholesale clear did).
-    fn shapedRunLookup(self: *FreeTypeTextRenderer, key: u64) !?*ShapedRun {
-        if (self.shaped_run_cache.getPtr(key)) |run| return run;
+    /// Runs are returned by value (a slice plus two floats), never as a pointer into the map: the
+    /// next insert can rehash and free the storage such a pointer names.
+    fn shapedRunLookup(self: *FreeTypeTextRenderer, key: u64) !?ShapedRun {
+        if (self.shaped_run_cache.get(key)) |run| return run;
         if (self.shaped_run_prev.fetchRemove(key)) |kv| {
             try self.shaped_run_cache.put(key, kv.value);
-            return self.shaped_run_cache.getPtr(key).?;
+            return kv.value;
         }
         if (self.shaped_run_cache.count() >= 8192) {
             var prev_it = self.shaped_run_prev.valueIterator();
@@ -1025,7 +1027,7 @@ pub const FreeTypeTextRenderer = struct {
         pixel_size: u16,
         style: FaceStyle,
         spaced: bool,
-    ) !*const ShapedRun {
+    ) !ShapedRun {
         const synth = synthFor(face, style, pixel_size);
 
         var hasher = std.hash.Wyhash.init(@as(u64, pixel_size));
@@ -1086,7 +1088,7 @@ pub const FreeTypeTextRenderer = struct {
             .advance_y = advance_y,
         };
         try self.shaped_run_cache.put(key, run);
-        return self.shaped_run_cache.getPtr(key).?;
+        return run;
     }
 
     /// Shape one direction run and append its glyphs. `cluster_base` re-anchors HarfBuzz's
@@ -1412,7 +1414,7 @@ pub const FreeTypeTextRenderer = struct {
                 var runs = self.splitRuns(line, font_family);
                 while (runs.next()) |face_run| {
                     const run_offset = @intFromPtr(face_run.text.ptr) - @intFromPtr(line.ptr);
-                    const run_opt: ?*const ShapedRun = if (face_run.emoji) blk: {
+                    const run_opt: ?ShapedRun = if (face_run.emoji) blk: {
                         const face = self.faces.get(face_run.family) orelse break :blk null;
                         break :blk self.getEmojiShapedRun(face, face_run.text, face_run.family, pixel_size) catch null;
                     } else blk: {
@@ -2356,7 +2358,7 @@ pub const FreeTypeTextRenderer = struct {
         text: []const u8,
         emoji_family: []const u8,
         pixel_size: u16,
-    ) !*const ShapedRun {
+    ) !ShapedRun {
         var hasher = std.hash.Wyhash.init(@as(u64, pixel_size));
         hasher.update(emoji_family);
         hasher.update(&[_]u8{1});
@@ -2402,12 +2404,13 @@ pub const FreeTypeTextRenderer = struct {
             advance_y -= out.y_advance;
         }
 
-        try self.shaped_run_cache.put(key, .{
+        const run = ShapedRun{
             .glyphs = shaped,
             .advance_x = advance_x,
             .advance_y = advance_y,
-        });
-        return self.shaped_run_cache.getPtr(key).?;
+        };
+        try self.shaped_run_cache.put(key, run);
+        return run;
     }
 
     /// One baked color glyph plus the factor mapping its strike pixels to the requested size.
