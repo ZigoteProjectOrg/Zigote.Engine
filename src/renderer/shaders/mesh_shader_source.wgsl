@@ -203,14 +203,14 @@ fn vs_instanced(
   return out;
 }
 
-// MRT: location 0 = linear HDR colour, location 1 = view-space position (xyz) + 1.0 in w.
-// The position target feeds screen-space ambient occlusion; w=1 marks "geometry here" so
-// the SSAO pass can tell lit surfaces from the cleared background (sky).
+// MRT: location 0 = linear HDR colour, location 1 = view-space z + lighting metadata (see
+// gbuf_view_pos). metadata 1 marks "geometry here" so the post passes can tell surfaces from the
+// cleared background (sky); 2 + sun fraction marks a lit PBR surface for the tonemap composite.
 struct FragOut {
   @location(0) color: vec4<f32>,
-  @location(1) view_pos: vec4<f32>,
-  @location(2) view_normal: vec4<f32>, // xyz = view-space normal, w = roughness (for SSR)
-  @location(3) albedo: vec4<f32>,      // base colour, for receiver-albedo tinting of SSGI
+  @location(1) view_pos: vec2<f32>,   // x = view-space z, y = metadata
+  @location(2) view_normal: vec2<f32>, // octahedral view-space normal (gbuf_encode_normal)
+  @location(3) albedo: vec4<f32>,      // rgb = base colour (SSGI receiver tint), a = roughness (SSR)
 }
 
 // Height-based exponential fog with analytic sun in-scatter (aerial perspective + god-ray glow).
@@ -252,7 +252,7 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
   // dedicated wireframe pipeline; emit a flat unlit colour so the edges read clearly over the
   // scene regardless of material. Skips all lighting/post so it stays a clean overlay.
   if (light.debug.z == 1u) {
-    return FragOut(vec4<f32>(0.55, 0.95, 0.60, 1.0), vpos, vn_geo, vec4<f32>(0.0));
+    return FragOut(vec4<f32>(0.55, 0.95, 0.60, 1.0), vpos.zw, gbuf_encode_normal(vn_geo.xyz), vec4<f32>(0.0, 0.0, 0.0, vn_geo.w));
   }
   if (model_data.effect.x == 1u) {
     let centered = in.uv * 2.0 - vec2<f32>(1.0);
@@ -266,7 +266,7 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
     let scanline = 0.82 + 0.18 * sin(in.uv.y * 900.0);
     let vignette = clamp(1.0 - r2 * 0.45, 0.0, 1.0);
     let color = vec3<f32>(sample_r.r, sample_g.g, sample_b.b) * scanline * vignette;
-    return FragOut(vec4<f32>(color, sample_g.a), vpos, vn_geo, vec4<f32>(0.0));
+    return FragOut(vec4<f32>(color, sample_g.a), vpos.zw, gbuf_encode_normal(vn_geo.xyz), vec4<f32>(0.0, 0.0, 0.0, vn_geo.w));
   }
   var base_color = model_data.base_color * textureSample(base_color_tex, base_color_sampler, in.uv);
   // Alpha-mask (effect.z == 1): hard cutout. effect.w carries the cutoff as raw f32 bits.
@@ -274,7 +274,7 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
     discard;
   }
   if (model_data.effect.x == 2u) {
-    return FragOut(base_color, vpos, vn_geo, base_color);
+    return FragOut(base_color, vpos.zw, gbuf_encode_normal(vn_geo.xyz), vec4<f32>(base_color.rgb, vn_geo.w));
   }
   
   var n = normalize(in.normal);
@@ -687,7 +687,7 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
     // glass clean, since a window's interior/exterior is either far or absent.
     let bg_pos = textureLoad(gbuf_pos_tex, vec2<i32>(in.clip_pos.xy), 0);
     let glass_vz = (camera.view * vec4<f32>(in.world_pos, 1.0)).z;
-    let thickness = select(100.0, max(glass_vz - bg_pos.z, 0.0), bg_pos.w > 0.5);
+    let thickness = select(100.0, max(glass_vz - bg_pos.x, 0.0), bg_pos.y > 0.5);
     let thick_scale = smoothstep(0.03, 0.15, thickness) * (1.0 - smoothstep(0.7, 1.6, thickness));
     // Damp the bend slightly at grazing angles — reflection dominates there anyway and the lookup
     // would otherwise walk off-screen into the edge fade.
@@ -701,7 +701,7 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
     var refr_uv = clamp(refr_uv_raw, half_texel, vec2<f32>(1.0) - half_texel);
     // Screen-space refraction must never pull opaque foreground geometry through glass.
     let refr_pos = textureLoad(gbuf_pos_tex, vec2<i32>(refr_uv * screen_dims), 0);
-    if (refr_pos.w > 0.5 && refr_pos.z >= glass_vz) {
+    if (refr_pos.y > 0.5 && refr_pos.x >= glass_vz) {
       refr_uv = screen_uv;
     }
     // Frosted glass: rough glass scatters both the transmitted and reflected light. Blur the
@@ -721,7 +721,7 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
       for (var fi: i32 = 0; fi < 6; fi = fi + 1) {
         let fuv = clamp(refr_uv + (frot * fd[fi]) * fb, half_texel, vec2<f32>(1.0) - half_texel);
         let tap_pos = textureLoad(gbuf_pos_tex, vec2<i32>(fuv * screen_dims), 0);
-        if (tap_pos.w > 0.5 && tap_pos.z >= glass_vz) {
+        if (tap_pos.y > 0.5 && tap_pos.x >= glass_vz) {
           facc += behind;
         } else {
           facc += textureSampleLevel(refraction_tex, env_samp, fuv, 0.0).rgb;
@@ -767,5 +767,5 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
   var meta_pos = vpos;
   meta_pos.w = 2.0 + sun_ratio;
   let scene_alpha = select(ambient_ratio, out_alpha, model_data.effect.z == 2u || model_data.effect.z == 3u);
-  return FragOut(vec4<f32>(color, scene_alpha), meta_pos, view_n, vec4<f32>(base_color.rgb, 1.0));
+  return FragOut(vec4<f32>(color, scene_alpha), meta_pos.zw, gbuf_encode_normal(view_n.xyz), vec4<f32>(base_color.rgb, view_n.w));
 }

@@ -11,8 +11,8 @@ struct DofParams {
 
 // View-space linear depth (camera looks -z, so depth = -z). Background (w<0.5) reads as far.
 fn linear_depth(g: vec4<f32>) -> f32 {
-  if (g.w < 0.5) { return 1.0e6; }
-  return max(-g.z, 1.0e-4);
+  if (g.y < 0.5) { return 1.0e6; }
+  return max(-g.x, 1.0e-4);
 }
 
 // Centre-spot autofocus: lock the focal plane onto whatever geometry sits at screen centre
@@ -28,7 +28,7 @@ fn autofocus() -> f32 {
     vec2<f32>(0.5, 0.47), vec2<f32>(0.5, 0.53));
   for (var i: i32 = 0; i < 5; i = i + 1) {
     let g = textureSampleLevel(pos_tex, samp, pts[i], 0.0);
-    if (g.w > 0.5) { sum = sum + max(-g.z, 1.0e-4); n = n + 1.0; }
+    if (g.y > 0.5) { sum = sum + max(-g.x, 1.0e-4); n = n + 1.0; }
   }
   if (n > 0.0) { return sum / n; }
   return p.cfg.x;

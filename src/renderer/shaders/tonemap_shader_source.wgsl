@@ -122,7 +122,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   // result is masked out by pbr_surface below anyway — the 25 taps are dead work there. The AO/SSGI
   // debug views (11/16) still force the full blur so they stay byte-identical to pre-change.
   let texel = 1.0 / vec2<f32>(textureDimensions(ao_tex, 0));
-  let lighting_meta = textureSampleLevel(lighting_meta_tex, samp, in.uv, 0.0).w;
+  let lighting_meta = textureSampleLevel(lighting_meta_tex, samp, in.uv, 0.0).y;
   let pbr_surface = select(0.0, 1.0, lighting_meta >= 1.5);
   let dv = p.debug.x;
   var aogi = vec4<f32>(0.0);

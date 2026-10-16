@@ -515,13 +515,15 @@ fn createPostResources(device: *wgpu.Device, surface_format: wgpu.TextureFormat)
         .entries = &tonemap_bgl_entries,
     }) orelse return error.BindGroupLayoutCreateFailed;
 
-    // SSR bind group layout: scene colour + view-position + view-normal + sampler + params.
+    // SSR bind group layout: scene colour + view-position + view-normal + sampler + params + albedo
+    // (its alpha carries roughness).
     const ssr_bgl_entries = [_]wgpu.BindGroupLayoutEntry{
         .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
         .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
         .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
         .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
         .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .min_binding_size = @sizeOf(SsrParams) } },
+        .{ .binding = 5, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
     };
     const ssr_bgl = device.createBindGroupLayout(&.{
         .label = wgpu.StringView.fromSlice("ssr bgl"),
@@ -1100,6 +1102,9 @@ pub const Gpu3d = struct {
     taa_path_supported: bool = true,
     // Projection matrix of the last world-3D layer, used to project SSAO/SSR samples.
     last_proj: [16]f32 = @splat(0),
+    // The world-3D projection the G-buffer was rasterized with (jitter included): the post passes
+    // rebuild view-space x/y from it and the stored z (gbuf_view_pos).
+    recon_proj: [16]f32 = @splat(0),
     last_view: [16]f32 = @splat(0), // world→view of the last world-3D layer (for contact shadows)
     // TAA reprojection state (unjittered): current view-proj (becomes prev next frame),
     // previous view-proj, and current inverse view (view_pos → world).
@@ -1412,20 +1417,20 @@ pub const Gpu3d = struct {
             },
             .write_mask = wgpu.ColorWriteMasks.all,
         };
-        // MRT location 1 = view-space position (SSAO/SSR), location 2 = view normal + roughness
-        // (SSR). Opaque writes both G-buffer targets; transparent (glass) writes neither
+        // MRT location 1 = view-space z + lighting metadata (SSAO/SSR/DoF/TAA/glass), location 2 = octahedral view normal,
+        // location 3 = albedo + roughness (SSGI tint, SSR). Opaque writes both G-buffer targets; transparent (glass) writes neither
         // (write_mask none) so the opaque surface behind the glass remains in the G-buffer.
         const opaque_targets = [_]wgpu.ColorTargetState{
             opaque_color_target,
-            .{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all },
-            .{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all },
-            .{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.all }, // location 3: albedo
+            .{ .format = shaders3d.gbuf_pos_format, .write_mask = wgpu.ColorWriteMasks.all },
+            .{ .format = shaders3d.gbuf_normal_format, .write_mask = wgpu.ColorWriteMasks.all },
+            .{ .format = shaders3d.gbuf_albedo_format, .write_mask = wgpu.ColorWriteMasks.all }, // location 3: albedo
         };
         const transparent_targets = [_]wgpu.ColorTargetState{
             transparent_color_target,
-            .{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.none },
-            .{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.none },
-            .{ .format = SCENE_HDR_FORMAT, .write_mask = wgpu.ColorWriteMasks.none }, // location 3: albedo (glass/blend don't write)
+            .{ .format = shaders3d.gbuf_pos_format, .write_mask = wgpu.ColorWriteMasks.none },
+            .{ .format = shaders3d.gbuf_normal_format, .write_mask = wgpu.ColorWriteMasks.none },
+            .{ .format = shaders3d.gbuf_albedo_format, .write_mask = wgpu.ColorWriteMasks.none }, // location 3: albedo (glass/blend don't write)
         };
 
         const pipeline = device.createRenderPipeline(&.{
@@ -2704,7 +2709,7 @@ pub const Gpu3d = struct {
             .usage = wgpu.TextureUsages.render_attachment,
             .dimension = .@"2d",
             .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
-            .format = SCENE_HDR_FORMAT,
+            .format = shaders3d.gbuf_pos_format,
             .mip_level_count = 1,
             .sample_count = MSAA_SAMPLES,
         }) orelse return error.SceneHdrCreateFailed;
@@ -2714,7 +2719,7 @@ pub const Gpu3d = struct {
             .usage = hdr_usage,
             .dimension = .@"2d",
             .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
-            .format = SCENE_HDR_FORMAT,
+            .format = shaders3d.gbuf_pos_format,
             .mip_level_count = 1,
             .sample_count = 1,
         }) orelse return error.SceneHdrCreateFailed;
@@ -2724,7 +2729,7 @@ pub const Gpu3d = struct {
             .usage = wgpu.TextureUsages.render_attachment,
             .dimension = .@"2d",
             .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
-            .format = SCENE_HDR_FORMAT,
+            .format = shaders3d.gbuf_normal_format,
             .mip_level_count = 1,
             .sample_count = MSAA_SAMPLES,
         }) orelse return error.SceneHdrCreateFailed;
@@ -2734,7 +2739,7 @@ pub const Gpu3d = struct {
             .usage = hdr_usage,
             .dimension = .@"2d",
             .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
-            .format = SCENE_HDR_FORMAT,
+            .format = shaders3d.gbuf_normal_format,
             .mip_level_count = 1,
             .sample_count = 1,
         }) orelse return error.SceneHdrCreateFailed;
@@ -2745,7 +2750,7 @@ pub const Gpu3d = struct {
             .usage = wgpu.TextureUsages.render_attachment,
             .dimension = .@"2d",
             .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
-            .format = SCENE_HDR_FORMAT,
+            .format = shaders3d.gbuf_albedo_format,
             .mip_level_count = 1,
             .sample_count = MSAA_SAMPLES,
         }) orelse return error.SceneHdrCreateFailed;
@@ -2755,7 +2760,7 @@ pub const Gpu3d = struct {
             .usage = hdr_usage,
             .dimension = .@"2d",
             .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
-            .format = SCENE_HDR_FORMAT,
+            .format = shaders3d.gbuf_albedo_format,
             .mip_level_count = 1,
             .sample_count = 1,
         }) orelse return error.SceneHdrCreateFailed;
@@ -2870,13 +2875,14 @@ pub const Gpu3d = struct {
         const ssr_bg = self.device.createBindGroup(&.{
             .label = wgpu.StringView.fromSlice("ssr bg"),
             .layout = self.ssr_bgl,
-            .entry_count = 5,
+            .entry_count = 6,
             .entries = &.{
                 .{ .binding = 0, .texture_view = scene_hdr_view },
                 .{ .binding = 1, .texture_view = gbuf_pos_view },
                 .{ .binding = 2, .texture_view = gbuf_normal_view },
                 .{ .binding = 3, .sampler = self.post_sampler },
                 .{ .binding = 4, .buffer = self.ssr_buf, .size = @sizeOf(SsrParams) },
+                .{ .binding = 5, .texture_view = gbuf_albedo_view },
             },
         }) orelse return error.BindGroupCreateFailed;
 
@@ -3281,8 +3287,9 @@ pub const Gpu3d = struct {
         // one full-res rgba16float, ~16 MB at 1080p.
         var hdr: u64 = px * hdr_bpp * 2 + (px * hdr_bpp / 3);
         if (self.dof_view != null) hdr += px * hdr_bpp;
-        // 3 G-buffers (pos/normal/albedo), each an MSAA target + a single-sample resolve
-        const gbuffer: u64 = 3 * (px * hdr_bpp * samples + px * hdr_bpp);
+        // 3 G-buffers, each an MSAA target + a single-sample resolve, 4 B each: view-z + metadata
+        // rg16float, octahedral normal rg16float, albedo + roughness rgba8.
+        const gbuffer: u64 = 12 * px * (samples + 1);
         // ao + gi_history + ssr at post resolution (hdr); exposure 1×1 negligible
         const post: u64 = ppx * hdr_bpp * 3;
         // taa input + output + history at full res (surface format)
@@ -3985,8 +3992,9 @@ pub const Gpu3d = struct {
             .cur_view_proj = self.cur_view_proj,
             .inv_view = self.inv_view,
             .gi = .{ if (self.gi_history_valid) 1.0 else 0.0, 0.9, 0.0, 0.0 },
+            .recon_proj = self.recon_proj,
         };
-        const rp = SsrParams{ .proj = self.last_proj, .cfg = .{ s.ssr_intensity, s.ssr_max_distance, s.ssr_thickness, s.ssr_steps } };
+        const rp = SsrParams{ .proj = self.last_proj, .cfg = .{ s.ssr_intensity, s.ssr_max_distance, s.ssr_thickness, s.ssr_steps }, .recon_proj = self.recon_proj };
         queue.writeBuffer(self.bloom_down_first_buf, 0, std.mem.asBytes(&down_first).ptr, @sizeOf(BloomDownParams));
         queue.writeBuffer(self.bloom_down_rest_buf, 0, std.mem.asBytes(&down_rest).ptr, @sizeOf(BloomDownParams));
         queue.writeBuffer(self.tonemap_buf, 0, std.mem.asBytes(&tp).ptr, @sizeOf(TonemapParams));
@@ -4098,6 +4106,7 @@ pub const Gpu3d = struct {
                 .cur_view_proj = self.cur_view_proj,
                 .inv_view = self.inv_view,
                 .cfg = .{ s.taa_feedback, 1.0, if (self.taa_valid) @as(f32, 1.0) else 0.0, 0.0 },
+                .recon_proj = self.recon_proj,
             };
             queue.writeBuffer(self.taa_buf, 0, std.mem.asBytes(&taa).ptr, @sizeOf(TaaParams));
             self.fullscreenPass(encoder, self.taa_output_view.?, self.taa_pipeline, self.taa_bg.?);
@@ -4520,6 +4529,7 @@ pub const Gpu3d = struct {
                 proj.cols[2].x += jx;
                 proj.cols[2].y += jy;
             }
+            self.recon_proj = proj.toArray();
         }
         const view_proj = proj.mul(view);
 
@@ -4570,62 +4580,6 @@ pub const Gpu3d = struct {
         }
         const renderables = self.render_list;
 
-        const layer_depth_attachment = wgpu.DepthStencilAttachment{
-            .view = depth_attachment.view,
-            .depth_load_op = if (clear_depth) .clear else .load,
-            .depth_store_op = .store,
-            .depth_clear_value = depth_attachment.depth_clear_value,
-        };
-        const layer_color_attachments = [_]wgpu.ColorAttachment{
-            .{
-                .view = self.msaa_color_view.?,
-                .resolve_target = color_attachment.view,
-                .load_op = if (layer == .world_3d) color_attachment.load_op else .load,
-                .store_op = color_attachment.store_op,
-                .clear_value = color_attachment.clear_value,
-            },
-            // View-position G-buffer (MRT location 1). Cleared to w=0 on the first layer so
-            // background pixels read as "no geometry"; the 2D layer loads to keep 3D positions.
-            .{
-                .view = self.msaa_pos_view.?,
-                .resolve_target = self.gbuf_pos_view.?,
-                .load_op = if (layer == .world_3d) .clear else .load,
-                .store_op = .store,
-                .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-            },
-            // View-normal + roughness G-buffer (MRT location 2), for roughness-aware SSR.
-            .{
-                .view = self.msaa_normal_view.?,
-                .resolve_target = self.gbuf_normal_view.?,
-                .load_op = if (layer == .world_3d) .clear else .load,
-                .store_op = .store,
-                .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-            },
-            // Albedo G-buffer (MRT location 3), for receiver-albedo tinting of SSGI.
-            .{
-                .view = self.msaa_albedo_view.?,
-                .resolve_target = self.gbuf_albedo_view.?,
-                .load_op = if (layer == .world_3d) .clear else .load,
-                .store_op = .store,
-                .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-            },
-        };
-        const pass_desc = wgpu.RenderPassDescriptor{
-            .color_attachment_count = layer_color_attachments.len,
-            .color_attachments = &layer_color_attachments,
-            .depth_stencil_attachment = &layer_depth_attachment,
-        };
-
-        const pass = encoder.beginRenderPass(&pass_desc) orelse return error.RenderPassFailed;
-        defer pass.release();
-
-        pass.setBindGroup(0, self.camera_bg, 0, null);
-        pass.setBindGroup(3, self.shadow_map_bg, 0, null); // includes the refraction source at binding 5
-
-        // Wireframe debug mode swaps every geometry pass to the line-list pipeline + edge index
-        // buffer; the drawRenderable helpers pick the line index buffer off the same flag.
-        const wf = self.settings.wireframe != 0.0;
-
         // Pass 1 — bucket geometry: opaque/masked → opaque_scratch (sorted below), blended → pass 2,
         // glass → post-copy refraction pass, instanced → batch pass.
         self.transparent_scratch.clearRetainingCapacity();
@@ -4675,6 +4629,72 @@ pub const Gpu3d = struct {
                 .double_sided = if (mat_data) |m| @intFromBool(m.double_sided) else 0,
             }) catch {};
         }
+
+        // The bucketing above decides what still reads the 4x MSAA attachments after this pass: the
+        // glass pass loads colour + depth (and binds the G-buffer targets only for attachment
+        // compatibility; glass never writes them), and the 2D scene layer loads all of them.
+        // Otherwise the resolves already hold everything, and storing the samples is pure
+        // bandwidth — the largest per-frame write of the 3D path, worst on tile-based GPUs.
+        // Depth stays stored: other passes read it. The 2D layer keeps .store as before.
+        const scene2d_follows = layer == .world_3d and world.active_camera_2d != null;
+        const msaa_color_store: wgpu.StoreOp = if (layer != .world_3d or scene2d_follows or self.glass_scratch.items.len > 0) .store else .discard;
+        const gbuf_store: wgpu.StoreOp = if (layer != .world_3d or scene2d_follows) .store else .discard;
+
+        const layer_depth_attachment = wgpu.DepthStencilAttachment{
+            .view = depth_attachment.view,
+            .depth_load_op = if (clear_depth) .clear else .load,
+            .depth_store_op = .store,
+            .depth_clear_value = depth_attachment.depth_clear_value,
+        };
+        const layer_color_attachments = [_]wgpu.ColorAttachment{
+            .{
+                .view = self.msaa_color_view.?,
+                .resolve_target = color_attachment.view,
+                .load_op = if (layer == .world_3d) color_attachment.load_op else .load,
+                .store_op = msaa_color_store,
+                .clear_value = color_attachment.clear_value,
+            },
+            // View-position G-buffer (MRT location 1). Cleared to w=0 on the first layer so
+            // background pixels read as "no geometry"; the 2D layer loads to keep 3D positions.
+            .{
+                .view = self.msaa_pos_view.?,
+                .resolve_target = self.gbuf_pos_view.?,
+                .load_op = if (layer == .world_3d) .clear else .load,
+                .store_op = gbuf_store,
+                .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+            },
+            // View-normal + roughness G-buffer (MRT location 2), for roughness-aware SSR.
+            .{
+                .view = self.msaa_normal_view.?,
+                .resolve_target = self.gbuf_normal_view.?,
+                .load_op = if (layer == .world_3d) .clear else .load,
+                .store_op = gbuf_store,
+                .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+            },
+            // Albedo G-buffer (MRT location 3), for receiver-albedo tinting of SSGI.
+            .{
+                .view = self.msaa_albedo_view.?,
+                .resolve_target = self.gbuf_albedo_view.?,
+                .load_op = if (layer == .world_3d) .clear else .load,
+                .store_op = gbuf_store,
+                .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+            },
+        };
+        const pass_desc = wgpu.RenderPassDescriptor{
+            .color_attachment_count = layer_color_attachments.len,
+            .color_attachments = &layer_color_attachments,
+            .depth_stencil_attachment = &layer_depth_attachment,
+        };
+
+        const pass = encoder.beginRenderPass(&pass_desc) orelse return error.RenderPassFailed;
+        defer pass.release();
+
+        pass.setBindGroup(0, self.camera_bg, 0, null);
+        pass.setBindGroup(3, self.shadow_map_bg, 0, null); // includes the refraction source at binding 5
+
+        // Wireframe debug mode swaps every geometry pass to the line-list pipeline + edge index
+        // buffer; the drawRenderable helpers pick the line index buffer off the same flag.
+        const wf = self.settings.wireframe != 0.0;
 
         // Sort opaque draws by (double_sided, material handle) so identical materials are adjacent.
         // Opaque geometry is order-independent (depth-write on, depth-test .less), so reordering
@@ -4782,11 +4802,14 @@ pub const Gpu3d = struct {
                     return a.depth > b.depth;
                 }
             }.farther);
+            const msaa_color_glass_store: wgpu.StoreOp = if (scene2d_follows) .store else .discard;
+            const gbuf_glass_load: wgpu.LoadOp = if (gbuf_store == .store) .load else .clear;
             const glass_color_attachments = [_]wgpu.ColorAttachment{
-                .{ .view = self.msaa_color_view.?, .resolve_target = self.scene_hdr_view.?, .load_op = .load, .store_op = .store, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
-                .{ .view = self.msaa_pos_view.?, .load_op = .load, .store_op = .store, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
-                .{ .view = self.msaa_normal_view.?, .load_op = .load, .store_op = .store, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
-                .{ .view = self.msaa_albedo_view.?, .load_op = .load, .store_op = .store, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+                .{ .view = self.msaa_color_view.?, .resolve_target = self.scene_hdr_view.?, .load_op = .load, .store_op = msaa_color_glass_store, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+                // Never written here (write_mask none). Only carried through when the 2D layer loads them.
+                .{ .view = self.msaa_pos_view.?, .load_op = gbuf_glass_load, .store_op = gbuf_store, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+                .{ .view = self.msaa_normal_view.?, .load_op = gbuf_glass_load, .store_op = gbuf_store, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+                .{ .view = self.msaa_albedo_view.?, .load_op = gbuf_glass_load, .store_op = gbuf_store, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
             };
             const glass_depth = wgpu.DepthStencilAttachment{
                 .view = depth_attachment.view,

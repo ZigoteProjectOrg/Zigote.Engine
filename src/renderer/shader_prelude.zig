@@ -14,6 +14,10 @@ const std = @import("std");
 /// Fullscreen-triangle vertex stage plus the `VOut` it produces. Prepend to any post pass.
 pub const fullscreen = @embedFile("shaders/common_fullscreen.wgsl") ++ "\n";
 
+/// `gbuf_encode_normal` / `gbuf_decode_normal`: the view-normal G-buffer encoding. Prepend to every
+/// shader that writes or reads that target.
+pub const gbuffer = @embedFile("shaders/common_gbuffer.wgsl") ++ "\n";
+
 /// `srgb_decode`. Prepend to anything that decodes an sRGB-encoded colour.
 pub const color = @embedFile("shaders/common_color.wgsl") ++ "\n";
 

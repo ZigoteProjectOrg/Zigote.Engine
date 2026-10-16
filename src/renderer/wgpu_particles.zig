@@ -419,12 +419,12 @@ pub const ParticleSystem = struct {
             .alpha = .{ .src_factor = .one, .dst_factor = .one_minus_src_alpha, .operation = .add },
         };
         // Must declare ALL of the geometry pass's color attachments (attachment-state compatibility):
-        // location 1 = view-position, 2 = view-normal, 3 = albedo G-buffer — all masked off.
+        // location 1 = view-z + metadata, 2 = view-normal, 3 = albedo G-buffer — all masked off.
         const targets = [_]wgpu.ColorTargetState{
             .{ .format = hdr_format, .blend = &blend, .write_mask = wgpu.ColorWriteMasks.all },
-            .{ .format = hdr_format, .write_mask = wgpu.ColorWriteMasks.none },
-            .{ .format = hdr_format, .write_mask = wgpu.ColorWriteMasks.none },
-            .{ .format = hdr_format, .write_mask = wgpu.ColorWriteMasks.none },
+            .{ .format = shaders3d.gbuf_pos_format, .write_mask = wgpu.ColorWriteMasks.none },
+            .{ .format = shaders3d.gbuf_normal_format, .write_mask = wgpu.ColorWriteMasks.none },
+            .{ .format = shaders3d.gbuf_albedo_format, .write_mask = wgpu.ColorWriteMasks.none },
         };
 
         const inst_attrs = [_]wgpu.VertexAttribute{

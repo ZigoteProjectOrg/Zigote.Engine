@@ -7,6 +7,7 @@ struct SsaoParams {
   cur_view_proj: mat4x4<f32>,
   inv_view: mat4x4<f32>,
   gi: vec4<f32>,       // x=history_valid, y=history feedback weight
+  recon_proj: mat4x4<f32>, // rasterized (jittered) projection, for gbuf_view_pos
 }
 @group(0) @binding(0) var pos_tex: texture_2d<f32>;
 @group(0) @binding(1) var nrm_tex: texture_2d<f32>;
@@ -31,13 +32,13 @@ fn to_uv(view_pos: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   let g = textureSampleLevel(pos_tex, samp, in.uv, 0.0);
-  if (g.w < 0.5) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); } // background — no occlusion (a), no bounce (rgb)
-  let P = g.xyz; // view space (camera at origin, looking -z)
+  if (g.y < 0.5) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); } // background — no occlusion (a), no bounce (rgb)
+  let P = gbuf_view_pos(in.uv, g.x, p.recon_proj); // view space (camera at origin, looking -z)
   // View-space shading normal straight from the G-buffer (.xyz; .w is roughness). It is already
   // unit-length, camera-facing, and carries normal-mapped detail — far cleaner than the previous
   // cross(dpdx(P), dpdy(P)) face normal, which faceted on curved/low-poly geometry and haloed
   // where the derivatives straddled a depth discontinuity. (Same target SSR reads.)
-  let N = normalize(textureSampleLevel(nrm_tex, samp, in.uv, 0.0).xyz);
+  let N = gbuf_decode_normal(textureSampleLevel(nrm_tex, samp, in.uv, 0.0).xy);
 
   let radius = p.cfg.x;
   let bias = p.cfg.y;
@@ -59,8 +60,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
       let suv = in.uv + dir * t * radius_uv;
       if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) { break; }
       let sg = textureSampleLevel(pos_tex, samp, suv, 0.0);
-      if (sg.w < 0.5) { continue; }
-      let diff = sg.xyz - P;
+      if (sg.y < 0.5) { continue; }
+      let diff = gbuf_view_pos(suv, sg.x, p.recon_proj) - P;
       let l = length(diff);
       if (l < 0.001 || l > radius) { continue; }
       let sin_h = dot(N, diff / l); // elevation of the sample above the tangent plane
@@ -91,14 +92,14 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
       let guv = in.uv + vec2<f32>(cos(ga), sin(ga)) * gr * gi_radius_uv;
       if (guv.x < 0.0 || guv.x > 1.0 || guv.y < 0.0 || guv.y > 1.0) { continue; }
       let gg = textureSampleLevel(pos_tex, samp, guv, 0.0);
-      if (gg.w < 0.5) { continue; }
-      let gd = gg.xyz - P;
+      if (gg.y < 0.5) { continue; }
+      let gd = gbuf_view_pos(guv, gg.x, p.recon_proj) - P;
       let gl2 = dot(gd, gd);
       if (gl2 < 0.0004 || gl2 > gi_radius_sq) { continue; }
       let gdir = gd * inverseSqrt(gl2);
       let ndl = max(dot(N, gdir), 0.0); // receiver faces the sample
       if (ndl <= 0.0) { continue; }
-      let gsn = normalize(textureSampleLevel(nrm_tex, samp, guv, 0.0).xyz);
+      let gsn = gbuf_decode_normal(textureSampleLevel(nrm_tex, samp, guv, 0.0).xy);
       let gfacing = max(-dot(gsn, gdir), 0.0); // sample faces the receiver
       let gatten = 1.0 / (1.0 + gl2 * 4.0);
       indirect += textureSampleLevel(color_tex, samp, guv, 0.0).rgb * (ndl * gfacing * gatten);
@@ -129,8 +130,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
       let cuv = to_uv(march);
       if (cuv.z <= 0.0 || cuv.x < 0.0 || cuv.x > 1.0 || cuv.y < 0.0 || cuv.y > 1.0) { break; }
       let cg = textureSampleLevel(pos_tex, samp, cuv.xy, 0.0);
-      if (cg.w < 0.5) { continue; }
-      let dz = cg.z - march.z; // geometry nearer the camera than the ray → occluder
+      if (cg.y < 0.5) { continue; }
+      let dz = cg.x - march.z; // geometry nearer the camera than the ray → occluder
       if (dz > 0.003 && dz < p.contact2.z) { contact = 1.0 - cstr; break; }
     }
   }

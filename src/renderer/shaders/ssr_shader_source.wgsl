@@ -1,12 +1,14 @@
 struct SsrParams {
   proj: mat4x4<f32>,  // view → clip
   cfg: vec4<f32>,     // x=intensity, y=max_distance, z=thickness, w=step_count
+  recon_proj: mat4x4<f32>, // rasterized (jittered) projection, for gbuf_view_pos
 }
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;
 @group(0) @binding(1) var pos_tex: texture_2d<f32>;
 @group(0) @binding(2) var normal_tex: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var<uniform> p: SsrParams;
+@group(0) @binding(5) var albedo_tex: texture_2d<f32>; // a = roughness
 
 fn to_uv(view_pos: vec3<f32>) -> vec3<f32> {
   let clip = p.proj * vec4<f32>(view_pos, 1.0);
@@ -44,16 +46,15 @@ fn sample_reflection(uv: vec2<f32>, radius: f32) -> vec3<f32> {
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   let g = textureSampleLevel(pos_tex, samp, in.uv, 0.0);
-  if (g.w < 0.5) { return vec4<f32>(0.0); } // background
-  let nr = textureSampleLevel(normal_tex, samp, in.uv, 0.0);
-  let roughness = nr.w;
+  if (g.y < 0.5) { return vec4<f32>(0.0); } // background
+  let roughness = textureSampleLevel(albedo_tex, samp, in.uv, 0.0).a;
   // Roughness-aware: smooth → glossy surfaces get SSR (mirror chrome through glossy paint). Beyond
   // ~0.45 the glossy disk under-samples into low-frequency haze, so hand off to the prefiltered env
   // cubemap (already applied by the forward pass), which covers that range better.
   let smoothness = 1.0 - smoothstep(0.05, 0.45, roughness);
   if (smoothness <= 0.001) { return vec4<f32>(0.0); }
-  let pos = g.xyz; // view space (camera at origin, looking -z)
-  var n = normalize(nr.xyz);
+  let pos = gbuf_view_pos(in.uv, g.x, p.recon_proj); // view space (camera at origin, looking -z)
+  var n = gbuf_decode_normal(textureSampleLevel(normal_tex, samp, in.uv, 0.0).xy);
   if (dot(n, -pos) < 0.0) { n = -n; }
   let view_dir = normalize(pos);
   let refl = normalize(reflect(view_dir, n));
@@ -83,8 +84,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     if (uvw.z <= 0.0) { break; }
     if (uvw.x < 0.0 || uvw.x > 1.0 || uvw.y < 0.0 || uvw.y > 1.0) { break; }
     let scene_g = textureSampleLevel(pos_tex, samp, uvw.xy, 0.0);
-    if (scene_g.w < 0.5) { prev = march; continue; } // sky: ray still in front → advance bracket
-    let diff = scene_g.z - march.z; // >0: geometry nearer camera than the ray → ray is behind it
+    if (scene_g.y < 0.5) { prev = march; continue; } // sky: ray still in front → advance bracket
+    let diff = scene_g.x - march.z; // >0: geometry nearer camera than the ray → ray is behind it
     if (diff <= 0.0) { prev = march; continue; } // ray in front of geometry → advance the bracket
     // Depth-proportional acceptance window: a constant view-space thickness is too thick near the
     // camera (false hits / smear) and too thin far away (missed hits). Scaling by distance-from-camera
@@ -99,15 +100,15 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
       for (var b: i32 = 0; b < 6; b = b + 1) {
         let mid = (lo + hi) * 0.5;
         let mg = textureSampleLevel(pos_tex, samp, to_uv(mid).xy, 0.0);
-        if (mg.w > 0.5 && (mg.z - mid.z) > 0.0) { hi = mid; } else { lo = mid; }
+        if (mg.y > 0.5 && (mg.x - mid.z) > 0.0) { hi = mid; } else { lo = mid; }
       }
       let huv = to_uv(hi);
       // Reject refined hits that straddled a silhouette: the converged uv can project onto a different
       // (foreground/background) surface than the one bracketed, leaving the depth gap > thickness —
       // accepting it smears edge-coloured streaks along silhouettes.
       let hg = textureSampleLevel(pos_tex, samp, huv.xy, 0.0);
-      if (hg.w < 0.5) { break; }
-      let hdiff = hg.z - hi.z;
+      if (hg.y < 0.5) { break; }
+      let hdiff = hg.x - hi.z;
       if (hdiff < 0.0 || hdiff >= thick) { break; }
       // Per-edge screen fade (corners fade fastest; a wider band on the top edge, huv.y→0, where
       // world-up reflections exit) so reflections don't pop at screen borders.

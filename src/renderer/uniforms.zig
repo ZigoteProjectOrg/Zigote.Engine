@@ -45,12 +45,14 @@ pub const SsaoParams = extern struct {
     cur_view_proj: [16]f32, // current UNJITTERED — for jitter-free motion vectors
     inv_view: [16]f32,
     gi: [4]f32, // x = history_valid (0/1), y = history feedback weight, zw unused
+    recon_proj: [16]f32, // rasterized (jittered) projection: rebuilds view x/y from the z G-buffer
 };
 
 /// Uniform params for the SSR (screen-space reflections) pass.
 pub const SsrParams = extern struct {
     proj: [16]f32, // view → clip
     cfg: [4]f32, // x=intensity, y=max_distance, z=thickness, w=step_count
+    recon_proj: [16]f32, // rasterized (jittered) projection: rebuilds view x/y from the z G-buffer
 };
 
 /// Uniform params for the TAA resolve pass.
@@ -59,6 +61,7 @@ pub const TaaParams = extern struct {
     cur_view_proj: [16]f32,
     inv_view: [16]f32,
     cfg: [4]f32, // x=feedback, y=enabled, z=history_valid, w unused
+    recon_proj: [16]f32, // rasterized (jittered) projection: rebuilds view x/y from the z G-buffer
 };
 
 /// Uniform params for the auto-exposure metering pass (average scene luminance → adapted multiplier,

@@ -3,6 +3,7 @@ struct TaaParams {
   cur_view_proj: mat4x4<f32>,  // current frame UNJITTERED — for jitter-free motion vectors
   inv_view: mat4x4<f32>,
   cfg: vec4<f32>, // x=feedback, y=enabled, z=history_valid, w unused
+  recon_proj: mat4x4<f32>, // rasterized (jittered) projection, for gbuf_view_pos
 }
 @group(0) @binding(0) var cur_tex: texture_2d<f32>;
 @group(0) @binding(1) var history_tex: texture_2d<f32>;
@@ -62,8 +63,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   let cur = textureSampleLevel(cur_tex, samp, in.uv, 0.0).rgb;
   if (p.cfg.y < 0.5 || p.cfg.z < 0.5) { return vec4<f32>(cur, 1.0); }
   let g = textureSampleLevel(pos_tex, samp, in.uv, 0.0);
-  if (g.w < 0.5) { return vec4<f32>(cur, 1.0); } // background — no reprojection
-  let world = (p.inv_view * vec4<f32>(g.xyz, 1.0)).xyz;
+  if (g.y < 0.5) { return vec4<f32>(cur, 1.0); } // background — no reprojection
+  let world = (p.inv_view * vec4<f32>(gbuf_view_pos(in.uv, g.x, p.recon_proj), 1.0)).xyz;
   let pc = p.prev_view_proj * vec4<f32>(world, 1.0);
   let cc = p.cur_view_proj * vec4<f32>(world, 1.0);
   if (pc.w <= 0.0 || cc.w <= 0.0) { return vec4<f32>(cur, 1.0); }

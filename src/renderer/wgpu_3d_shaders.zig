@@ -13,7 +13,16 @@ const builtin = @import("builtin");
 /// MAX_POINT_SHADOWS): point light 0 keeps its shadow, further point lights cast none.
 pub const cube_array_supported = !(builtin.os.tag == .ios and builtin.abi == .simulator);
 
-pub const mesh_shader_source = if (cube_array_supported)
+/// G-buffer target formats, shared by every pipeline that renders into the geometry pass.
+/// Normal: octahedral xy (see `prelude.gbuffer`). Albedo: base colour in rgb, roughness in a — the
+/// sRGB encoding spends the 8 bits where dark albedo needs them; alpha is stored linear.
+/// Position: view-space z + lighting metadata; x/y are rebuilt from the pixel (`gbuf_view_pos`).
+/// z keeps the 16-bit float precision the old xyz target had.
+pub const gbuf_pos_format: @import("wgpu").TextureFormat = .rg16_float;
+pub const gbuf_normal_format: @import("wgpu").TextureFormat = .rg16_float;
+pub const gbuf_albedo_format: @import("wgpu").TextureFormat = .rgba8_unorm_srgb;
+
+pub const mesh_shader_source = prelude.gbuffer ++ if (cube_array_supported)
     @embedFile("shaders/mesh_shader_source.wgsl")
 else
     comptimeReplace(
@@ -84,24 +93,24 @@ pub const bloom_down_shader_source = prelude.fullscreen ++ @embedFile("shaders/b
 
 pub const bloom_up_shader_source = prelude.fullscreen ++ @embedFile("shaders/bloom_up_shader_source.wgsl");
 
-// Screen-space ambient occlusion. Reads the view-space position G-buffer (rgba16float,
-// w=1 on geometry, 0 on background), reconstructs the face normal from screen derivatives,
+// Screen-space ambient occlusion. Reads the view-z G-buffer (metadata y=1 on geometry, 0 on
+// background; x/y rebuilt by gbuf_view_pos) and the octahedral normal G-buffer,
 // and accumulates occlusion over a hemisphere kernel rotated by a per-pixel hash. Output is
 // a single AO factor in [0,1] (1 = unoccluded) written to all channels.
-pub const ssao_shader_source = prelude.fullscreen ++ @embedFile("shaders/ssao_shader_source.wgsl");
+pub const ssao_shader_source = prelude.fullscreen ++ prelude.gbuffer ++ @embedFile("shaders/ssao_shader_source.wgsl");
 
 // Screen-space reflections. Reflects the lit HDR scene off the view-position G-buffer:
 // reconstructs the face normal, reflects the view ray, ray-marches in view space, and on a
 // depth intersection samples the scene colour at the hit. Output is the (pre-weighted)
 // reflection colour in rgb + confidence in a, added by the tonemap pass.
-pub const ssr_shader_source = prelude.fullscreen ++ @embedFile("shaders/ssr_shader_source.wgsl");
+pub const ssr_shader_source = prelude.fullscreen ++ prelude.gbuffer ++ @embedFile("shaders/ssr_shader_source.wgsl");
 
 // Temporal anti-aliasing. Reconstructs each pixel's world position from the view-position
 // G-buffer, reprojects it through the PREVIOUS frame's view-projection to fetch the history
 // colour, neighborhood-clamps that history to the current 3x3 colour range (kills ghosting),
 // and blends. Combined with a per-frame sub-pixel projection jitter, accumulated frames
 // anti-alias the image (including the post-MSAA bits: SSR, specular, softbox highlights).
-pub const taa_shader_source = prelude.fullscreen ++ @embedFile("shaders/taa_shader_source.wgsl");
+pub const taa_shader_source = prelude.fullscreen ++ prelude.gbuffer ++ @embedFile("shaders/taa_shader_source.wgsl");
 
 pub const tonemap_shader_source = prelude.fullscreen ++ prelude.color ++ @embedFile("shaders/tonemap_shader_source.wgsl");
 
