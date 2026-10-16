@@ -321,7 +321,8 @@ pub const ZgSceneMaterial = extern struct {
     effect: u32,
     alpha_mode: u32,
     double_sided: u32,
-    pad: u32 = 0,
+    // 1 - base-colour alpha (glTF baseColorFactor.a). Stored inverted so a zero-filled record is opaque.
+    transparency: f32 = 0,
 };
 
 pub const ZgSceneVisibility = extern struct {

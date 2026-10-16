@@ -40,7 +40,7 @@ struct LightUniforms {
   post: vec4<f32>,
   shadow: vec4<f32>,
   lights: array<LightData, 16>,
-  debug: vec4<u32>, // x = debug view code, y = diagnostic mode flag
+  debug: vec4<u32>, // x = debug view code, y = diagnostic mode flag, z = wireframe, w = editor grid
   probe_center: vec4<f32>, // xyz = box centre, w = enabled (0/1)
   probe_extents: vec4<f32>, // xyz = box half-extents
   csm_view_proj: array<mat4x4<f32>, 4>, // directional cascade light view-proj matrices
@@ -288,7 +288,8 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
   // Emissive map (default 1×1 white → factor passes through untextured materials unchanged).
   // Sampled here, in uniform control flow, for the same implicit-LOD reason as the normal map.
   let emissive_rgb = model_data.emissive.rgb * textureSample(emissive_tex, emissive_sampler, in.uv).rgb;
-  if (length(in.tangent.xyz) > 0.1) {
+  let has_normal_map = length(in.tangent.xyz) > 0.1;
+  if (has_normal_map) {
     let t = normalize(in.tangent.xyz);
     let b = cross(n, t) * in.tangent.w;
     let tbn = mat3x3<f32>(t, b, n);
@@ -376,6 +377,17 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
   // the mere CURVATURE of a car body inflated glossy paint to ~0.66 roughness — the
   // "clay" look. Use a small amount so curved glossy surfaces stay reflective.
   roughness = clamp(sqrt(roughness * roughness + min(geo_var * 0.10, 0.05)), roughness, 1.0);
+  // Toksvig: a minified normal map averages its bumps in the mip chain, so the filtered normal comes
+  // back SHORTER than unit length — 1/len - 1 is the lost normal variance. Fold it into alpha² so a
+  // brushed/bumpy map converges to a correctly broader highlight with distance instead of aliasing
+  // into blotches where it scatters a crisp softbox edge. Only where a normal map is actually bound.
+  if (has_normal_map) {
+    let nm_len = clamp(length(map_normal), 0.05, 1.0);
+    let alpha = roughness * roughness;
+    // 0.01 dead zone: 8-bit quantisation alone shortens a full-res unit normal by up to ~0.007.
+    let variance = max(1.0 / nm_len - 1.01, 0.0);
+    roughness = clamp(sqrt(sqrt(alpha * alpha + variance)), roughness, 1.0);
+  }
   // (Removed the global `if (metallic > 0.5) roughness = min(roughness, 0.4)` clamp — it was
   // non-physical and prevented genuinely rough metals from looking rough. Roughness now comes
   // purely from the material data.)
@@ -626,8 +638,9 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
 
   // Editor world-space grid overlay (anti-aliased derivative-based). Applied in linear
   // space; it darkens toward a small linear value so it survives tonemapping downstream.
-  // Suppressed in diagnostic mode so it can't darken inspected materials near y=0.
-  if (light.debug.y == 0u) {
+  // Editor-only (debug.w, zigote_render_set_editor_grid) and suppressed in diagnostic mode so it
+  // can't darken inspected materials near y=0.
+  if (light.debug.y == 0u && light.debug.w == 1u) {
   let gx = in.world_pos.x;
   let gz = in.world_pos.z;
   let fw_gx = fwidth(gx);

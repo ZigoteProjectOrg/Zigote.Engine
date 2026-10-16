@@ -1164,6 +1164,9 @@ pub const Gpu3d = struct {
     // Frustum culling of the world-3D geometry pass (set via zigote_render_set_frustum_cull). On by
     // default; drops draws whose world-space bounding sphere is fully outside the camera frustum.
     frustum_cull: bool = true,
+    // World-space editor grid on floor-like surfaces near y=0 (set via zigote_render_set_editor_grid).
+    // Off by default so games never draw it; the editor turns it on while authoring.
+    editor_grid: bool = false,
     // Scratch buffer for depth-sorting blended renderables each frame (back-to-front).
     transparent_scratch: std.ArrayListUnmanaged(TransparentItem) = .empty,
     // Glass renderables, deferred to a second pass (after copying the opaque scene) for refraction.
@@ -3472,7 +3475,11 @@ pub const Gpu3d = struct {
         // One params slot per (mip, face). All queue writes land before any pass executes, so
         // each pass must read its own slot through a distinct dynamic offset.
         for (0..ENV_MIPS) |mip| {
-            const rough: f32 = if (ENV_MIPS <= 1) 0.0 else @as(f32, @floatFromInt(mip)) / @as(f32, @floatFromInt(ENV_MIPS - 1));
+            // The mesh shader samples LOD = sqrt(roughness) * (ENV_MIPS - 1), so mip m must hold the
+            // lobe for roughness (m / (ENV_MIPS - 1))². Baking it at the linear ratio made every
+            // glossy reflection read several times blurrier than its authored roughness.
+            const t: f32 = if (ENV_MIPS <= 1) 0.0 else @as(f32, @floatFromInt(mip)) / @as(f32, @floatFromInt(ENV_MIPS - 1));
+            const rough: f32 = t * t;
             for (0..6) |face| {
                 const params = EnvBakeParams{
                     .face_mode_rough = .{ @floatFromInt(face), @floatFromInt(self.env_mode), rough, 0 },
@@ -3693,7 +3700,7 @@ pub const Gpu3d = struct {
         const diagnostic = s.diagnostic_mode != 0.0;
         light_data.ambient_color = .{ 0.08, 0.10, 0.14, s.ambient_intensity };
         light_data.light_count[0] = @min(16, @as(u32, @intCast(active_lights.items.len)));
-        light_data.debug = .{ @intFromFloat(@max(self.settings.debug_view, 0.0)), if (diagnostic) 1 else 0, if (self.settings.wireframe != 0.0) 1 else 0, 0 };
+        light_data.debug = .{ @intFromFloat(@max(self.settings.debug_view, 0.0)), if (diagnostic) 1 else 0, if (self.settings.wireframe != 0.0) 1 else 0, @intFromBool(self.editor_grid) };
 
         // Pack editor-tunable render settings into the light UBO (read by the mesh shader).
         light_data.sky_horizon = .{ s.sky_horizon[0], s.sky_horizon[1], s.sky_horizon[2], 0 };

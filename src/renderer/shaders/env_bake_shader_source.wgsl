@@ -36,27 +36,59 @@ fn faceDir(face: u32, uv: vec2<f32>) -> vec3<f32> {
   return normalize(d);
 }
 
-fn proceduralEnv(d: vec3<f32>, rough: f32) -> vec3<f32> {
+// Rectangular softbox seen from the origin: `d` projected onto the panel's plane (gnomonic), then a
+// smooth box mask. half = tangent-space half extents along (u, v); soft widens the edge falloff.
+fn softbox(d: vec3<f32>, c: vec3<f32>, half: vec2<f32>, soft: f32) -> f32 {
+  let z = dot(d, c);
+  if (z <= 0.0) { return 0.0; }
+  let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(c.y) > 0.95);
+  let u = normalize(cross(up, c));
+  let v = cross(c, u);
+  let q = abs(vec2<f32>(dot(d, u), dot(d, v)) / z) - half;
+  let e = vec2<f32>(0.004) + soft * (half + vec2<f32>(0.05));
+  let m = vec2<f32>(1.0) - smoothstep(-e, e, q);
+  return m.x * m.y;
+}
+
+// The procedural studio at a given edge softness (0 = crisp; the GGX prefilter below does the real
+// roughness blur and only uses `soft` to keep its finite sample count from banding on hard edges).
+fn proceduralEnv(d: vec3<f32>, soft: f32) -> vec3<f32> {
   let sky_up = mix(p.sky_horizon.rgb, p.sky_zenith.rgb, pow(clamp(d.y, 0.0, 1.0), 0.55));
-  let base   = mix(sky_up, p.sky_ground.rgb, clamp(-d.y, 0.0, 1.0));
-  // Studio key/softbox reflections, broadened as roughness rises (cheap analytic prefilter).
-  let sharp    = mix(1.0, 0.2, rough);
-  let sun_spot = pow(clamp(dot(d, p.sun_dir.xyz), 0.0, 1.0), max(p.studio.z * sharp, 1.0)) * p.sun_dir.w;
+  // A readable horizon line: glossy surfaces need a light/dark split to show their curvature.
+  let ground = smoothstep(0.0, 0.02 + soft * 0.3, -d.y);
+  let base   = mix(sky_up, p.sky_ground.rgb * mix(1.0, 0.7, clamp(-d.y * 2.0, 0.0, 1.0)), ground);
+  let sun_spot = pow(clamp(dot(d, p.sun_dir.xyz), 0.0, 1.0), max(p.studio.z * (1.0 - soft * 0.8), 1.0)) * p.sun_dir.w;
   let overhead = smoothstep(0.25, 0.85, d.y) * p.studio.x;
   let horizon  = exp(-(d.y * d.y) * 14.0) * p.studio.y;
-  // Defined studio softboxes — bright panels (key / side fill / back rim) that reflect as
-  // crisp streaks across glossy paint and glass (the car-studio look). Their angular size
-  // narrows for smooth surfaces and broadens as roughness rises. Scaled by the "Overhead
-  // Softbox" studio knob so they stay editor-tunable.
-  let sb_sharp = mix(50.0, 6.0, rough);
-  let key  = pow(clamp(dot(d, normalize(vec3<f32>( 0.4, 0.9, 0.5))), 0.0, 1.0), sb_sharp) * 2.2;
-  let fill = pow(clamp(dot(d, normalize(vec3<f32>(-0.8, 0.6, 0.2))), 0.0, 1.0), sb_sharp * 0.7) * 0.9;
-  let rim  = pow(clamp(dot(d, normalize(vec3<f32>( 0.3, 0.5, -0.9))), 0.0, 1.0), sb_sharp * 0.8) * 1.4;
-  let softbox = (key + fill + rim) * p.studio.x * (1.0 - rough * 0.4);
-  // Studio reflections are kept subtle so they read as soft highlights on glossy surfaces rather
-  // than a high-contrast chrome studio that buries every material's albedo. (Was ~2.5x hotter.)
-  let studio   = vec3<f32>(1.0, 0.98, 0.94) * (sun_spot + overhead + horizon + softbox) * (1.0 - rough * 0.5);
-  return base + studio * 0.4;
+  // Car-studio softboxes: a long overhead strip, a tall key strip, a broad dim fill and a narrow back
+  // rim. Crisp rectangles reflect as the streaks that read glossy paint, chrome and glass. Scaled by
+  // the "Overhead Softbox" knob so they stay editor-tunable.
+  let boxes =
+      softbox(d, normalize(vec3<f32>( 0.0, 1.0,  0.12)), vec2<f32>(0.22, 1.10), soft) * 1.6
+    + softbox(d, normalize(vec3<f32>( 0.65, 0.45, 0.62)), vec2<f32>(0.16, 0.55), soft) * 2.0
+    + softbox(d, normalize(vec3<f32>(-0.85, 0.35, 0.25)), vec2<f32>(0.55, 0.30), soft) * 0.7
+    + softbox(d, normalize(vec3<f32>( 0.15, 0.30, -0.95)), vec2<f32>(0.70, 0.08), soft) * 1.8;
+  let studio = vec3<f32>(1.0, 0.98, 0.94) * ((sun_spot + overhead + horizon) * 0.4 + boxes * p.studio.x * 0.45);
+  return base + studio;
+}
+
+// GGX prefilter of the procedural studio — the same lobe the HDRI path integrates, so a mip baked at
+// roughness r is what the mesh shader expects when it samples at r.
+fn prefilterProcedural(d: vec3<f32>, rough: f32) -> vec3<f32> {
+  if (rough < 0.01) { return proceduralEnv(d, 0.0); }
+  var col = vec3<f32>(0.0);
+  var wsum = 0.0;
+  for (var i = 0u; i < 128u; i = i + 1u) {
+    let xi = vec2<f32>(f32(i) / 128.0, radicalInverse(i));
+    let h = importanceGGX(xi, d, rough);
+    let l = normalize(2.0 * dot(d, h) * h - d);
+    let ndl = dot(d, l);
+    if (ndl > 0.0) {
+      col = col + min(proceduralEnv(l, rough * 0.5), vec3<f32>(20.0)) * ndl;
+      wsum = wsum + ndl;
+    }
+  }
+  return select(proceduralEnv(d, rough), col / wsum, wsum > 0.0);
 }
 
 fn dirToEquirectUv(d: vec3<f32>) -> vec2<f32> {
@@ -181,7 +213,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     else { c = prefilterHdri(d, rough); }
   } else {
     if (rough > 0.95) { c = irradianceProcedural(d); }
-    else { c = proceduralEnv(d, rough); }
+    else { c = prefilterProcedural(d, rough); }
   }
   return vec4<f32>(c, 1.0);
 }

@@ -543,6 +543,7 @@ const EngineState = struct {
     // Reads pre-creation are served from these (they equal Gpu3d's own defaults).
     pending_settings_3d: wgpu_renderer.wgpu_3d.Settings3D = .{},
     pending_frustum_cull: bool = true,
+    pending_editor_grid: bool = false,
     offscreen_3d_texture: ?*wgpu.Texture,
     offscreen_3d_view: ?*wgpu.TextureView,
     physics: ?*physics_ffi.PhysicsState,
@@ -2040,6 +2041,7 @@ fn ensure3d(state: *EngineState) ?*wgpu_renderer.wgpu_3d.Gpu3d {
     // sky/environment settings bake on the first render without an explicit diff.
     g.settings = state.pending_settings_3d;
     g.frustum_cull = state.pending_frustum_cull;
+    g.editor_grid = state.pending_editor_grid;
     state.gpu_3d = g;
     return g;
 }
@@ -3356,9 +3358,6 @@ fn sceneStreamBadRecord(bytes: []const u8) ?usize {
 /// One record. Every op resolves its own node handle: a batch naming a node that has since been
 /// destroyed skips that record rather than failing the rest of the frame's changes.
 fn applySceneOp(state: *EngineState, record: []const u8, header: *const abi.ZgSceneOpHeader) void {
-    // The setters below each resolve the engine themselves; `state` is threaded in so a future op
-    // that needs the state directly does not change this signature.
-    _ = state;
     switch (header.kind) {
         @backingInt(abi.ZgSceneOp.transform) => {
             if (record.len < @sizeOf(abi.ZgSceneTransform)) return;
@@ -3390,6 +3389,7 @@ fn applySceneOp(state: *EngineState, record: []const u8, header: *const abi.ZgSc
             if (record.len < @sizeOf(abi.ZgSceneMaterial)) return;
             const op: *const abi.ZgSceneMaterial = @ptrCast(@alignCast(record.ptr));
             _ = zigote_scene_set_mesh_color(op.node, op.color_r, op.color_g, op.color_b);
+            setMeshBaseAlpha(state, op.node, 1.0 - std.math.clamp(op.transparency, 0.0, 1.0));
             _ = zigote_scene_set_mesh_roughness(op.node, op.metallic, op.roughness);
             _ = zigote_scene_set_mesh_surface(op.node, op.clearcoat, op.clearcoat_roughness, op.specular);
             _ = zigote_scene_set_mesh_emissive(op.node, op.emissive_r, op.emissive_g, op.emissive_b);
@@ -3411,6 +3411,16 @@ fn applySceneOp(state: *EngineState, record: []const u8, header: *const abi.ZgSc
         },
         else => {}, // unknown op: skipped by size, see the note above
     }
+}
+
+/// Base-colour alpha (glTF baseColorFactor.a). zigote_scene_set_mesh_color resets it to 1, so the
+/// material record applies this right after the colour.
+fn setMeshBaseAlpha(state: *EngineState, node_handle: u64, alpha: f32) void {
+    const node = state.nodeFromHandle(node_handle) orelse return;
+    const mr_comp = node.getComponent(.mesh_renderer) orelse return;
+    const mat_handle = mr_comp.mesh_renderer.material;
+    if (mat_handle >= state.world.materials.items.len) return;
+    state.world.materials.items[mat_handle].base_color_factor.w = alpha;
 }
 
 export fn zigote_scene_set_mesh_color(node_handle: u64, r: f32, g: f32, b: f32) ZgStatus {
@@ -3583,6 +3593,15 @@ export fn zigote_render_set_frustum_cull(enabled: u32) ZgStatus {
     // Must NOT create the 3D renderer — remember the toggle and apply it at creation.
     state.pending_frustum_cull = enabled != 0;
     if (state.gpu_3d) |g| g.frustum_cull = enabled != 0;
+    return .ok;
+}
+
+/// Show/hide the world-space editor grid drawn on floor-like surfaces near y=0 (off by default).
+export fn zigote_render_set_editor_grid(enabled: u32) ZgStatus {
+    const state = engineState() orelse return .invalid_handle;
+    // Must NOT create the 3D renderer — remember the toggle and apply it at creation.
+    state.pending_editor_grid = enabled != 0;
+    if (state.gpu_3d) |g| g.editor_grid = enabled != 0;
     return .ok;
 }
 
