@@ -154,6 +154,9 @@ pub const LightUniforms = extern struct {
     // Height-based exponential fog + analytic sun in-scatter (aerial perspective + god-ray glow).
     fog_color: [4]f32, // rgb fog/in-scatter base colour, .w = density (0 = fog off)
     fog_params: [4]f32, // x = height falloff, y = height base (world Y), z = sun in-scatter strength, w = anisotropy g
+    // Captured probe (appended last; only the mesh shader reads it): xyz = where the ready probe cube
+    // was captured (its box-projection origin), w = 1 once a full cube has been captured + filtered.
+    probe_capture: [4]f32,
 };
 
 pub const ModelUniforms = extern struct {
@@ -188,7 +191,8 @@ comptime {
     std.debug.assert(@offsetOf(LightUniforms, "spot_view_proj") == 1568);
     std.debug.assert(@offsetOf(LightUniforms, "fog_color") == 1824);
     std.debug.assert(@offsetOf(LightUniforms, "fog_params") == 1840);
-    std.debug.assert(@sizeOf(LightUniforms) == 1856);
+    std.debug.assert(@offsetOf(LightUniforms, "probe_capture") == 1856);
+    std.debug.assert(@sizeOf(LightUniforms) == 1872);
     // ModelUniforms / TonemapParams: pinned so a field insert can't silently shift the rest.
     std.debug.assert(@offsetOf(ModelUniforms, "surface") == 192);
     std.debug.assert(@sizeOf(ModelUniforms) == 208);

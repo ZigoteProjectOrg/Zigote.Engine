@@ -329,6 +329,39 @@ fn wgpuLog(level: wgpu.LogLevel, message: wgpu.StringView, userdata: ?*anyopaque
 
 // A shader file that nothing in `shaders` above references would never be validated — the exact
 // gap that let text_shader_source.wgsl rot. Every .wgsl must be reachable from a listed source.
+test "probe capture faces match the cube lookup convention" {
+    const Gpu3d = renderer.wgpu_3d.Gpu3d;
+    const Vec3 = @import("zigote").Vec3;
+    // env_bake_shader_source.wgsl faceDir: texel uv (top-left origin) → direction for each layer.
+    const faceDir = struct {
+        fn f(face: usize, u: f32, v: f32) Vec3 {
+            const ax = u * 2 - 1;
+            const ay = v * 2 - 1;
+            const d: Vec3 = switch (face) {
+                0 => .{ .x = 1, .y = -ay, .z = -ax },
+                1 => .{ .x = -1, .y = -ay, .z = ax },
+                2 => .{ .x = ax, .y = 1, .z = ay },
+                3 => .{ .x = ax, .y = -1, .z = -ay },
+                4 => .{ .x = ax, .y = -ay, .z = 1 },
+                else => .{ .x = -ax, .y = -ay, .z = -1 },
+            };
+            return d.normalize();
+        }
+    }.f;
+    const pos = Vec3{ .x = 1, .y = 2, .z = 3 };
+    for (0..6) |face| {
+        const vp = Gpu3d.probeFaceProj().mul(Gpu3d.probeFaceView(face, pos));
+        for ([_][2]f32{ .{ 0.25, 0.25 }, .{ 0.8, 0.3 }, .{ 0.5, 0.5 }, .{ 0.1, 0.9 } }) |uv| {
+            const p = pos.add(faceDir(face, uv[0], uv[1]).scale(5));
+            const clip = vp.mulVec4(.{ .x = p.x, .y = p.y, .z = p.z, .w = 1 });
+            try std.testing.expect(clip.w > 0);
+            // wgpu framebuffer: x right, y down from NDC y up.
+            try std.testing.expectApproxEqAbs(uv[0], (clip.x / clip.w) * 0.5 + 0.5, 1e-4);
+            try std.testing.expectApproxEqAbs(uv[1], 0.5 - (clip.y / clip.w) * 0.5, 1e-4);
+        }
+    }
+}
+
 test "every shader file is covered by the validation list" {
     var io_state = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_state.deinit();

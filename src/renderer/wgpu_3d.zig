@@ -306,6 +306,158 @@ const MaterialGpu = struct {
     }
 };
 
+/// Captured reflection/irradiance probe. While a ReflectionProbe box is active, the scene is rendered
+/// into `color`/`meta` one cube face per frame from the viewer (clamped into the box), and every full
+/// cube is GGX-prefiltered by the env-bake shader (mode 2) into `env`. Inside the box the mesh shader
+/// lights and reflects from `env` instead of the sky — interiors get light from their windows and
+/// shade from their walls, and chrome reflects the room.
+const PROBE_SIZE: u32 = 128;
+const ProbeGpu = struct {
+    color_tex: *wgpu.Texture, // lit HDR faces
+    meta_tex: *wgpu.Texture, // G-buffer metadata faces: y > 0.5 where geometry was drawn
+    normal_tex: *wgpu.Texture, // scratch for the MRT slots the capture never reads
+    albedo_tex: *wgpu.Texture,
+    depth_tex: *wgpu.Texture,
+    env_tex: *wgpu.Texture, // the prefiltered result (ENV_MIPS mips, like env_cube)
+    color_faces: [6]*wgpu.TextureView,
+    meta_faces: [6]*wgpu.TextureView,
+    color_cube: *wgpu.TextureView,
+    meta_cube: *wgpu.TextureView,
+    normal_view: *wgpu.TextureView,
+    albedo_view: *wgpu.TextureView,
+    depth_view: *wgpu.TextureView,
+    env_view: *wgpu.TextureView,
+    env_faces: [ENV_MIPS][6]*wgpu.TextureView,
+    cam_bufs: [6]*wgpu.Buffer, // one camera per face: all six faces' uniforms land before the submit
+    cam_bgs: [6]*wgpu.BindGroup,
+    pipeline: *wgpu.RenderPipeline,
+    pipeline_ds: *wgpu.RenderPipeline,
+    face: u32 = 0, // next face to capture
+    ready: bool = false, // `env` holds a filtered cube
+    cycle_pos: Vec3 = Vec3.zero, // capture point of the cube in progress
+    ready_pos: Vec3 = Vec3.zero, // capture point of the cube in `env`
+
+    fn texture(device: *wgpu.Device, label: []const u8, format: wgpu.TextureFormat, layers: u32, mips: u32, usage: wgpu.TextureUsage) !*wgpu.Texture {
+        return device.createTexture(&.{
+            .label = wgpu.StringView.fromSlice(label),
+            .usage = usage,
+            .dimension = .@"2d",
+            .size = .{ .width = PROBE_SIZE, .height = PROBE_SIZE, .depth_or_array_layers = layers },
+            .format = format,
+            .mip_level_count = mips,
+            .sample_count = 1,
+        }) orelse error.WgpuTextureCreateFailed;
+    }
+
+    fn view(tex: *wgpu.Texture, format: wgpu.TextureFormat, dim: wgpu.ViewDimension, mip: u32, mips: u32, layer: u32, layers: u32) !*wgpu.TextureView {
+        return tex.createView(&.{
+            .format = format,
+            .dimension = dim,
+            .base_mip_level = mip,
+            .mip_level_count = mips,
+            .base_array_layer = layer,
+            .array_layer_count = layers,
+        }) orelse error.WgpuTextureViewUnavailable;
+    }
+
+    /// `layout`, `shader` and the target/vertex/depth states are the main opaque pipeline's, so the
+    /// capture shades exactly like the frame. The cube faces are rendered X-mirrored (wgpu cube faces
+    /// are left-handed), which flips winding — hence `front_face = .cw`, keeping `front_facing` and
+    /// back-face culling correct.
+    fn init(
+        device: *wgpu.Device,
+        shader: *wgpu.ShaderModule,
+        layout: *wgpu.PipelineLayout,
+        vertex_layout: *const wgpu.VertexBufferLayout,
+        depth_state: *const wgpu.DepthStencilState,
+        targets: []const wgpu.ColorTargetState,
+        camera_bgl: *wgpu.BindGroupLayout,
+        light_buf: *wgpu.Buffer,
+    ) !ProbeGpu {
+        const attach = wgpu.TextureUsages.render_attachment;
+        const sampled = wgpu.TextureUsages.render_attachment | wgpu.TextureUsages.texture_binding;
+        const pos_fmt = shaders3d.gbuf_pos_format;
+        var p: ProbeGpu = undefined;
+        p.face = 0;
+        p.ready = false;
+        p.cycle_pos = Vec3.zero;
+        p.ready_pos = Vec3.zero;
+        p.color_tex = try texture(device, "probe color", SCENE_HDR_FORMAT, 6, 1, sampled);
+        p.meta_tex = try texture(device, "probe meta", pos_fmt, 6, 1, sampled);
+        p.normal_tex = try texture(device, "probe normal", shaders3d.gbuf_normal_format, 1, 1, attach);
+        p.albedo_tex = try texture(device, "probe albedo", shaders3d.gbuf_albedo_format, 1, 1, attach);
+        p.depth_tex = try texture(device, "probe depth", .depth32_float, 1, 1, attach);
+        p.env_tex = try texture(device, "probe env", ENV_CUBE_FORMAT, 6, ENV_MIPS, sampled);
+        for (0..6) |f| {
+            p.color_faces[f] = try view(p.color_tex, SCENE_HDR_FORMAT, .@"2d", 0, 1, @intCast(f), 1);
+            p.meta_faces[f] = try view(p.meta_tex, pos_fmt, .@"2d", 0, 1, @intCast(f), 1);
+            for (0..ENV_MIPS) |m| p.env_faces[m][f] = try view(p.env_tex, ENV_CUBE_FORMAT, .@"2d", @intCast(m), 1, @intCast(f), 1);
+        }
+        p.color_cube = try view(p.color_tex, SCENE_HDR_FORMAT, .cube, 0, 1, 0, 6);
+        p.meta_cube = try view(p.meta_tex, pos_fmt, .cube, 0, 1, 0, 6);
+        p.normal_view = try view(p.normal_tex, shaders3d.gbuf_normal_format, .@"2d", 0, 1, 0, 1);
+        p.albedo_view = try view(p.albedo_tex, shaders3d.gbuf_albedo_format, .@"2d", 0, 1, 0, 1);
+        p.depth_view = try view(p.depth_tex, .depth32_float, .@"2d", 0, 1, 0, 1);
+        p.env_view = try view(p.env_tex, ENV_CUBE_FORMAT, .cube, 0, ENV_MIPS, 0, 6);
+
+        for (0..6) |f| {
+            p.cam_bufs[f] = device.createBuffer(&.{
+                .label = wgpu.StringView.fromSlice("probe camera ubo"),
+                .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
+                .size = @sizeOf(CameraUniforms),
+            }) orelse return error.BufferCreateFailed;
+            const entries = [_]wgpu.BindGroupEntry{
+                .{ .binding = 0, .buffer = p.cam_bufs[f], .size = @sizeOf(CameraUniforms) },
+                .{ .binding = 1, .buffer = light_buf, .size = @sizeOf(LightUniforms) },
+            };
+            p.cam_bgs[f] = device.createBindGroup(&.{
+                .label = wgpu.StringView.fromSlice("probe camera bg"),
+                .layout = camera_bgl,
+                .entry_count = entries.len,
+                .entries = &entries,
+            }) orelse return error.BindGroupCreateFailed;
+        }
+
+        for ([_]wgpu.CullMode{ .back, .none }, 0..) |cull, i| {
+            const pl = device.createRenderPipeline(&.{
+                .label = wgpu.StringView.fromSlice("probe capture pipeline"),
+                .layout = layout,
+                .vertex = .{
+                    .module = shader,
+                    .entry_point = wgpu.StringView.fromSlice("vs_main"),
+                    .buffer_count = 1,
+                    .buffers = @ptrCast(vertex_layout),
+                },
+                .primitive = .{ .topology = .triangle_list, .front_face = .cw, .cull_mode = cull },
+                .depth_stencil = depth_state,
+                .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
+                .fragment = &.{
+                    .module = shader,
+                    .entry_point = wgpu.StringView.fromSlice("fs_main"),
+                    .target_count = targets.len,
+                    .targets = targets.ptr,
+                },
+            }) orelse return error.PipelineCreateFailed;
+            if (i == 0) p.pipeline = pl else p.pipeline_ds = pl;
+        }
+        return p;
+    }
+
+    fn deinit(self: *ProbeGpu) void {
+        self.pipeline.release();
+        self.pipeline_ds.release();
+        for (self.cam_bgs) |bg| bg.release();
+        for (self.cam_bufs) |b| b.release();
+        for (0..6) |f| {
+            self.color_faces[f].release();
+            self.meta_faces[f].release();
+            for (0..ENV_MIPS) |m| self.env_faces[m][f].release();
+        }
+        for ([_]*wgpu.TextureView{ self.color_cube, self.meta_cube, self.normal_view, self.albedo_view, self.depth_view, self.env_view }) |v| v.release();
+        for ([_]*wgpu.Texture{ self.color_tex, self.meta_tex, self.normal_tex, self.albedo_tex, self.depth_tex, self.env_tex }) |t| t.release();
+    }
+};
+
 fn createSolidTextureView(
     device: *wgpu.Device,
     queue: *wgpu.Queue,
@@ -989,6 +1141,7 @@ pub const Gpu3d = struct {
     env_bake_bgl: *wgpu.BindGroupLayout,
     env_bake_buf: *wgpu.Buffer, // dynamic-offset UBO, one ENV_SLOT per face/mip
     env_bake_bg: *wgpu.BindGroup,
+    probe: ProbeGpu,
     env_equirect_tex: *wgpu.Texture, // 1×1 dummy until an HDRI is supplied
     env_equirect_view: *wgpu.TextureView,
     env_mode: u32 = 0, // 0 = procedural studio, 1 = HDRI
@@ -1359,6 +1512,8 @@ pub const Gpu3d = struct {
             // binding 6: view-space position G-buffer (unfilterable f16) — glass reads the depth of the
             // surface behind it to make refraction thickness-aware (thin flat glass barely refracts).
             .{ .binding = 6, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .unfilterable_float, .view_dimension = .@"2d" } },
+            // binding 7: the captured probe cube (ProbeGpu.env), sampled inside the ReflectionProbe box.
+            .{ .binding = 7, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .cube } },
         };
         const shadow_map_bgl = device.createBindGroupLayout(&.{
             .label = wgpu.StringView.fromSlice("shadow map bgl"),
@@ -1486,6 +1641,8 @@ pub const Gpu3d = struct {
                 .targets = &opaque_targets,
             },
         }) orelse return error.PipelineCreateFailed;
+
+        const probe = try ProbeGpu.init(device, shader, pipeline_layout, &vertex_buf_layout, &depth_stencil_state, &opaque_targets, camera_bgl, light_buf);
 
         // Transparent variant: identical to `pipeline` but it does NOT write depth, so
         // blended surfaces don't occlude the geometry behind them. Depth testing stays
@@ -1820,6 +1977,8 @@ pub const Gpu3d = struct {
             .{ .binding = 0, .visibility = wgpu.ShaderStages.fragment, .buffer = .{ .type = .uniform, .has_dynamic_offset = 1, .min_binding_size = @sizeOf(EnvBakeParams) } },
             .{ .binding = 1, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .@"2d" } },
             .{ .binding = 2, .visibility = wgpu.ShaderStages.fragment, .sampler = .{ .type = .filtering } },
+            .{ .binding = 3, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .cube } },
+            .{ .binding = 4, .visibility = wgpu.ShaderStages.fragment, .texture = .{ .sample_type = .float, .view_dimension = .cube } },
         };
         const env_bake_bgl = device.createBindGroupLayout(&.{
             .label = wgpu.StringView.fromSlice("env bake bgl"),
@@ -1830,13 +1989,15 @@ pub const Gpu3d = struct {
         const env_bake_buf = device.createBuffer(&.{
             .label = wgpu.StringView.fromSlice("env bake ubo"),
             .usage = wgpu.BufferUsages.uniform | wgpu.BufferUsages.copy_dst,
-            .size = @as(u64, ENV_SLOT) * 6 * ENV_MIPS,
+            .size = @as(u64, ENV_SLOT) * 6 * ENV_MIPS * 2, // sky bake slots, then the probe filter's
         }) orelse return error.BufferCreateFailed;
 
         const env_bake_bg_entries = [_]wgpu.BindGroupEntry{
             .{ .binding = 0, .buffer = env_bake_buf, .size = @sizeOf(EnvBakeParams) },
             .{ .binding = 1, .texture_view = env_equirect.texture_view },
             .{ .binding = 2, .sampler = env_sampler },
+            .{ .binding = 3, .texture_view = probe.color_cube },
+            .{ .binding = 4, .texture_view = probe.meta_cube },
         };
         const env_bake_bg = device.createBindGroup(&.{
             .label = wgpu.StringView.fromSlice("env bake bg"),
@@ -1884,6 +2045,7 @@ pub const Gpu3d = struct {
             .{ .binding = 4, .texture_view = point_shadow_view },
             .{ .binding = 5, .texture_view = refraction_placeholder.texture_view },
             .{ .binding = 6, .texture_view = refraction_placeholder.texture_view },
+            .{ .binding = 7, .texture_view = probe.env_view },
         };
         const shadow_map_bg = device.createBindGroup(&.{
             .label = wgpu.StringView.fromSlice("shadow map bg"),
@@ -1943,10 +2105,14 @@ pub const Gpu3d = struct {
                 .buffer_count = 1,
                 .buffers = @ptrCast(&vertex_buf_layout),
             },
+            // No culling: imported interiors are full of single-sided ceilings and walls whose
+            // normals face into the room, i.e. AWAY from the sun. Back-face culling dropped them
+            // from the map and sunlight leaked straight through the roof. Closed meshes are
+            // unaffected — their back faces sit behind their front faces in light space.
             .primitive = .{
                 .topology = .triangle_list,
                 .front_face = .ccw,
-                .cull_mode = .back,
+                .cull_mode = .none,
             },
             .depth_stencil = &depth_stencil_state,
             .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
@@ -2044,7 +2210,7 @@ pub const Gpu3d = struct {
             .primitive = .{
                 .topology = .triangle_list,
                 .front_face = .ccw,
-                .cull_mode = .back,
+                .cull_mode = .none, // single-sided walls must still occlude (see the cascade pipeline)
             },
             .depth_stencil = &depth_stencil_state,
             .multisample = .{ .count = 1, .mask = 0xFFFFFFFF },
@@ -2223,6 +2389,7 @@ pub const Gpu3d = struct {
             .env_bake_bgl = env_bake_bgl,
             .env_bake_buf = env_bake_buf,
             .env_bake_bg = env_bake_bg,
+            .probe = probe,
             .env_equirect_tex = env_equirect.texture,
             .env_equirect_view = env_equirect.texture_view,
             .default_base_color = default_base_color,
@@ -2336,6 +2503,7 @@ pub const Gpu3d = struct {
         self.env_bake_buf.release();
         self.env_bake_bgl.release();
         self.env_bake_pipeline.release();
+        self.probe.deinit();
         self.env_equirect_view.release();
         self.env_equirect_tex.release();
         self.texture_bgl.release();
@@ -3335,6 +3503,7 @@ pub const Gpu3d = struct {
             .{ .binding = 4, .texture_view = self.point_shadow_view },
             .{ .binding = 5, .texture_view = self.refraction_src_view },
             .{ .binding = 6, .texture_view = self.refraction_src_view }, // dummy — opaque pass never reads it
+            .{ .binding = 7, .texture_view = self.probe.env_view },
         };
         const glass_entries = [_]wgpu.BindGroupEntry{
             .{ .binding = 0, .texture_view = self.shadow_view },
@@ -3344,6 +3513,7 @@ pub const Gpu3d = struct {
             .{ .binding = 4, .texture_view = self.point_shadow_view },
             .{ .binding = 5, .texture_view = self.refraction_src_view },
             .{ .binding = 6, .texture_view = self.gbuf_pos_view }, // read for thickness-aware refraction
+            .{ .binding = 7, .texture_view = self.probe.env_view },
         };
         self.shadow_map_bg = self.device.createBindGroup(&.{
             .label = wgpu.StringView.fromSlice("shadow map bg"),
@@ -3466,6 +3636,13 @@ pub const Gpu3d = struct {
     /// roughness levels. Cheap enough to run on demand; gated behind `env_dirty` so it only fires
     /// at startup and when settings or the HDRI change.
     fn rebuildEnvironment(self: *Gpu3d, queue: *wgpu.Queue, encoder: *wgpu.CommandEncoder) void {
+        self.bakeEnvCube(queue, encoder, self.env_mode, &self.env_face_views, 0);
+    }
+
+    /// Prefilter into `faces` (one view per mip/face): mode 0 = procedural sky, 1 = HDRI, 2 = the
+    /// captured probe with the current sky behind it. `slot_base` keeps the probe filter's params
+    /// apart from a sky rebake recorded in the same frame (queue writes all land before the submit).
+    fn bakeEnvCube(self: *Gpu3d, queue: *wgpu.Queue, encoder: *wgpu.CommandEncoder, mode: u32, faces: *const [ENV_MIPS][6]*wgpu.TextureView, slot_base: u64) void {
         const s = self.effectiveSettings();
         const az = s.sun_azimuth_deg * std.math.pi / 180.0;
         const el = s.sun_elevation_deg * std.math.pi / 180.0;
@@ -3482,14 +3659,14 @@ pub const Gpu3d = struct {
             const rough: f32 = t * t;
             for (0..6) |face| {
                 const params = EnvBakeParams{
-                    .face_mode_rough = .{ @floatFromInt(face), @floatFromInt(self.env_mode), rough, 0 },
+                    .face_mode_rough = .{ @floatFromInt(face), @floatFromInt(mode), rough, @floatFromInt(self.env_mode) },
                     .sky_horizon = .{ s.sky_horizon[0], s.sky_horizon[1], s.sky_horizon[2], 0 },
                     .sky_zenith = .{ s.sky_zenith[0], s.sky_zenith[1], s.sky_zenith[2], 0 },
                     .sky_ground = .{ s.sky_ground[0], s.sky_ground[1], s.sky_ground[2], 0 },
                     .sun_dir = sun,
                     .studio = .{ s.overhead, s.horizon_glow, s.sun_sharpness, s.clearcoat },
                 };
-                const slot: u64 = (@as(u64, @intCast(mip)) * 6 + @as(u64, @intCast(face))) * ENV_SLOT;
+                const slot: u64 = slot_base + (@as(u64, @intCast(mip)) * 6 + @as(u64, @intCast(face))) * ENV_SLOT;
                 const bytes = std.mem.asBytes(&params);
                 queue.writeBuffer(self.env_bake_buf, slot, bytes.ptr, bytes.len);
             }
@@ -3498,7 +3675,7 @@ pub const Gpu3d = struct {
         for (0..ENV_MIPS) |mip| {
             for (0..6) |face| {
                 const color_attachment = wgpu.ColorAttachment{
-                    .view = self.env_face_views[mip][face],
+                    .view = faces[mip][face],
                     .load_op = .clear,
                     .store_op = .store,
                     .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 1 },
@@ -3510,7 +3687,7 @@ pub const Gpu3d = struct {
                 };
                 const pass = encoder.beginRenderPass(&pass_desc) orelse return;
                 pass.setPipeline(self.env_bake_pipeline);
-                const offset: u32 = @intCast((mip * 6 + face) * ENV_SLOT);
+                const offset: u32 = @intCast(slot_base + (mip * 6 + face) * ENV_SLOT);
                 pass.setBindGroup(0, self.env_bake_bg, 1, @ptrCast(&offset));
                 pass.draw(3, 1, 0, 0);
                 pass.end();
@@ -3534,6 +3711,8 @@ pub const Gpu3d = struct {
             .{ .binding = 0, .buffer = self.env_bake_buf, .size = @sizeOf(EnvBakeParams) },
             .{ .binding = 1, .texture_view = self.env_equirect_view },
             .{ .binding = 2, .sampler = self.env_sampler },
+            .{ .binding = 3, .texture_view = self.probe.color_cube },
+            .{ .binding = 4, .texture_view = self.probe.meta_cube },
         };
         self.env_bake_bg = self.device.createBindGroup(&.{
             .label = wgpu.StringView.fromSlice("env bake bg"),
@@ -3580,6 +3759,8 @@ pub const Gpu3d = struct {
             .{ .binding = 0, .buffer = self.env_bake_buf, .size = @sizeOf(EnvBakeParams) },
             .{ .binding = 1, .texture_view = self.env_equirect_view },
             .{ .binding = 2, .sampler = self.env_sampler },
+            .{ .binding = 3, .texture_view = self.probe.color_cube },
+            .{ .binding = 4, .texture_view = self.probe.meta_cube },
         };
         self.env_bake_bg = self.device.createBindGroup(&.{
             .label = wgpu.StringView.fromSlice("env bake bg"),
@@ -3720,6 +3901,8 @@ pub const Gpu3d = struct {
         const probe_on = !diagnostic and (self.probe_extents[0] > 0.0 or self.probe_extents[1] > 0.0 or self.probe_extents[2] > 0.0);
         light_data.probe_center = .{ self.probe_center[0], self.probe_center[1], self.probe_center[2], if (probe_on) 1.0 else 0.0 };
         light_data.probe_extents = .{ self.probe_extents[0], self.probe_extents[1], self.probe_extents[2], 0.0 };
+        const rp = self.probe.ready_pos;
+        light_data.probe_capture = .{ rp.x, rp.y, rp.z, if (probe_on and self.probe.ready) 1.0 else 0.0 };
         // Atmospheric fog (height exponential + analytic sun in-scatter). density 0 → shader skips it.
         light_data.fog_color = .{ s.fog_color[0], s.fog_color[1], s.fog_color[2], s.fog_density };
         light_data.fog_params = .{ s.fog_height_falloff, s.fog_height, s.fog_sun_inscatter, s.fog_anisotropy };
@@ -3930,6 +4113,7 @@ pub const Gpu3d = struct {
         // render pass reads each emitter's (compute-written) instance buffer. wgpu barriers the two passes.
         self.particles.computeStep(self.device, queue, encoder);
 
+        self.captureProbe(world, queue, encoder);
         try self.renderLayer(world, queue, encoder, &color_attachment, &depth_attachment, frame_width, frame_height, .world_3d, true);
         var drawn: u32 = @intCast(self.render_list.items.len);
         if (world.active_camera_2d != null) {
@@ -3947,6 +4131,113 @@ pub const Gpu3d = struct {
         self.stats.visible_objects = drawn;
         self.stats.render_passes += 1; // geometry pass (sky/shadow counted in their own fns)
         return drawn;
+    }
+
+    /// View matrix for cube face `face` (wgpu layer order +X,-X,+Y,-Y,+Z,-Z) seen from `pos`. The ups
+    /// are chosen so that, with `probeFaceProj`'s mirrored X, each texel maps to the same direction as
+    /// the env-bake shader's faceDir — the hardware cube lookup convention. check_gpu.zig pins this.
+    pub fn probeFaceView(face: usize, pos: Vec3) Mat4 {
+        const fwd = [6]Vec3{ .{ .x = 1, .y = 0, .z = 0 }, .{ .x = -1, .y = 0, .z = 0 }, .{ .x = 0, .y = 1, .z = 0 }, .{ .x = 0, .y = -1, .z = 0 }, .{ .x = 0, .y = 0, .z = 1 }, .{ .x = 0, .y = 0, .z = -1 } };
+        const up = [6]Vec3{ .{ .x = 0, .y = 1, .z = 0 }, .{ .x = 0, .y = 1, .z = 0 }, .{ .x = 0, .y = 0, .z = -1 }, .{ .x = 0, .y = 0, .z = 1 }, .{ .x = 0, .y = 1, .z = 0 }, .{ .x = 0, .y = 1, .z = 0 } };
+        return Mat4.lookAt(pos, pos.add(fwd[face]), up[face]);
+    }
+
+    pub fn probeFaceProj() Mat4 {
+        var proj = Mat4.perspectiveRhZo(std.math.pi / 2.0, 1.0, 0.05, 500.0);
+        proj.cols[0].x = -proj.cols[0].x;
+        return proj;
+    }
+
+    /// Render the next face of the probe cube (see ProbeGpu); after the sixth, prefilter the cube into
+    /// the env the mesh shader samples. One face per frame keeps the cost to a 128² opaque pass, and the
+    /// continuous refresh follows the viewer from room to room, moving lights and newly loaded assets.
+    fn captureProbe(self: *Gpu3d, world: *const scene_mod.World, queue: *wgpu.Queue, encoder: *wgpu.CommandEncoder) void {
+        const pr = &self.probe;
+        const ext = Vec3{ .x = self.probe_extents[0], .y = self.probe_extents[1], .z = self.probe_extents[2] };
+        const s = self.effectiveSettings();
+        if (!(ext.x > 0.0 or ext.y > 0.0 or ext.z > 0.0) or s.diagnostic_mode != 0.0 or s.wireframe != 0.0) {
+            pr.face = 0;
+            pr.ready = false;
+            return;
+        }
+        if (pr.face == 0) {
+            // Capture from the viewer, held just inside the box, so the cube sees the room you are in.
+            const c = Vec3{ .x = self.probe_center[0], .y = self.probe_center[1], .z = self.probe_center[2] };
+            const eye = if (world.active_camera) |cam| cam.world_transform.position else c;
+            pr.cycle_pos = .{
+                .x = std.math.clamp(eye.x, c.x - ext.x * 0.98, c.x + ext.x * 0.98),
+                .y = std.math.clamp(eye.y, c.y - ext.y * 0.98, c.y + ext.y * 0.98),
+                .z = std.math.clamp(eye.z, c.z - ext.z * 0.98, c.z + ext.z * 0.98),
+            };
+        }
+        const face = pr.face;
+        const pos = pr.cycle_pos;
+        const view = probeFaceView(face, pos);
+        const vp = probeFaceProj().mul(view);
+        const cam_data = CameraUniforms{
+            .view_proj = vp.toArray(),
+            .view = view.toArray(),
+            .camera_pos = .{ pos.x, pos.y, pos.z, 1.0 },
+            .inv_view_proj = vp.inverse().toArray(),
+        };
+        const cam_bytes = std.mem.asBytes(&cam_data);
+        queue.writeBuffer(pr.cam_bufs[face], 0, cam_bytes.ptr, cam_bytes.len);
+
+        const clear = wgpu.Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
+        const colors = [_]wgpu.ColorAttachment{
+            .{ .view = pr.color_faces[face], .load_op = .clear, .store_op = .store, .clear_value = clear },
+            .{ .view = pr.meta_faces[face], .load_op = .clear, .store_op = .store, .clear_value = clear },
+            .{ .view = pr.normal_view, .load_op = .clear, .store_op = .discard, .clear_value = clear },
+            .{ .view = pr.albedo_view, .load_op = .clear, .store_op = .discard, .clear_value = clear },
+        };
+        const depth = wgpu.DepthStencilAttachment{
+            .view = pr.depth_view,
+            .depth_load_op = .clear,
+            .depth_store_op = .discard,
+            .depth_clear_value = 1.0,
+        };
+        const pass = encoder.beginRenderPass(&.{
+            .color_attachment_count = colors.len,
+            .color_attachments = &colors,
+            .depth_stencil_attachment = &depth,
+        }) orelse return;
+        defer pass.release();
+        pass.setBindGroup(0, pr.cam_bgs[face], 0, null);
+        pass.setBindGroup(3, self.shadow_map_bg, 0, null);
+
+        // No selection rim in the room's reflection of the selected object.
+        const selected = self.selected_node_ptr;
+        self.selected_node_ptr = 0;
+        defer self.selected_node_ptr = selected;
+
+        // Opaque + masked only: the faces see straight through glass to the sky behind it, which is
+        // what lights the room. ponytail: instanced and blended geometry are skipped; capture them
+        // too if foliage-heavy interiors read too bright.
+        const fr = math.Frustum.fromViewProj(vp);
+        var cur: ?*wgpu.RenderPipeline = null;
+        for (self.world3d_list.items) |r| {
+            if (std.mem.startsWith(u8, r.node.name, "__Gizmo")) continue;
+            if (self.instanceFor(r.node.entity) != null) continue;
+            const mesh = world.getMesh(r.mesh_renderer.mesh) orelse continue;
+            if (!shadowCasterVisible(r, mesh, fr)) continue;
+            const mat = if (r.mesh_renderer.material != scene_mod.null_material) world.getMaterial(r.mesh_renderer.material) else null;
+            if (mat) |m| if (m.renderPass() != .solid) continue;
+            const want = if (mat != null and mat.?.double_sided) pr.pipeline_ds else pr.pipeline;
+            if (cur != want) {
+                pass.setPipeline(want);
+                cur = want;
+            }
+            self.drawRenderable(world, queue, pass, r, mat);
+        }
+        pass.end();
+
+        pr.face += 1;
+        if (pr.face == 6) {
+            pr.face = 0;
+            self.bakeEnvCube(queue, encoder, 2, &pr.env_faces, @as(u64, ENV_SLOT) * 6 * ENV_MIPS);
+            pr.ready = true;
+            pr.ready_pos = pr.cycle_pos;
+        }
     }
 
     /// Post-processing: extract a bloom from the HDR scene buffer (soft-knee bright-pass +

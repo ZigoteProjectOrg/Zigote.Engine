@@ -1,5 +1,5 @@
 struct EnvBakeParams {
-  face_mode_rough: vec4<f32>, // x=face index, y=mode, z=roughness, w=unused
+  face_mode_rough: vec4<f32>, // x=face index, y=mode, z=roughness, w=sky mode behind a probe (0/1)
   sky_horizon: vec4<f32>,
   sky_zenith: vec4<f32>,
   sky_ground: vec4<f32>,
@@ -9,6 +9,10 @@ struct EnvBakeParams {
 @group(0) @binding(0) var<uniform> p: EnvBakeParams;
 @group(0) @binding(1) var equirect: texture_2d<f32>;
 @group(0) @binding(2) var equirect_samp: sampler;
+// Mode 2 (captured probe): the scene rendered around the viewer + its G-buffer metadata, whose y > 0.5
+// marks geometry. Where nothing was drawn (open sky, through windows) the regular sky source shows.
+@group(0) @binding(3) var probe_color: texture_cube<f32>;
+@group(0) @binding(4) var probe_meta: texture_cube<f32>;
 
 const PI: f32 = 3.14159265;
 
@@ -199,6 +203,55 @@ fn irradianceProcedural(n: vec3<f32>) -> vec3<f32> {
   return col / f32(samples);
 }
 
+fn skyEnv(d: vec3<f32>) -> vec3<f32> {
+  if (p.face_mode_rough.w > 0.5) { return textureSampleLevel(equirect, equirect_samp, dirToEquirectUv(d), 0.0).rgb; }
+  return proceduralEnv(d, 0.0);
+}
+
+fn probeEnv(d: vec3<f32>) -> vec3<f32> {
+  if (textureSampleLevel(probe_meta, equirect_samp, d, 0.0).y > 0.5) {
+    return textureSampleLevel(probe_color, equirect_samp, d, 0.0).rgb;
+  }
+  return skyEnv(d);
+}
+
+// GGX prefilter / cosine irradiance of the captured probe — the same integrals as the sky paths, so
+// the mesh shader reads both cubes with one roughness → mip mapping.
+fn prefilterProbe(d: vec3<f32>, rough: f32) -> vec3<f32> {
+  if (rough < 0.01) { return probeEnv(d); }
+  var col = vec3<f32>(0.0);
+  var wsum = 0.0;
+  for (var i = 0u; i < 128u; i = i + 1u) {
+    let xi = vec2<f32>(f32(i) / 128.0, radicalInverse(i));
+    let h = importanceGGX(xi, d, rough);
+    let l = normalize(2.0 * dot(d, h) * h - d);
+    let ndl = dot(d, l);
+    if (ndl > 0.0) {
+      col = col + min(probeEnv(l), vec3<f32>(20.0)) * ndl;
+      wsum = wsum + ndl;
+    }
+  }
+  return select(probeEnv(d), col / wsum, wsum > 0.0);
+}
+
+fn irradianceProbe(n: vec3<f32>) -> vec3<f32> {
+  var up = vec3<f32>(0.0, 1.0, 0.0);
+  if (abs(n.y) > 0.999) { up = vec3<f32>(1.0, 0.0, 0.0); }
+  let tx = normalize(cross(up, n));
+  let ty = cross(n, tx);
+  var col = vec3<f32>(0.0);
+  let samples = 512u;
+  for (var i = 0u; i < samples; i = i + 1u) {
+    let xi = vec2<f32>(f32(i) / f32(samples), radicalInverse(i));
+    let phi = 2.0 * PI * xi.x;
+    let ct = sqrt(1.0 - xi.y);
+    let st = sqrt(xi.y);
+    let l = tx * (cos(phi) * st) + ty * (sin(phi) * st) + n * ct;
+    col = col + min(probeEnv(l), vec3<f32>(12.0));
+  }
+  return col / f32(samples);
+}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   let face  = u32(p.face_mode_rough.x + 0.5);
@@ -208,7 +261,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   var c: vec3<f32>;
   // The blurriest mip is sampled as diffuse irradiance by the mesh shader → use a proper cosine
   // hemisphere convolution there; the sharper mips are the GGX specular prefilter.
-  if (mode == 1u) {
+  if (mode == 2u) {
+    if (rough > 0.95) { c = irradianceProbe(d); }
+    else { c = prefilterProbe(d, rough); }
+  } else if (mode == 1u) {
     if (rough > 0.95) { c = irradianceHdri(d); }
     else { c = prefilterHdri(d, rough); }
   } else {

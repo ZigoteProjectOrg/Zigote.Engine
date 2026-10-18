@@ -107,6 +107,8 @@ const JManifest = struct {
     materials: []const JMaterial,
     lights: []const JLight,
     animations: []const JAnimation,
+    /// World-space AABB of the static (flattened) geometry: min xyz, max xyz. Zero when animated.
+    bounds: [6]f32,
 };
 
 // ── Import context ──────────────────────────────────────────────────────────
@@ -119,6 +121,8 @@ const Ctx = struct {
     model_dir: []const u8,
     base: []const u8,
     warnings: *std.ArrayListUnmanaged([]const u8),
+    lo: Vec3 = .{ .x = std.math.inf(f32), .y = std.math.inf(f32), .z = std.math.inf(f32) },
+    hi: Vec3 = .{ .x = -std.math.inf(f32), .y = -std.math.inf(f32), .z = -std.math.inf(f32) },
     node_count: usize = 0,
     prim_count: usize = 0,
     mesh_seq: usize = 0,
@@ -285,6 +289,8 @@ fn walkStatic(ctx: *Ctx, node: *const c.aiNode, parent_world: Mat4, groups: []Ac
             var wv = v;
             const wp = world.mulPoint(.{ .x = v.position[0], .y = v.position[1], .z = v.position[2] });
             wv.position = .{ wp.x, wp.y, wp.z };
+            ctx.lo = .{ .x = @min(ctx.lo.x, wp.x), .y = @min(ctx.lo.y, wp.y), .z = @min(ctx.lo.z, wp.z) };
+            ctx.hi = .{ .x = @max(ctx.hi.x, wp.x), .y = @max(ctx.hi.y, wp.y), .z = @max(ctx.hi.z, wp.z) };
             const wn = normal_mat.mulDirection(.{ .x = v.normal[0], .y = v.normal[1], .z = v.normal[2] }).normalize();
             wv.normal = .{ wn.x, wn.y, wn.z };
             const wt = world.mulDirection(.{ .x = v.tangent[0], .y = v.tangent[1], .z = v.tangent[2] }).normalize();
@@ -716,6 +722,7 @@ pub fn importModelJson(path_z: [*:0]const u8, cache_dir_z: [*:0]const u8) ?[*:0]
         .materials = materials,
         .lights = lights,
         .animations = animations,
+        .bounds = if (ctx.lo.x <= ctx.hi.x) .{ ctx.lo.x, ctx.lo.y, ctx.lo.z, ctx.hi.x, ctx.hi.y, ctx.hi.z } else @splat(0),
     };
 
     const json = std.json.Stringify.valueAlloc(arena, manifest, .{}) catch return null;

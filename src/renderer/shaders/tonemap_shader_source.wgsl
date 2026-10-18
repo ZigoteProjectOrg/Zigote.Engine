@@ -84,8 +84,10 @@ fn white_balance(c: vec3<f32>, temperature: f32, tint: f32) -> vec3<f32> {
 // hash grain, animated by frame seed. Returns [-0.5, 0.5]. Integer-style hash (Dave Hoskins
 // hash13) instead of fract(sin(...)) — the sin-fract hash is precision-divergent across GPUs and
 // bands diagonally in flat areas (exactly what the grain is meant to mask).
-fn grain_hash(uv: vec2<f32>, seed: f32) -> f32 {
-  var p3 = fract(vec3<f32>(uv.x, uv.y, uv.x) * 0.1031 + seed * 0.0017);
+// Takes PIXEL coordinates: fed [0,1] UVs the hash degenerates into a smooth ramp that printed
+// diagonal stripes over every dark surface.
+fn grain_hash(px: vec2<f32>, seed: f32) -> f32 {
+  var p3 = fract(vec3<f32>(px.x, px.y, px.x) * 0.1031 + seed * 0.0017);
   p3 += dot(p3, p3.yzx + 33.33);
   return fract((p3.x + p3.y) * p3.z) - 0.5;
 }
@@ -193,7 +195,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   color = color * vig;
 
   // ── Film grain: animated, luma-modulated (peaks at mid-grey, fades at 0/1).
-  let grain = grain_hash(in.uv, p.wb.w) * p.look.w;
+  let grain = grain_hash(in.pos.xy, p.wb.w) * p.look.w;
   let luma = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
   let grain_mod = grain * (1.0 - abs(luma * 2.0 - 1.0));
   color = clamp(color + vec3<f32>(grain_mod), vec3<f32>(0.0), vec3<f32>(1.0));
@@ -204,8 +206,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   // (fixed seed, NOT the per-frame p.wb.w) — an animated dither floor "crawls" frame-to-frame on
   // flat low-contrast areas (the near-white floor/horizon shimmer), which the grain avoids only
   // because it's luma-gated off there.
-  let d1 = grain_hash(in.uv + vec2<f32>(0.5, 0.0), 0.0);
-  let d2 = grain_hash(in.uv + vec2<f32>(0.0, 0.5), 1.0);
+  let d1 = grain_hash(in.pos.xy + vec2<f32>(37.0, 0.0), 0.0);
+  let d2 = grain_hash(in.pos.xy + vec2<f32>(0.0, 59.0), 1.0);
   color = clamp(color + vec3<f32>((d1 + d2) * (1.0 / 255.0)), vec3<f32>(0.0), vec3<f32>(1.0));
 
   // Final NaN/inf guard.

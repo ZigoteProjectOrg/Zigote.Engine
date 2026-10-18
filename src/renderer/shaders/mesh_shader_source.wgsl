@@ -49,6 +49,7 @@ struct LightUniforms {
   spot_view_proj: array<mat4x4<f32>, 4>, // per shadow-casting spot light
   fog_color: vec4<f32>,  // rgb fog/in-scatter colour, .w = density (0 = off)
   fog_params: vec4<f32>, // x = height falloff, y = height base, z = sun in-scatter, w = anisotropy g
+  probe_capture: vec4<f32>, // xyz = capture point of the ready probe cube, w = ready (0/1)
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
@@ -75,6 +76,8 @@ struct LightUniforms {
 // View-space position G-buffer (xyz, w=1 on geometry / 0 on sky). Glass reads the depth of the surface
 // behind it (textureLoad, no filtering) to make refraction thickness-aware.
 @group(3) @binding(6) var gbuf_pos_tex: texture_2d<f32>;
+// Captured probe: the scene around the viewer, prefiltered like env_cube (same mip ↔ roughness map).
+@group(3) @binding(7) var probe_env: texture_cube<f32>;
 
 struct VertexOut {
   @builtin(position) clip_pos: vec4<f32>,
@@ -300,7 +303,9 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
   // Per-pixel rotation angle shared by every shadow PCF dither (cascade, spot, point). It depends
   // only on in.clip_pos.xy, so compute the sin/fract hash and its cos/sin ONCE here and reuse across
   // all three branches instead of re-deriving the identical value up to three times per fragment.
-  let dither_ang = fract(sin(dot(in.clip_pos.xy, vec2<f32>(12.9898, 78.233))) * 43758.5453) * 6.2831853;
+  // Interleaved gradient noise (Jimenez 2014). The old fract(sin(dot)·43758) hash loses f32 precision
+  // at framebuffer-sized arguments and printed fine diagonal stripes across every shadowed surface.
+  let dither_ang = fract(52.9829189 * fract(dot(in.clip_pos.xy, vec2<f32>(0.06711056, 0.00583715)))) * 6.2831853;
   let dither_cs = cos(dither_ang);
   let dither_sn = sin(dither_ang);
   // ── Cascaded shadow maps ─────────────────────────────────────────────────────────────────
@@ -418,6 +423,17 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
   let cc_rough = clamp(model_data.metallic_roughness.w, 0.02, 1.0);
   let cc_alpha2 = (cc_rough * cc_rough) * (cc_rough * cc_rough);
 
+  // Shadow-grounded ambient fill (also applied to the diffuse IBL below). The sun shadow darkens the
+  // fill but is floored well above black: the sky still fills shadows, and SSAO/GTAO handles genuine
+  // ambient occlusion.
+  let shadow_ao = max(mix(1.0 - light.shadow.x, 1.0, shadow_factor), 0.3);
+  // Captured probe weight: 1 inside the box, fading to the sky over its outer 0.5 m.
+  var probe_w = 0.0;
+  if (light.probe_center.w > 0.5 && light.probe_capture.w > 0.5) {
+    let dbox = abs(in.world_pos - light.probe_center.xyz) - light.probe_extents.xyz;
+    probe_w = clamp(-max(dbox.x, max(dbox.y, dbox.z)) / 0.5, 0.0, 1.0);
+  }
+
   var Lo = vec3<f32>(0.0);
   var Lo_cc = vec3<f32>(0.0);
   var Lo_specular = vec3<f32>(0.0);
@@ -431,7 +447,11 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
     if (l_data.position_or_dir.w == 0.0) {
       // Directional
       l = normalize(l_data.position_or_dir.xyz + vec3<f32>(0.00001));
-      if (i == 0u) { light_color = light_color * shadow_factor; }
+      // Only the sun (light 0) has a shadow map. Extra directional lights are sky/bounce fills with no
+      // occlusion of their own, so ground them like the ambient fill — unshadowed, they shone straight
+      // through roofs and lit interiors as brightly as the outdoors.
+      // Inside a captured probe the real sky arrives through the windows, so fills fade out entirely.
+      light_color = light_color * select(shadow_ao * (1.0 - probe_w), shadow_factor, i == 0u);
     } else {
       // Point or spot: inverse-square-ish range attenuation.
       let dir = l_data.position_or_dir.xyz - in.world_pos;
@@ -546,6 +566,8 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
   // carries the max mip index (env LOD range).
   let env_max_lod = light.post.w;
   var R           = reflect(-v, n);
+  var R_probe     = R;
+
   // Reflection-probe box projection (EEVEE-style): when a finite probe box is active, re-aim the
   // reflection vector at the point where it hits the box wall, then re-base it at the box centre.
   // This anchors reflections to the room instead of an infinitely-distant sky.
@@ -560,14 +582,21 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
     if (dist > 0.0) {
       let hit = in.world_pos + R * dist;
       R = normalize(hit - light.probe_center.xyz);
+      R_probe = normalize(hit - light.probe_capture.xyz); // the captured cube's own origin
+
     }
   }
-  let irradiance  = textureSampleLevel(env_cube, env_samp, n, env_max_lod).rgb;
+  // Inside a captured probe the room's own cube replaces the sky: walls darken the fill, windows
+  // brighten it, and reflections show the room instead of an outdoor sky.
+  let irradiance  = mix(textureSampleLevel(env_cube, env_samp, n, env_max_lod).rgb,
+                        textureSampleLevel(probe_env, env_samp, n, env_max_lod).rgb, probe_w);
   let F_ibl       = F0 + (vec3<f32>(1.0) - F0) * pow5(clamp(1.0 - NdotV, 0.0, 1.0));
   var kD_ibl      = (vec3<f32>(1.0) - F_ibl) * (1.0 - metallic);
   let diffuse_ibl = irradiance * base_color.rgb * kD_ibl;
   // Specular: perceptual roughness -> mip LOD (sqrt curve widens low-roughness detail).
-  let env_color   = textureSampleLevel(env_cube, env_samp, R, sqrt(roughness) * env_max_lod).rgb; // roughness already in [0.05,1]
+  let env_lod     = sqrt(roughness) * env_max_lod; // roughness already in [0.05,1]
+  let env_color   = mix(textureSampleLevel(env_cube, env_samp, R, env_lod).rgb,
+                        textureSampleLevel(probe_env, env_samp, R_probe, env_lod).rgb, probe_w);
   // Multi-scatter energy compensation (Fdez-Agüera) — without it, rough metals lose energy and
   // read dull/dark (EEVEE compensates for this). FssEss is the single-scatter term; Fms*Ems adds
   // back the light lost to multiple microfacet bounces. Reuses `dfg` from the direct-light
@@ -592,14 +621,15 @@ fn fs_main(in: VertexOut, @builtin(front_facing) front_facing: bool) -> FragOut 
   // shadows, and SSAO/GTAO handles genuine ambient occlusion. (Previously this multiplied BOTH terms
   // and could reach 0, crushing shadowed reflective surfaces — and anything refracting them — to pure
   // black.)
-  let shadow_ao = max(mix(1.0 - light.shadow.x, 1.0, shadow_factor), 0.3);
   // Baked occlusion (glTF ORM: occlusion in the MR map's R channel, gated by surface.z so plain
   // metallic-roughness maps aren't misread as AO). Full strength on diffuse ambient; half-weighted
   // on the specular reflection (Filament-style: baked AO over-darkens sharp reflections).
   let occl = mix(1.0, mr_sample.r, clamp(model_data.surface.z, 0.0, 1.0));
   // Diffuse IBL is the fill light → scaled by the ambient-intensity knob and grounded by shadow_ao.
   // Specular IBL is the ENVIRONMENT REFLECTION → stays at full strength so metals/glass keep glossy.
-  let ambient = diffuse_ibl * light.ambient_color.a * shadow_ao * occl + specular_ibl * mix(1.0, occl, 0.5);
+  // The captured cube already contains the room's occlusion, so the sun-shadow grounding only
+  // applies to the sky share of the fill.
+  let ambient = diffuse_ibl * light.ambient_color.a * mix(shadow_ao, 1.0, probe_w) * occl + specular_ibl * mix(1.0, occl, 0.5);
   // Clearcoat layer: a sharp Fresnel-weighted environment reflection over the paint. The
   // base layer is dimmed by the coat's reflectance so energy is roughly conserved.
   // The coat reflects the environment at ITS OWN roughness (cc_rough), not a forced mip-0 mirror —
