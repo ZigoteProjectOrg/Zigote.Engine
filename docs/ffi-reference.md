@@ -1,35 +1,45 @@
 # FFI / ABI reference
 
-Zigote.Engine exposes a flat C ABI: **286 exported `zigote_*` functions** (the count `nm` reports
-from the built library), all `callconv(.c)`, defined across `src/ffi/` — **204** in
-[`ffi/root.zig`](../src/ffi/root.zig) (which also holds the audio and physics wrappers), **49** in
-[`ffi/ecs.zig`](../src/ffi/ecs.zig), **11** in [`ffi/chrome.zig`](../src/ffi/chrome.zig), **10** in
-`ffi/desktop_shims_stub.zig` (non-macOS only), **6** each in
-[`ffi/dialogs.zig`](../src/ffi/dialogs.zig) and `ffi/channel.zig`.
-The C# frontend consumes them via `[DllImport]` P/Invoke; the bindings are **generated** from these `export fn`s — don't hand-write
-them, regenerate.
+Zigote.Engine exposes a flat C ABI: roughly three hundred `zigote_*` functions, all `callconv(.c)`,
+defined across `src/ffi/` — most in [`ffi/root.zig`](../src/ffi/root.zig) (which also holds the
+audio and physics wrappers), the flecs surface in [`ffi/ecs.zig`](../src/ffi/ecs.zig), and the rest
+in [`ffi/chrome.zig`](../src/ffi/chrome.zig), [`ffi/dialogs.zig`](../src/ffi/dialogs.zig),
+`ffi/channel.zig` and `ffi/desktop_shims_stub.zig` (non-macOS only). `nm` on the built library is
+the authoritative count.
 
-`ffi/root.zig` is the authoritative export list. This document is a map, not a replacement for it.
+The C# frontend consumes them through `[DllImport]` bindings that a Roslyn source generator
+(`Zigote.Generators/ZigoteBindingGenerator`) emits on every build from the `export fn`s in
+`src/ffi/*.zig` and the enums in `src/abi.zig`. Don't hand-write a binding.
+
+Every struct and enum that crosses the boundary is defined in [`src/abi.zig`](../src/abi.zig). This
+document is a map, not a replacement for it.
 
 ## ABI versioning — the safety contract
 
-The C# side pins struct sizes and an ABI version against this backend. At startup it calls
-`zigote_get_renderer_abi_info` and asserts the returned sizes equal its own compile-time `sizeof`
-values — a mismatch fails loudly instead of corrupting memory.
+At startup the C# side calls `zigote_get_renderer_abi_info` and `RendererAbiInfo.Validate` compares
+the version and the sizes of the paint-op header, `ZgEvent` and the handle type against its own —
+a mismatch fails loudly instead of corrupting memory. On the Zig side every field offset is pinned by
+a `comptime` assert in `abi.zig`, and `zig build ffi-manifest` writes the real layouts to
+`zig-out/ffi-manifest.json`, which `Zigote.Tests/AbiManifestTests` checks the C# mirrors against.
 
-**Current ABI version: `9`** (`.abi_version = 9` in `zigote_get_renderer_abi_info`,
-[`ffi/root.zig`](../src/ffi/root.zig)).
+**Current ABI version: `100`** — the V2 contract (see [v2-design.md](v2-design.md)). Version 9 was
+the last flat-struct ABI; a version-9 host cannot talk to this engine. V2 changed:
 
-**Bump the ABI version whenever you change field order/size or add fields** to `ZgPaintCommand`,
-`ZgEvent`, or `ZgRenderSettings3D`. The C# counterpart is `RendererAbiInfo.ExpectedAbiVersion` +
-`AbiLayoutTests`.
+- paint commands from one flat 112-byte struct to a **tagged, variable-size stream**;
+- errors to **`ZgStatus`** (`0` = ok, negative = error code): fallible exports return a status and
+  hand results back through out-parameters;
+- resource handles to **generational** `(generation, index)` values, so a stale handle fails cleanly;
+- dropped the engine handle from every signature (one engine per process).
+
+**Bump the version whenever a wire struct's layout changes**, and regenerate the manifest.
+
 
 ### `ZgAbiInfo` (20 bytes) — returned by `zigote_get_renderer_abi_info`
 
 | Offset | Field | Type |
 |-------:|-------|------|
 | 0 | `abi_version` | u32 |
-| 4 | `paint_command_size` | u32 |
+| 4 | `paint_op_header_size` | u32 (must equal `sizeof(ZgPaintOpHeader)`) |
 | 8 | `event_size` | u32 |
 | 12 | `handle_size` | u32 (opaque resource handle = usize) |
 | 16 | `render_settings_3d_size` | u32 |
@@ -51,47 +61,34 @@ is a fixed compile-time guard). Features gate on this, never on a backend-name c
 
 ## Wire structs
 
-### `ZgPaintCommand` (112 bytes)
+### The paint command stream
 
-One flat paint command. Fields are ordered large→small (8-byte pointers first) so the struct packs
-with a single 3-byte hole instead of ~11 padding bytes (120→112 B — meaningful across the
-thousands of commands a frame streams). Every offset is pinned by a `comptime @offsetOf` assert here
-and by `AbiLayoutTests` on the C# side.
+A frame's paint commands cross as **one byte stream**: each record is a `ZgPaintOpHeader` followed
+by a struct specific to its kind. Nothing aliases — every record names its own fields — and an
+unknown kind is skipped by `size`, so a newer host still gets everything else drawn.
 
-| Offset | Field | Type | Notes |
-|-------:|-------|------|-------|
-| 0 | `kind` | u8 | `CMD_*` discriminant (0–17) |
-| 1 | `font_style` | u8 | 0 = normal, 1 = italic |
-| 2 | `font_weight` | u16 | 100–900 |
-| 4 | `has_cache_key` | u8 | |
-| 5 | `pad0` | [3]u8 | the single packing hole |
-| 8 | `text_ptr` | ptr | text bytes; also the `ZgGlyphRunQuad` array for `CMD_GLYPH_RUN` |
-| 16 | `pixels_ptr` | ptr | image pixels / font-family bytes / **polygon points** |
-| 24 | `rect_x/y/w/h` | 4×f32 | |
-| 40 | `color_r/g/b/a` | 4×f32 | |
-| 56 | `radius` | f32 | aliased: image u0 / shader id (`@bitCast`) |
-| 60 | `border_width` | f32 | aliased: image v0 |
-| 64 | `baseline_x` | f32 | aliased: image u1 |
-| 68 | `baseline_y` | f32 | aliased: image v1 |
-| 72 | `font_size` | f32 | |
-| 76 | `line_height` | f32 | |
-| 80 | `letter_spacing` | f32 | |
-| 84 | `word_spacing` | f32 | |
-| 88 | `img_pixel_w` | u32 | |
-| 92 | `img_pixel_h` | u32 | |
-| 96 | `cache_key_lo` | u32 | |
-| 100 | `cache_key_hi` | u32 | |
-| 104 | `text_len` | u32 | |
-| 108 | `pixels_len` | u32 | |
+```zig
+pub const ZgPaintOpHeader = extern struct {
+    kind: u32,   // a ZgPaintOp
+    size: u32,   // whole record, header included; always a multiple of 8
+};
+```
 
-**`CMD_*` command kinds:** 0 `RECT` · 1 `BORDER` · 2 `TEXT` · 3 `IMAGE` · 4 `CLIP_START` ·
-5 `CLIP_END` · 6 `PUSH_OPACITY` · 7 `POP_OPACITY` · 8 `SHADOW` · 9 `LIQUID_GLASS` ·
-10 `SHADER_EFFECT` · 11 `TEXT_LAYOUT` · 12 `GLYPH_RUN` · 13 `RENDER_TEXTURE_BEGIN` ·
-14 `RENDER_TEXTURE_END` · 15 `BLUR` · 16 `BEZIER` · 17 `POLYGON`.
+A rect record is 48 bytes (header, `bounds`, `color`, `radius`, `squircle`). Text, font-family names,
+pixels and polygon points are not copied into the stream: their records carry pointer + length to
+payloads the C# `PaintList` keeps on the pinned object heap until the frame is submitted.
 
-`ZgGlyphRunQuad` (32 bytes, for `CMD_GLYPH_RUN`): `{ x, y, w, h, u0, v0, u1, v1 }` (8×f32).
+**`ZgPaintOp` kinds:** 0 `rect` · 1 `border` · 2 `text` · 3 `image` · 4 `clip_start` ·
+5 `clip_end` · 6 `push_opacity` · 7 `pop_opacity` · 8 `shadow` · 9 `liquid_glass` ·
+10 `shader_effect` · 11 `text_layout` · 12 `glyph_run` · 13 `render_texture_begin` ·
+14 `render_texture_end` · 15 `blur` · 16 `bezier` · 17 `polygon` · 18 `transform_push` ·
+19 `transform_pop`.
+
+`ZgGlyphRunQuad` (32 bytes, for `glyph_run`): `{ x, y, w, h, u0, v0, u1, v1 }` (8×f32).
+Colours are straight (non-premultiplied) RGBA in 0..1.
 
 See [rendering.md](rendering.md) for what each command draws.
+
 
 ### `ZgEvent` (44 bytes)
 
@@ -125,7 +122,7 @@ unknown / 1 light / 2 dark) · 13 `DROP_BEGIN` · 14 `DROP_FILE` · 15 `DROP_TEX
 
 A file/text drop arrives as `DROP_BEGIN` → N × `DROP_FILE`/`DROP_TEXT` → `DROP_COMPLETE`, with the
 payload out-of-band in `poll_text` exactly like text input. **New drop event kinds reused existing
-`ZgEvent` fields — no ABI bump** (still ABI 9).
+`ZgEvent` fields — no ABI bump.**
 
 Touchscreen fingers (direct touch devices only — trackpads stay wheel/cursor; SDL's touch↔mouse
 synthesis is pinned off at init so nothing fires twice) arrive as `TOUCH_DOWN` → N × `TOUCH_MOVE` →
@@ -134,7 +131,7 @@ the mouse coordinate space), `key_scancode` = compact finger slot (0–9, stable
 `scroll_x` = pressure 0..1. `TOUCH_CANCEL` means the OS took the gesture — abandon, don't commit.
 App lifecycle: `APP_BACKGROUND` (SDL `will_enter_background` — stop GPU work before the app
 suspends), `APP_FOREGROUND` (`did_enter_foreground`), `LOW_MEMORY`; `terminating` maps to `QUIT`.
-**All reuse existing `ZgEvent` fields — no ABI bump** (still ABI 9). The main-window safe-area
+**All reuse existing `ZgEvent` fields — no ABI bump.** The main-window safe-area
 insets (notch/home indicator; zero on desktop) are queryable via `zigote_get_safe_area(handle,
 insets*4f32)` as `[left, top, right, bottom]` in window coordinates.
 
@@ -148,7 +145,7 @@ source. `ffi/root.zig` for everything except ECS, which is in `ffi/ecs.zig`.
 
 | Group | Anchors | Notes |
 |-------|---------|-------|
-| **Lifecycle / frame** | `zigote_init`, `zigote_shutdown`, `zigote_begin_frame`, `zigote_submit_paint_commands`, `zigote_submit_overlay_commands`, `zigote_render_frame_v2`, `zigote_end_frame` | The per-frame contract (see [architecture.md](architecture.md)). `zigote_render_3d` is the immediate-mode 3D entry the editor uses. |
+| **Lifecycle / frame** | `zigote_init`, `zigote_shutdown`, `zigote_frame_acquire`, `zigote_begin_frame`, `zigote_submit_paint_commands`, `zigote_submit_overlay_commands`, `zigote_submit_frame_damage`, `zigote_frame_end`, `zigote_frame_was_dropped`, `zigote_frame_timings` | The per-frame contract (see [architecture.md](architecture.md)); `zigote_render_frame_v2` + `zigote_end_frame` are the older pair. `zigote_render_3d` is the immediate-mode 3D entry the editor uses. |
 | **Events / input** | `zigote_poll_events`, `zigote_poll_text_ptr`, `zigote_wait_events`, `zigote_input_gamepad_*`, `zigote_get_system_theme` | Events → `ZgEvent` buffer; text/IME/drops via the out-of-band `poll_text` buffer. |
 | **Windowing / multi-window** | `zigote_window_create`, `zigote_window_render`, `zigote_window_submit_paint`, `zigote_main_window_*`, `zigote_get_size`, `zigote_get_scale` | Secondary OS windows are UI-only, each with its own `GpuUi` sharing the main device. |
 | **Text** | `zigote_load_font`, `zigote_add_emoji_font`, `zigote_measure_text`, `zigote_text_layout_*`, `zigote_text_reset_caches` | `zigote_measure_text` is headless (no GPU). See [subsystems.md](subsystems.md#text). |
@@ -171,11 +168,13 @@ source. `ffi/root.zig` for everything except ECS, which is in `ffi/ecs.zig`.
 1. Add `export fn zigote_x(...) callconv(.c) ...` in [`ffi/root.zig`](../src/ffi/root.zig) (or the
    subsystem's own `src/ffi/*.zig` — ECS in `ecs.zig`, dialogs in `dialogs.zig`; a new file must be
    force-referenced from a `comptime` block in `root.zig` or its exports won't be compiled).
-2. Regenerate the C# P/Invoke in `Zigote.Core/Native/NativeEngine.cs` — don't hand-write it.
+   Return `ZgStatus` if it can fail; return results through out-parameters.
+2. Build the C# solution: the source generator emits `NativeEngine.X(...)`. Nothing to regenerate by hand.
 3. Wrap it publicly in `ZigoteEngine` (C#) — never expose `NativeEngine` members directly.
 4. If it stores into a `Gpu3d` cache, call `ensure3d(...)` first. If it only reads/invalidates, it
    must **not** create the 3D stack.
-5. If you touched a wire struct, bump `.abi_version` and update the C# `AbiLayoutTests`.
+5. If you touched a struct in `src/abi.zig`, keep its `comptime` asserts in step, bump
+   `.abi_version`, and run `zig build ffi-manifest`.
 
 GPU UBO/param structs live in [`src/renderer/uniforms.zig`](../src/renderer/uniforms.zig) with comptime
 `@offsetOf`/`@sizeOf` guards pinning the field offsets the shaders depend on — the same pattern as the

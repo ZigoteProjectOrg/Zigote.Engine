@@ -2,14 +2,14 @@
 
 Zigote.Engine is the **native half** of the Zigote engine. It is a Zig library that owns the GPU and
 every OS-facing resource, and exposes a flat C ABI (`zigote_*` functions) that the C# frontend
-(`Zigote.Core`) drives via `[LibraryImport]` P/Invoke.
+(`Zigote.Core`) drives via `[DllImport]` P/Invoke, generated at compile time from the `export fn`s.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  C# solution (Zigote.Core, Zigote.UI, Zigote.Game, Editor…)  │  product logic
 │    widgets · scenes · scripting · physics coordination       │
 └───────────────────────────┬─────────────────────────────────┘
-                            │  [LibraryImport] P/Invoke — the zigote_* C ABI
+                            │  [DllImport] P/Invoke — the zigote_* C ABI
 ┌───────────────────────────▼─────────────────────────────────┐
 │  Zigote.Engine (this repo, Zig)                              │  native backend
 │    SDL3 window · wgpu renderer · FreeType/HarfBuzz text      │
@@ -28,8 +28,8 @@ every OS-facing resource, and exposes a flat C ABI (`zigote_*` functions) that t
 frame the C# side polls events, builds a paint-command list, and calls into Zig to render. The one
 exception is the audio device (miniaudio's own callback thread) and SDL's internal event queue.
 
-The full design rationale for the whole engine lives in the root [CLAUDE.md](../../CLAUDE.md) of the
-parent C# solution — this repo documents only the native backend.
+The design of the whole solution lives in the parent repository's
+[docs/architecture.md](../../docs/architecture.md) — this repo documents only the native backend.
 
 ## Source layout
 
@@ -44,7 +44,7 @@ src/
   ui/                      headless UI support (no GPU)
     text.zig               text measurement + text styles
     geometry.zig           2D geometry helpers
-    render/paint.zig       (C ABI paint command structs live in ffi/root.zig today)
+    render/paint.zig       the renderer's internal command list (the wire format is abi.zig)
 
   engine/                  3D foundation. NOT legacy: `World` is the live mesh/material/transform
                            store the 3D renderer walks every frame. C# drives tree editing; Zig
@@ -98,29 +98,36 @@ ffi/*  ──►  renderer/*  ──►  engine/* ──────────
 
 `ffi/` is the top: it references the renderer, the render graph, the engine scaffold, text, and the
 subsystem FFI modules, and turns them into C exports. Nothing below `ffi/` knows about the C ABI —
-the wire structs (`ZgPaintCommand`, `ZgEvent`) are defined in `ffi/root.zig` and passed down as plain
-Zig data.
+the wire structs (the tagged paint-op records, `ZgEvent`, `ZgAbiInfo`, …) are defined in
+[`src/abi.zig`](../src/abi.zig), which imports nothing but `std`, and `ffi/` decodes them into
+plain Zig data for the layers below.
 
 ## What is *not* here
 
-- **No widgets, layout, or scenes** — those are C# (`Zigote.UI`, `Zigote.Game`). The `engine/scene`
-  Zig scaffold is legacy; the live scene graph is C# and pushes resources down through the FFI.
-- **No gameplay** — game code lives in the C# side's `examples/<project>/`.
+- **No widgets, layout, or scene authoring** — those are C# (`Zigote.UI`, `Zigote.Runtime`). The C#
+  scene graph drives tree edits through the FFI; the native `engine/` `World` stores and walks the
+  resulting meshes, materials and transforms.
+- **No gameplay** — game code lives in each game's own project, outside this repository.
 - **No software rendering fallback** — the path is always GPU (wgpu). This is a GPU-first engine.
 
 ## Frame flow (the contract with C#)
 
-Each frame the C# host runs this exact sequence against the FFI (from the header of `ffi/root.zig`):
+Each frame the C# host (`Zigote.UI.App`) runs this sequence against the FFI:
 
 ```
-1. zigote_poll_events()             SDL3 poll → ZgEvent buffer  (+ zigote_poll_text_ptr for text/IME/drops)
-   … C# builds the widget tree, runs layout, produces a flat paint-command list …
-3. zigote_begin_frame()             store this frame's parameters
-4. zigote_submit_paint_commands()   hand over the root paint list
-5. zigote_submit_overlay_commands() hand over the overlay paint list (optional)
-6. zigote_render_frame_v2()         execute the render graph + present
-7. zigote_end_frame()               reset per-frame state
+1. zigote_wait_events(ms)           only when idle: block until input, a post, or a timeout
+2. zigote_poll_events()             SDL3 poll → ZgEvent buffer (+ zigote_poll_text_ptr for text/IME/drops)
+   … C# runs effects, layout, input dispatch and animation, and paints into a PaintList …
+3. zigote_frame_acquire()           optional: take the next swapchain image before late input, so
+                                    the vsync wait stays out of input latency
+4. zigote_begin_frame(dt, …)        store this frame's parameters
+5. zigote_submit_paint_commands()   hand over the tagged paint stream (+ _overlay_commands, _frame_damage)
+6. zigote_frame_end(window)         run the frame's pass list and present; then
+                                    zigote_frame_was_dropped() says whether the image was skipped
 ```
+
+`zigote_render_frame_v2` + `zigote_end_frame` are the older pair for the same work and remain for
+hosts that have not moved to `frame_end`.
 
 3D content, sprites, and particles are uploaded through their own resource FFI (`zigote_scene_*`,
 `zigote_sprites_*`, `zigote_particles_*`) between frames or before the render call; the 3D pipeline is

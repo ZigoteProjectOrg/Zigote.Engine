@@ -2,8 +2,8 @@
 
 The native **Zig + wgpu rendering backend** for [Zigote](../README.md). This repository builds
 `libzigote` (`.dylib` / `.dll` / `.so`) and exports a C ABI through
-[`src/ffi/root.zig`](src/ffi/root.zig) that the C# frontend (`Zigote.Core`) consumes via
-`[LibraryImport]` P/Invoke.
+[`src/ffi/`](src/ffi/root.zig) that the C# frontend (`Zigote.Core`) consumes via `[DllImport]`
+P/Invoke bindings generated at compile time.
 
 > **The split:** Zig owns the GPU — SDL3 windowing, wgpu rendering, text shaping, physics, ECS, audio,
 > model import. C# owns everything above the GPU — widgets, scenes, scripting, and the editor. This
@@ -29,13 +29,15 @@ The native **Zig + wgpu rendering backend** for [Zigote](../README.md). This rep
   clipboard, and drag-and-drop, marshalled as `ZgEvent` structs.
 - **3D foundation** — Jolt physics (`zphysics`), flecs ECS (`zflecs`), Assimp model import
   (glTF/FBX/OBJ/… → `.zmesh` caches + a JSON manifest), and spatial/surround audio (`zaudio`/miniaudio).
-- **Math & scene primitives** — Vec/Mat/Quat/Ray, Color/Rect/Size, and a legacy scene/resource scaffold.
+- **Math & scene primitives** — Vec/Mat/Quat/Ray, Color/Rect/Size, and the `World` mesh/material/transform
+  store the 3D renderer walks every frame (C# edits the tree; Zig owns the storage).
 
-Everything is exposed as `zigote_*` C functions (**286 exports** today — 204 in
-[`src/ffi/root.zig`](src/ffi/root.zig), 49 in [`src/ffi/ecs.zig`](src/ffi/ecs.zig), the rest in
-chrome/dialogs/channel and the non-macOS shims). The C# P/Invoke
-layer is **generated** from these `export fn`s — don't hand-write bindings; regenerate. See the
-[FFI/ABI reference](docs/ffi-reference.md) for the full map.
+Everything is exposed as `zigote_*` C functions — roughly three hundred: most in
+[`src/ffi/root.zig`](src/ffi/root.zig), the flecs surface in [`src/ffi/ecs.zig`](src/ffi/ecs.zig),
+and the rest in `chrome.zig`, `dialogs.zig`, `channel.zig` and the non-macOS desktop shims. The C#
+P/Invoke layer is **generated**: `Zigote.Generators/ZigoteBindingGenerator` is a Roslyn source
+generator that reads every `export fn` in `src/ffi/*.zig` (and the enums in `src/abi.zig`) on each
+C# build. Never hand-write a binding. See the [FFI/ABI reference](docs/ffi-reference.md) for the map.
 
 ---
 
@@ -82,9 +84,10 @@ transitively — needed by wgpu's own Metal backend, not a separate native-Metal
 ```text
 src/
   root.zig                 internal aggregate module
+  abi.zig                  the FFI wire contract: every struct/enum that crosses the C ABI
   core/                    shared geometry (Color, Rect, Size) + SpinLock
-  ui/                      headless text measurement + C ABI paint command structs
-  engine/                  3D foundation: math (Vec/Mat/Quat/Ray), scene, resources
+  ui/                      headless text measurement + the renderer's internal paint command list
+  engine/                  3D foundation: math (Vec/Mat/Quat/Ray), the live World store, resources
   renderer/
     wgpu.zig               2D UI renderer + paint-command tessellation
     wgpu_3d.zig            3D forward+ renderer
@@ -99,7 +102,10 @@ src/
     shaders/               WGSL sources + common_*.wgsl prelude fragments
                            (validated by `zig build check-gpu`)
   ffi/
-    root.zig               the C ABI export layer (all zigote_* functions)
+    root.zig               the C ABI export layer (most zigote_* functions)
+    chrome.zig             in-app titlebars / client-side decorations
+    dialogs.zig            native file dialogs
+    channel.zig            platform channels (zigote_channel_register / _send)
     assimp_loader.zig      Assimp import → .zmesh + JSON manifest
     audio.zig              miniaudio (ma_engine) spatial/surround audio
     physics.zig            Jolt physics FFI  (physics_stub.zig when -Dphysics3d=false)
@@ -113,22 +119,30 @@ src/
 
 ## FFI ABI contract
 
-The C# side pins struct sizes and an ABI version against this backend — they **must** match, or a
-mismatch fails loudly at startup (`zigote_get_renderer_abi_info`).
+Every struct and enum that crosses the boundary lives in [`src/abi.zig`](src/abi.zig), with
+`comptime` `@offsetOf`/`@sizeOf` asserts. At startup C# calls `zigote_get_renderer_abi_info` and
+refuses to run on any mismatch (`RendererAbiInfo.Validate`).
 
-| Struct           | Size      | Note                                                                                                          |
-|------------------|-----------|---------------------------------------------------------------------------------------------------------------|
-| `ZgPaintCommand` | 112 bytes | Explicit layout; offsets asserted on both sides (comptime `@offsetOf` here, `AbiLayoutTests` in C#).          |
-| `ZgEvent`        | 44 bytes  | Text/IME/drop payloads ride the out-of-band `zigote_poll_text` buffer; `WindowId` routes multi-window events. |
+| Contract | Shape | Note |
+|---|---|---|
+| Paint commands | Tagged byte stream: `ZgPaintOpHeader` (`kind`, `size`) + a kind-specific record | A rect is 48 B; unknown kinds are skipped by `size`. Strings and pixels ride pinned side buffers by address. |
+| `ZgEvent` | 44 bytes | Text/IME/drop payloads ride the out-of-band `zigote_poll_text` buffer; `window_id` routes multi-window events. |
+| Errors | `ZgStatus` (`0` = ok) | Fallible exports return a status; results come back through out-parameters. |
+| Handles | generational `u64` | A stale handle fails cleanly instead of pointing at reused memory. |
 
-Current ABI version: **9** (`abi_version` in [`src/ffi/root.zig`](src/ffi/root.zig)). Bump it whenever
-you change field order/size or add fields to these structs.
+Current ABI version: **100** — the V2 contract (`abi_version` in [`src/ffi/root.zig`](src/ffi/root.zig);
+version 9 was the last flat-struct ABI). Bump it whenever a wire struct's layout changes.
+`zig build ffi-manifest` writes the real sizes and offsets to `zig-out/ffi-manifest.json`, which
+`Zigote.Tests/AbiManifestTests` compares against the C# mirrors.
 
 ### Adding an FFI binding
 
-1. `export fn zigote_x(...)` in [`src/ffi/root.zig`](src/ffi/root.zig).
-2. Regenerate the C# P/Invoke in `Zigote.Core/Native/NativeEngine.cs` (don't hand-write it).
+1. `export fn zigote_x(...) callconv(.c)` in [`src/ffi/root.zig`](src/ffi/root.zig) (or the
+   subsystem's own file under `src/ffi/`).
+2. Build the C# solution — the source generator emits `NativeEngine.X(...)`. Nothing to regenerate by hand.
 3. Wrap it publicly in `ZigoteEngine` — never expose `NativeEngine` members directly.
+4. If you touched a struct in `src/abi.zig`, keep its asserts in step, bump the ABI version and
+   regenerate the manifest.
 
 GPU UBO/param structs live in [`src/renderer/uniforms.zig`](src/renderer/uniforms.zig) with comptime
 `@offsetOf`/`@sizeOf` guards pinning the field invariants the shaders depend on.

@@ -39,7 +39,7 @@ validator and an enable-toggle. None of it did anything: execution was registrat
 referenced. Nothing inserted a barrier, aliased a resource, reordered or culled.
 
 A pass that fails is recorded and skipped rather than aborting the frame, so one broken pass cannot
-black-screen the editor; `zigote_render_frame_v2` logs what failed.
+black-screen the editor; the frame call (`zigote_frame_end`) logs what failed.
 
 ## The 3D pipeline (forward+, EEVEE-style)
 
@@ -90,9 +90,10 @@ once at mesh upload, and the mesh shader emits a flat unlit colour when the wire
 
 ## The 2D UI paint path
 
-The C# side streams a flat array of `ZgPaintCommand` structs (see
-[ffi-reference.md](ffi-reference.md)). `renderer/wgpu.zig` parses them into a `paint.Command` union
-and tessellates them. Command kinds (`CMD_*`):
+The C# side streams one tagged byte stream per frame — a `ZgPaintOpHeader` plus a kind-specific
+record per command (see [ffi-reference.md](ffi-reference.md)). `zigote_submit_paint_commands` walks
+it once, decodes it into the renderer's internal `paint.Command` list, and `renderer/wgpu.zig`
+tessellates that. Command kinds (`ZgPaintOp`):
 
 | Code | Command | Notes |
 |------|---------|-------|
@@ -110,10 +111,32 @@ and tessellates them. Command kinds (`CMD_*`):
 | 13 / 14 | `RENDER_TEXTURE_BEGIN` / `_END` | render-to-texture region |
 | 15 | `BLUR` | separable blur region |
 | 16 | `BEZIER` | stroked bézier (the only "line" primitive) |
-| 17 | `POLYGON` | filled simple/convex polygon — point ring rides the `pixels` side-channel, triangle-fanned into the shape pipeline |
+| 17 | `POLYGON` | filled simple/convex polygon — the point ring rides a pinned side buffer, triangle-fanned into the shape pipeline |
+| 18 / 19 | `TRANSFORM_PUSH` / `TRANSFORM_POP` | 2D affine transform stack (`PaintList.PushTransform`) |
 
 `CMD_POLYGON` is what backs `Zigote.UI.Charts` filled symbols, sector wedges, and seam-free area
-fills. It adds no shader and no ABI change — it reuses existing command fields with a new `kind`.
+fills, with no shader of its own.
+
+### Custom shader effects
+
+`SHADER_EFFECT` draws one quad with an app-registered WGSL pipeline. Register with
+`ZigoteEngine.RegisterShader(id, wgsl)` (→ `zigote_register_shader`); draw with
+`PaintList.AddShaderEffect(bounds, id, p0..p7, imageKey, chainsBackdrop)`.
+
+- Entry points `vs_main` / `fs_main`. Vertex inputs: `@location(0)` position (already clip space),
+  `@location(1)` uv into the backdrop, `@location(2)`/`(3)` the eight params as two `vec4<f32>`.
+- `@group(0)`: the backdrop (`texture_2d<f32>` at binding 0, sampler at binding 1) — a copy of
+  everything painted before the quad. Any backdrop-sampling command is a barrier.
+- `@group(1)` is bound only when the WGSL declares it: the texture named by `imageKey` (a LUT, a mask).
+- In the fragment stage `@builtin(position)` is in **device pixels**; callers pass geometry
+  multiplied by the display scale, including the paint list's current translation.
+- The effect is not clipped by the frame's clip stack; round corners in the shader.
+- wgpu reports invalid WGSL through the uncaptured-error callback rather than failing the call.
+  `RegisterShader` captures those log lines: it returns `false` and `ZigoteEngine.LastShaderError`
+  holds the parser's message (line, column, caret).
+
+`Zigote.UI/Widgets/Painting/BackdropBlur.cs` and `plugins/Camera/Camera/CameraLut.cs` are complete
+examples; the Playground's *Custom Shaders* page has two editable ones.
 
 ### Text
 

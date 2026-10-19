@@ -3,7 +3,7 @@
 Beyond rendering, Zigote.Engine bundles the OS-facing and native-compute subsystems the C# side needs.
 Each is exposed through the `zigote_*` FFI ([ffi-reference.md](ffi-reference.md)) and, in the C#
 solution, wrapped by a static provider (`Audio`, `Physics`, `Input`, …). This document covers what the
-**native** side does; the C# API shape lives in the parent [CLAUDE.md](../../CLAUDE.md).
+**native** side does; the C# API shape lives in the parent solution's [games-and-3d.md](../../docs/games-and-3d.md).
 
 ## Windowing & input (SDL3)
 
