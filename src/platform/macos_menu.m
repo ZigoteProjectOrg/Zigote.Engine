@@ -7,6 +7,7 @@
 // for the app's lifetime (no ARC).
 
 #import <Cocoa/Cocoa.h>
+#import <objc/message.h>
 #include <stdint.h>
 
 #define ZEXPORT __attribute__((visibility("default")))
@@ -141,6 +142,13 @@ ZEXPORT void zigote_macmenu_add_item(void *parentMenu, const char *titleC, int32
                                      accessibilityDescription:nil];
             if (img != nil) {
                 [item setImage:img];
+                // macOS 27 hides menu item images by default; an app that passed a symbol asked
+                // for it. Set by selector (1 = NSMenuItemImageVisibilityVisible) so pre-27 SDKs
+                // still compile and pre-27 systems skip it.
+                SEL visibility = NSSelectorFromString(@"setPreferredImageVisibility:");
+                if ([item respondsToSelector:visibility]) {
+                    ((void (*)(id, SEL, NSInteger))objc_msgSend)(item, visibility, 1);
+                }
             }
         }
     }
