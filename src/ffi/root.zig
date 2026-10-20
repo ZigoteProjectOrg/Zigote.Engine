@@ -137,7 +137,10 @@ const crash_diagnostics = builtin.os.tag == .macos or
 
 const execinfo = @import("execinfo_c"); // empty where crash_diagnostics is false (build.zig)
 
-const fatal_sigs = [_]std.posix.SIG{ .ILL, .TRAP, .ABRT, .BUS, .FPE, .SEGV };
+// No SIGTRAP: it is not a crash in a managed host. The .NET runtime's in-process debugger plants
+// int3 breakpoints and steps through them via its own SIGTRAP handler (Debugger.Break and failed
+// Debug.Assert under a debugger too); intercepting it kills debug sessions. Zig's @trap is ud2 → SIGILL.
+const fatal_sigs = [_]std.posix.SIG{ .ILL, .ABRT, .BUS, .FPE, .SEGV };
 var prev_sigactions: [fatal_sigs.len]std.posix.Sigaction = undefined;
 var crash_handler_installed = false;
 
@@ -146,7 +149,6 @@ fn nativeCrashSignalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t
 
     const sig_name: []const u8 = switch (sig) {
         .ILL => "SIGILL (illegal instruction, exit code 132)",
-        .TRAP => "SIGTRAP (trace/breakpoint trap, exit code 133)",
         .ABRT => "SIGABRT (abort, exit code 134)",
         .BUS => "SIGBUS (bus error, exit code 135)",
         .FPE => "SIGFPE (arithmetic exception, exit code 136)",
