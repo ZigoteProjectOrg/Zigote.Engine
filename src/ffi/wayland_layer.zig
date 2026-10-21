@@ -16,9 +16,9 @@ const std = @import("std");
 const wayland_toplevel = @import("wayland_toplevel.zig");
 const wayland_vkbd = @import("wayland_vkbd.zig");
 
-/// std.DynLib has no Windows implementation, and there is no Wayland there to load: a stand-in
-/// whose `open` always fails keeps the Wayland files compiling for that target.
-pub const DynLib = if (@import("builtin").os.tag == .windows) struct {
+/// std.DynLib has no Windows or Emscripten implementation, and there is no Wayland there to load:
+/// a stand-in whose `open` always fails keeps the Wayland files compiling for those targets.
+pub const DynLib = if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .emscripten) struct {
     pub fn open(_: []const u8) error{FileNotFound}!@This() {
         return error.FileNotFound;
     }

@@ -48,6 +48,14 @@ fn addAndroidSysrootPaths(b: *std.Build, mod: *std.Build.Module, target: std.Bui
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ "/usr/lib", arch_dir, "34" }) });
 }
 
+/// Emscripten (web): zig ships no emscripten libc, so every compile gets the emsdk sysroot's headers
+/// (the .NET wasm workload's emsdk cache — the same one that does the final link). Nothing is
+/// linked here; the static archives meet libc at that emcc link.
+fn addEmscriptenSysrootPaths(b: *std.Build, mod: *std.Build.Module) void {
+    const sdk = sysroot orelse std.debug.panic("wasm32-emscripten needs -Dsysroot=<emsdk>/cache/sysroot", .{});
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "include" }) });
+}
+
 /// Translate a set of C headers into a Zig module (`step.createModule()`), the replacement for
 /// `@cImport`, which zig 0.17 removed. The caller adds the include paths the headers need.
 /// ponytail: `addTranslateC` is itself deprecated for the external translate-c package; move
@@ -75,6 +83,8 @@ fn translateHeaders(
     // Translation does not inherit `--libc`, so the SDK / NDK headers are spelled out.
     if (t.os.tag == .ios or t.abi.isAndroid())
         tc.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+    if (t.os.tag == .emscripten)
+        tc.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "include" }) });
     if (t.abi.isAndroid()) {
         tc.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include", androidArchDir(target) }) });
         // Two bionic-isms translate-c cannot parse: the _FORTIFY_SOURCE overload set redefines
@@ -207,6 +217,9 @@ fn specFor(t: std.Target) ?TargetSpec {
 
 fn linkWgpuNative(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     const t = target.result;
+    // The browser has WebGPU itself: web/zigote_webgpu.js implements the webgpu.h entry points
+    // over navigator.gpu at the final emcc link, so there is no archive to attach.
+    if (t.os.tag == .emscripten) return;
     const spec = specFor(t) orelse std.debug.panic(
         "wgpu-native: unsupported target {s}-{s}{s} — add a row to target_specs in build.zig",
         .{ @tagName(t.cpu.arch), @tagName(t.os.tag), if (t.abi.isAndroid()) "-android" else "" },
@@ -570,14 +583,15 @@ pub fn build(b: *std.Build) void {
     // with SIGILL. Every distro ships SDL without UBSan; so do we. Our own C deps already pass
     // -fno-sanitize=undefined (buildWebp/buildMiniaudio/buildFlecs) — this makes SDL consistent.
     // Android rides the linux ABI, so it needs the same treatment as desktop Linux.
-    const sdl3_dep = if ((target.result.os.tag == .ios or target.result.abi.isAndroid()) and sysroot != null) b.dependency("sdl3", .{
+    const is_web = target.result.os.tag == .emscripten;
+    const sdl3_dep = if ((target.result.os.tag == .ios or target.result.abi.isAndroid() or is_web) and sysroot != null) b.dependency("sdl3", .{
         .target = target,
         .optimize = optimize,
         .c_sdl_sanitize_c = std.zig.SanitizeC.off,
         .sysroot = @as([]const u8, sysroot orelse ""),
         // The binding's translate-c of the SDL headers needs the SDK's libc headers
         // (AvailabilityMacros.h & co) — same paths addAppleSdkPaths supplies to compiles.
-        .sdl_system_include_path = @as(std.Build.LazyPath, .{ .cwd_relative = b.pathJoin(&.{ sysroot.?, "usr/include" }) }),
+        .sdl_system_include_path = @as(std.Build.LazyPath, .{ .cwd_relative = b.pathJoin(&.{ sysroot.?, if (is_web) "include" else "usr/include" }) }),
     }) else b.dependency("sdl3", .{
         .target = target,
         .optimize = optimize,
@@ -781,6 +795,7 @@ pub fn build(b: *std.Build) void {
         // its bionic workarounds in translateHeaders).
         for (all_modules) |mod| addAndroidSysrootPaths(b, mod, target);
     }
+    if (is_web) for (all_modules) |mod| addEmscriptenSysrootPaths(b, mod);
 
     if (target.result.os.tag == .macos) {
         // Native macOS menu bar (NSMenu) — Objective-C, linked against Cocoa.

@@ -19,6 +19,9 @@ pub const SType = enum(u32) {
     bind_group_layout_entry_extras = 0x00030008,
     query_set_descriptor_extras = 0x00030009,
     surface_configuration_extras = 0x0003000A,
+
+    // Emscripten (emdawnwebgpu's value): implemented by web/zigote_webgpu.js.
+    emscripten_surface_source_canvas_html_selector = 0x00040000,
 };
 
 pub const ChainedStruct = extern struct {

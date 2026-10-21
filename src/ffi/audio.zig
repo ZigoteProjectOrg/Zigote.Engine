@@ -857,7 +857,7 @@ pub fn decodeFile(path: [:0]const u8, out_channels: *u32, out_rate: *u32, out_fr
 
     const samples = frames * channels;
     const bytes = samples * @sizeOf(f32);
-    const raw = std.c.malloc(bytes) orelse return null;
+    const raw = std.c.malloc(std.math.cast(usize, bytes) orelse return null) orelse return null;
     const buf: [*]f32 = @ptrCast(@alignCast(raw));
 
     const read = decoder.readPCMFrames(raw, frames) catch {

@@ -584,7 +584,10 @@ pub const ZgPaintBezier = extern struct {
 
 pub const ZgPaintPolygon = extern struct {
     header: ZgPaintOpHeader,
-    points_ptr: [*c]const u8,
+    /// A `[*]const u8` widened to 8 bytes so the record stays a multiple of 8 where pointers are 4
+    /// (wasm32) — the other pointer-bearing ops already pair their pointers or carry a u64. The
+    /// host patches a native-width pointer into the low bytes; the high bytes stay zero.
+    points_ptr: u64,
     points_len: u32,
     pad: u32 = 0,
     color: ZgRgba,

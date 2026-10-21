@@ -76,6 +76,24 @@ comptime {
 comptime {
     if (@import("builtin").os.tag != .macos) _ = @import("desktop_shims_stub.zig");
 }
+// The browser: libpng (and FreeType's PNG-glyph shim over it) recover from decode errors with
+// setjmp/longjmp, which wasm only has when every C object is compiled with LLVM's sjlj lowering —
+// flags the dependency packages' own builds do not take. Error recovery is the only use, so
+// setjmp answers "first return" and longjmp traps.
+// ponytail: a corrupt PNG glyph in a font aborts instead of failing that glyph; lower sjlj in the
+// freetype/libpng builds (-mllvm -wasm-enable-sjlj) if colour-bitmap fonts ever ship on the web.
+comptime {
+    if (@import("builtin").os.tag == .emscripten) {
+        @export(&webSetjmp, .{ .name = "setjmp" });
+        @export(&webLongjmp, .{ .name = "longjmp" });
+    }
+}
+fn webSetjmp(_: ?*anyopaque) callconv(.c) c_int {
+    return 0;
+}
+fn webLongjmp(_: ?*anyopaque, _: c_int) callconv(.c) noreturn {
+    @trap();
+}
 const build_options = @import("build_options");
 /// Gates 3D-game-only native subsystems (Assimp model import). Lean 2D-only builds
 /// (`-Denable3d=false`) compile these out and don't link Assimp — see build.zig.
@@ -695,7 +713,8 @@ const EngineState = struct {
 /// zigote_shutdown so calls still in flight on .NET worker threads (async image decodes, texture
 /// releases from disposers) are rejected instead of racing the teardown — an app quit while covers
 /// were still decoding used to panic inside image_registry.put on a deinited map.
-var live_engine: std.atomic.Value(u64) = .init(0);
+/// Pointer-width: wasm32 has no 64-bit atomics, and the value is only ever an address.
+var live_engine: std.atomic.Value(usize) = .init(0);
 
 // ZIGOTE_RESIZE_TORTURE state — see zigote_poll_events. null = env not read yet.
 var resize_torture: ?bool = null;
@@ -711,7 +730,7 @@ var shot_enabled: ?bool = null;
 /// Returns null if the handle is 0, stale, or the engine is shutting down.
 inline fn stateFromHandle(handle: u64) ?*EngineState {
     if (handle == 0 or live_engine.load(.acquire) != handle) return null;
-    return @ptrFromInt(handle);
+    return @ptrFromInt(@as(usize, @intCast(handle)));
 }
 
 /// The live engine, or null before init / after shutdown.
@@ -919,6 +938,11 @@ fn createNativeSurface(instance: *wgpu.Instance, window: sdl3.video.Window, meta
             const x_display = sdl3.c.SDL_GetPointerProperty(props, sdl3.c.SDL_PROP_WINDOW_X11_DISPLAY_POINTER, null) orelse return error.NoNativeWindowHandle;
             const x_window = sdl3.c.SDL_GetNumberProperty(props, sdl3.c.SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
             var src = wgpu.SurfaceSourceXlibWindow{ .display = x_display, .window = @intCast(x_window) };
+            return instance.createSurface(&.{ .next_in_chain = @ptrCast(&src.chain), .label = label }) orelse error.WgpuSurfaceUnavailable;
+        },
+        // The browser: SDL's emscripten window is bound to the page's #canvas element.
+        .emscripten => {
+            var src = wgpu.EmscriptenSurfaceSourceCanvasHTMLSelector{ .selector = wgpu.StringView.fromSlice("#canvas") };
             return instance.createSurface(&.{ .next_in_chain = @ptrCast(&src.chain), .label = label }) orelse error.WgpuSurfaceUnavailable;
         },
         else => return error.UnsupportedPlatform,
@@ -1420,9 +1444,20 @@ export fn zigote_set_relative_mouse_mode(enabled: bool) bool {
 /// After returning, call zigote_poll_events to drain the queue.
 /// Used by the C# frame loop to sleep instead of spinning when the UI is idle.
 export fn zigote_wait_events(timeout_ms: u32) ZgStatus {
+    // The browser cannot block its thread; requestAnimationFrame already paces the frames
+    // (see zigote_web_main_loop), so the idle wait is the gap between two of them.
+    if (comptime builtin.os.tag == .emscripten) return .ok;
     _ = sdl3.events.waitTimeout(@intCast(timeout_ms));
     return .ok;
 }
+
+/// Browser only: run `frame` once per animation frame for the life of the page, then return —
+/// the host's own frame loop cannot block the browser's thread. A no-op on every other target.
+export fn zigote_web_main_loop(frame: ?*const fn () callconv(.c) void) void {
+    if (comptime builtin.os.tag != .emscripten) return;
+    emscripten_set_main_loop(frame, 0, false);
+}
+extern fn emscripten_set_main_loop(func: ?*const fn () callconv(.c) void, fps: c_int, simulate_infinite_loop: bool) void;
 
 /// Wake a thread blocked in zigote_wait_events immediately. Thread-safe (SDL_PushEvent is), and
 /// the pushed SDL_EVENT_USER is ignored by the poll conversion — its only job is ending the wait.
@@ -2950,8 +2985,9 @@ fn fillPaintList(
                 if (rec.len < @sizeOf(abi.ZgPaintPolygon)) continue;
                 const op: *const abi.ZgPaintPolygon = @ptrCast(@alignCast(rec.ptr));
                 // Points are (x,y) f32 pairs; a polygon needs at least 3 (24 bytes).
-                if (op.points_ptr == null or op.points_len < 24) continue;
-                try current.appendOwnedPolygon(alloc, op.points_ptr[0..op.points_len], rgba(op.color));
+                if (op.points_ptr == 0 or op.points_len < 24) continue;
+                const points: [*]const u8 = @ptrFromInt(@as(usize, @intCast(op.points_ptr)));
+                try current.appendOwnedPolygon(alloc, points[0..op.points_len], rgba(op.color));
             },
             @backingInt(abi.ZgPaintOp.transform_push) => {
                 if (rec.len < @sizeOf(abi.ZgPaintTransformPush)) continue;
@@ -2997,7 +3033,25 @@ export fn zigote_register_shader(id: u32, wgsl_ptr: [*]const u8, wgsl_len: usize
 /// Measure text using the heuristic text model (no GPU required).
 ///
 /// Returns (0,0) if the engine is not initialized.
+/// The size is written through `size` rather than returned: the browser's P/Invoke
+/// generator cannot marshal a struct returned by value (nor take one as a parameter).
 export fn zigote_measure_text(
+    text: [*c]const u8,
+    text_len: u32,
+    font_size: f32,
+    max_width: f32,
+    font_weight: u32,
+    font_style: u32,
+    letter_spacing: f32,
+    word_spacing: f32,
+    font_family: [*c]const u8,
+    font_family_len: u32,
+    size: *ZgSize,
+) void {
+    size.* = measureText(text, text_len, font_size, max_width, @intCast(font_weight), @intCast(font_style), letter_spacing, word_spacing, font_family, font_family_len);
+}
+
+fn measureText(
     text: [*c]const u8,
     text_len: u32,
     font_size: f32,
@@ -4010,15 +4064,15 @@ export fn zigote_scene_load_textures_batch(items_ptr: [*]const ZgTextureLoadItem
     const threads_opt: ?[]std.Thread = alloc.alloc(std.Thread, want) catch null;
     defer if (threads_opt) |t| alloc.free(t);
     var spawned: usize = 0;
-    if (threads_opt) |threads| {
+    if (threads_opt) |threads| if (!builtin.single_threaded) {
         for (0..threads.len) |_| {
             threads[spawned] = std.Thread.spawn(.{}, textureDecodeWorker, .{ jobs.items, &cursor }) catch break;
             spawned += 1;
         }
-    }
+    };
     // The calling thread also drains the queue, so all jobs complete even if no thread spawned.
     textureDecodeWorker(jobs.items, &cursor);
-    if (threads_opt) |threads| for (threads[0..spawned]) |t| t.join();
+    if (threads_opt) |threads| if (!builtin.single_threaded) for (threads[0..spawned]) |t| t.join();
 
     // ── Phase 3: store decoded pixels into materials (serial — mutates shared state) ──
     for (jobs.items) |*job| {
@@ -7798,9 +7852,11 @@ fn settingsFromWire(w: ZgRenderSettings3D) wgpu_renderer.wgpu_3d.Settings3D {
 }
 
 /// Apply 3D render settings from the editor's Settings tab.
-export fn zigote_set_render_settings_3d(settings: ZgRenderSettings3D) ZgStatus {
+/// By pointer for the same reason as zigote_measure_text: no by-value structs across the browser's
+/// P/Invoke boundary.
+export fn zigote_set_render_settings_3d(settings: [*c]const ZgRenderSettings3D) ZgStatus {
     const state = engineState() orelse return .invalid_handle;
-    const new_settings = settingsFromWire(settings);
+    const new_settings = settingsFromWire(settings.*);
     const g = state.gpu_3d orelse {
         // Must NOT create the renderer — the debug-menu Renderer panel writes settings in UI-only
         // apps too. Remember them; ensure3d applies the pending copy at creation (env_dirty

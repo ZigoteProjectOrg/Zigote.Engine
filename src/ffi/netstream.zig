@@ -43,6 +43,25 @@ const zaudio = @import("zaudio");
 /// an idle decode thread off the CPU.
 const poll_ms: u64 = 5;
 
+/// The frame counters. wasm32 has no 64-bit atomics, but it also builds single-threaded (no decode
+/// thread, see `create`), so a plain value with the same three calls is equivalent there.
+const Counter = if (builtin.single_threaded) struct {
+    raw: u64,
+    pub fn init(v: u64) @This() {
+        return .{ .raw = v };
+    }
+    pub fn load(self: *const @This(), comptime _: std.builtin.AtomicOrder) u64 {
+        return self.raw;
+    }
+    pub fn store(self: *@This(), v: u64, comptime _: std.builtin.AtomicOrder) void {
+        self.raw = v;
+    }
+    pub fn fetchAdd(self: *@This(), v: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        defer self.raw += v;
+        return self.raw;
+    }
+} else std.atomic.Value(u64);
+
 // Declared here rather than taken from std: zig 0.16 dropped both `std.os.windows.kernel32.Sleep`
 // and `std.Thread.sleep` (sleeping moved behind the new std.Io interface, which this FFI layer has
 // no Io instance to reach). One extern is smaller than threading an Io through for a 5 ms nap.
@@ -114,12 +133,12 @@ pub const NetStream = struct {
     // One producer, one consumer, monotonic counters — so the audio thread takes no lock.
     pcm: []f32,
     capacity: u64,
-    write_frames: std.atomic.Value(u64) = .init(0),
-    read_frames: std.atomic.Value(u64) = .init(0),
+    write_frames: Counter = .init(0),
+    read_frames: Counter = .init(0),
 
     state: std.atomic.Value(u32) = .init(@backingInt(State.connecting)),
     /// Frames handed to the mixer, silence included — the cursor a player displays.
-    delivered: std.atomic.Value(u64) = .init(0),
+    delivered: Counter = .init(0),
 
     thread: ?std.Thread = null,
     decoder: ?*zaudio.Decoder = null,
@@ -166,7 +185,9 @@ pub fn create(allocator: std.mem.Allocator, sample_rate: u32) !*NetStream {
     config.vtable = &vtable;
     _ = try zaudio.DataSource.create(config, &self.head.base);
 
-    self.thread = try std.Thread.spawn(.{}, decodeLoop, .{self});
+    // ponytail: single-threaded (web) builds never decode, the stream stays silent; decode on
+    // push there if network audio is ever needed in the browser.
+    if (!builtin.single_threaded) self.thread = try std.Thread.spawn(.{}, decodeLoop, .{self});
     return self;
 }
 

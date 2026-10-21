@@ -250,6 +250,7 @@ pub const SurfaceSourceMetalLayer = _surface.SurfaceSourceMetalLayer;
 pub const MergedSurfaceDescriptorFromMetalLayer = _surface.MergedSurfaceDescriptorFromMetalLayer;
 pub const surfaceDescriptorFromMetalLayer = _surface.surfaceDescriptorFromMetalLayer;
 pub const SurfaceSourceWaylandSurface = _surface.SurfaceSourceWaylandSurface;
+pub const EmscriptenSurfaceSourceCanvasHTMLSelector = _surface.EmscriptenSurfaceSourceCanvasHTMLSelector;
 pub const MergedSurfaceDescriptorFromWaylandSurface = _surface.MergedSurfaceDescriptorFromWaylandSurface;
 pub const surfaceDescriptorFromWaylandSurface = _surface.surfaceDescriptorFromWaylandSurface;
 pub const SurfaceSourceWindowsHWND = _surface.SurfaceSourceWindowsHWND;

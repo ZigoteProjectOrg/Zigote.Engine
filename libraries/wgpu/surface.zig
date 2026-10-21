@@ -100,6 +100,14 @@ pub inline fn surfaceDescriptorFromWaylandSurface(descriptor: MergedSurfaceDescr
     };
 }
 
+// Chained in SurfaceDescriptor to make a Surface over an HTML canvas, found by CSS selector (web).
+pub const EmscriptenSurfaceSourceCanvasHTMLSelector = extern struct {
+    chain: ChainedStruct = ChainedStruct{
+        .s_type = SType.emscripten_surface_source_canvas_html_selector,
+    },
+    selector: StringView,
+};
+
 // Chained in SurfaceDescriptor to make an Surface wrapping a Windows [`HWND`](https://learn.microsoft.com/en-us/windows/apps/develop/ui-input/retrieve-hwnd).
 pub const SurfaceSourceWindowsHWND = extern struct {
     chain: ChainedStruct = ChainedStruct{
