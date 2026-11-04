@@ -2,8 +2,9 @@
 
 Deeper guides for the native Zig + wgpu backend. Start with the repo [README](../README.md) for the
 overview; these go one level down. Architecture, APIs, and coding patterns for the **whole** engine
-(the C# side included) live in the parent solution's [docs](../../docs/README.md) — start with
-[architecture.md](../../docs/architecture.md).
+(the C# side included) live in the Zigote repository's
+[docs](https://github.com/ZigoteProjectOrg/Zigote/tree/main/docs) — start with
+[architecture.md](https://github.com/ZigoteProjectOrg/Zigote/blob/main/docs/architecture.md).
 
 | Guide                                | What it covers                                                                                                               |
 |--------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
@@ -12,3 +13,4 @@ overview; these go one level down. Architecture, APIs, and coding patterns for t
 | [ffi-reference.md](ffi-reference.md) | The C ABI: the V2 contract (ABI 100), the tagged paint stream, `ZgEvent`, and the categorized `zigote_*` export map.         |
 | [building.md](building.md)           | Build steps, the `-Denable3d`/`-Dphysics3d`/`-Decs`/`-Dstrip` options, dependencies, wgpu pinning, and cross-compilation.    |
 | [subsystems.md](subsystems.md)       | Windowing/input (SDL3), text (FreeType/HarfBuzz), audio (miniaudio), physics (Jolt), ECS (flecs), and model import (Assimp). |
+| [../CHANGELOG.md](../CHANGELOG.md)   | What changed per release, and the ABI version each one carries.                                                              |

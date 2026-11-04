@@ -1,0 +1,221 @@
+name: Build & Release
+
+# Every push and pull request builds libzigote on the three desktop OSes and runs the module tests,
+# so a change that breaks one platform is caught before it lands. A `v*` tag does the same build
+# and then attaches one archive per RID — the shared library, its import library on Windows, the
+# FFI manifest and the licence notices — to the tag's GitHub release.
+#
+# The archives are prebuilt engines for people consuming the C ABI directly. Apps built on the C#
+# SDK get the engine as `Zigote.Engine.runtime.<rid>` from the Zigote repository's release instead;
+# that package is built from this repository at the matching tag.
+#
+# Build flags mirror build/Zigote.Native.targets in the Zigote repository, so an archive from here
+# is the same binary the SDK packages carry:
+#   * -Doptimize=fast, which also strips debug info (build.zig gates -Dstrip on the optimize mode);
+#   * a CPU floor rather than the build machine's chip (x86_64_v2, apple_m1), so the library does
+#     not die with SIGILL on older hardware;
+#   * Linux targets a glibc floor (2.36, Debian 12) rather than the runner's, so the library loads
+#     on LTS distributions and inside Flatpak runtimes;
+#   * macOS targets the 12.0 floor and needs the SDK spelled out as a sysroot, because the CPU
+#     floor makes the target query non-native and Zig then stops finding the SDK on its own.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  # A tag must name the version build.zig.zon declares: the archive names, the GitHub release and
+  # the SDK package that pins this commit all read the tag, and a disagreement between them is the
+  # kind of mistake that is only found by whoever installs the result.
+  verify:
+    name: verify version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag against build.zig.zon
+        shell: bash
+        run: |
+          zon="$(sed -n 's/^ *\.version = "\([^"]*\)",.*/\1/p' build.zig.zon)"
+          echo "build.zig.zon version: $zon"
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              tag="${GITHUB_REF_NAME#v}"
+              if [ "$tag" != "$zon" ]; then
+                echo "::error::tag $GITHUB_REF_NAME does not match build.zig.zon version $zon"
+                exit 1
+              fi
+              grep -q "^## \[$zon\]" CHANGELOG.md ||
+                { echo "::error::CHANGELOG.md has no '## [$zon]' section"; exit 1; }
+              ;;
+          esac
+
+  test:
+    name: zig build test
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test
+
+  build:
+    name: build ${{ matrix.rid }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            target: x86_64-linux-gnu.2.36
+            cpu: x86_64_v2
+          - os: ubuntu-latest
+            rid: linux-arm64
+            target: aarch64-linux-gnu.2.36
+            cpu: baseline
+          - os: macos-latest
+            rid: osx-arm64
+            target: aarch64-macos.12.0
+            cpu: apple_m1
+          - os: macos-latest
+            rid: osx-x64
+            target: x86_64-macos.12.0
+            cpu: x86_64_v2
+          # Native MSVC-ABI build: no -Dtarget, exactly as a Windows host builds in the SDK. The
+          # GNU ABI is what cross-compiling from another OS produces, and it is not what we ship.
+          - os: windows-latest
+            rid: win-x64
+            target: ''
+            cpu: x86_64_v2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Resolve the macOS SDK
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sdk="$(xcrun --show-sdk-path)"
+          mkdir -p zig-out
+          # The same libc file build/Zigote.Native.targets generates: a non-native CPU query turns
+          # off Zig's own libc discovery, so the SDK headers and crt directory are spelled out.
+          cat > zig-out/.zig-libc-macos.txt <<LIBC
+          include_dir=$sdk/usr/include
+          sys_include_dir=$sdk/usr/include
+          cc_dir=
+          crt_dir=$sdk/usr/lib
+          msvc_lib_dir=
+          kernel32_lib_dir=
+          darwin_sdk_dir=$sdk
+          LIBC
+          echo "ZIG_SYSROOT_ARGS=--sysroot $sdk -Dsysroot=$sdk --libc $PWD/zig-out/.zig-libc-macos.txt" >> "$GITHUB_ENV"
+
+      - name: Build libzigote
+        shell: bash
+        run: |
+          args=(shared-lib -Doptimize=fast "-Dcpu=${{ matrix.cpu }}")
+          [ -n "${{ matrix.target }}" ] && args+=("-Dtarget=${{ matrix.target }}")
+          # shellcheck disable=SC2206 # the sysroot args are meant to split on spaces
+          args+=(${ZIG_SYSROOT_ARGS:-})
+          echo "zig build ${args[*]}"
+          zig build "${args[@]}"
+          # The manifest is reflected out of src/abi.zig by a small program, which has to RUN —
+          # so it is built for the host, never for the cross target. Same layout on every 64-bit RID.
+          zig build ffi-manifest
+
+      - name: Stage the archive
+        shell: bash
+        run: |
+          name="zigote-engine-${{ matrix.rid }}"
+          stage="artifacts/$name"
+          mkdir -p "$stage"
+          # The versioned library and its symlinks (libzigote.so.0.1.0 → libzigote.so) collapse to
+          # one real file: a consumer wants the loadable name, not the symlink farm.
+          case "${{ matrix.rid }}" in
+            win-*)
+              cp zig-out/bin/zigote.dll zig-out/bin/wgpu_native.dll "$stage/"
+              cp zig-out/lib/zigote.lib "$stage/" 2>/dev/null || cp zig-out/lib/*.lib "$stage/" 2>/dev/null || true
+              ;;
+            osx-*)   cp -L zig-out/lib/libzigote.dylib "$stage/" ;;
+            linux-*) cp -L zig-out/lib/libzigote.so "$stage/" ;;
+          esac
+          cp zig-out/ffi-manifest.json LICENSE THIRD-PARTY-NOTICES.md "$stage/"
+          ls -l "$stage"
+          cd artifacts
+          case "${{ matrix.rid }}" in
+            win-*) 7z a -tzip -bso0 -bsp0 "$name.zip" "$name" ;;
+            *)     tar -czf "$name.tar.gz" "$name" ;;
+          esac
+          rm -r "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zigote-engine-${{ matrix.rid }}
+          path: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+          if-no-files-found: error
+
+  # Workflow artifacts expire and need a GitHub login, so a tag build that stops there ships nothing
+  # anyone can get. Attach the archives to the tag's release with the changelog section as notes.
+  # Not gated on the whole matrix succeeding (fail-fast is off): a tag that builds on four of the
+  # five targets still publishes those four, and the missing one is re-run on the same tag.
+  release:
+    needs: [verify, test, build]
+    if: ${{ !cancelled() && needs.verify.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The section between this version's heading and the next one.
+          awk -v heading="## [$version]" '
+            index($0, heading) == 1 { inside = 1; next }
+            /^## \[/ { inside = 0 }
+            inside { print }' CHANGELOG.md > dist/notes.md
+          [ -s dist/notes.md ] || { echo "::error::no CHANGELOG.md section for $version"; exit 1; }
+          cat dist/notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(dist/*.tar.gz dist/*.zip)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::no archives were built for $GITHUB_REF_NAME"; exit 1; }
+          ( cd dist && sha256sum ./*.tar.gz ./*.zip 2>/dev/null | sed 's#\./##' > SHA256SUMS )
+          files+=(dist/SHA256SUMS)
+          prerelease=()
+          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
+          # create-then-upload rather than a one-shot create, so re-running the workflow on an
+          # existing tag replaces the assets instead of failing on "release already exists".
+          gh release create "$GITHUB_REF_NAME" --title "Zigote.Engine $GITHUB_REF_NAME" \
+              --notes-file dist/notes.md "${prerelease[@]}" ||
+            echo "release $GITHUB_REF_NAME already exists — updating its assets"
+          gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber

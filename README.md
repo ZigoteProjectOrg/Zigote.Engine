@@ -1,19 +1,25 @@
 # Zigote.Engine
 
-The native **Zig + wgpu rendering backend** for [Zigote](../README.md). This repository builds
-`libzigote` (`.dylib` / `.dll` / `.so`) and exports a C ABI through
-[`src/ffi/`](src/ffi/root.zig) that the C# frontend (`Zigote.Core`) consumes via `[DllImport]`
-P/Invoke bindings generated at compile time.
+The native **Zig + wgpu rendering backend** for
+[Zigote](https://github.com/ZigoteProjectOrg/Zigote), a UI and game framework for .NET. This
+repository builds `libzigote` (`.dylib` / `.dll` / `.so`, a static archive on iOS and the browser)
+and exports a C ABI through [`src/ffi/`](src/ffi/root.zig) that the C# frontend (`Zigote.Core`)
+consumes via P/Invoke bindings generated at compile time.
+
+[![Build & Release](https://github.com/ZigoteProjectOrg/Zigote.Engine/actions/workflows/release.yml/badge.svg)](https://github.com/ZigoteProjectOrg/Zigote.Engine/actions/workflows/release.yml)
+[![Release](https://img.shields.io/github/v/release/ZigoteProjectOrg/Zigote.Engine?include_prereleases)](https://github.com/ZigoteProjectOrg/Zigote.Engine/releases)
+[![Zig 0.17](https://img.shields.io/badge/Zig-0.17.0-F7A41D)](https://ziglang.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 > **The split:** Zig owns the GPU — SDL3 windowing, wgpu rendering, text shaping, physics, ECS, audio,
 > model import. C# owns everything above the GPU — widgets, scenes, scripting, and the editor. This
-> repo is only the native half; all high-level product logic lives in the parent C# solution.
+> repo is only the native half; all high-level product logic lives in the C# solution, which carries
+> this repository as the `Zigote.Engine` git submodule.
 >
-> Architecture, APIs, and coding patterns for the whole engine live in the root. Deeper native-backend guides live in [
-`docs/`](docs/README.md):
+> Deeper native-backend guides live in [`docs/`](docs/README.md):
 > [architecture](docs/architecture.md) · [rendering](docs/rendering.md) ·
 > [FFI/ABI reference](docs/ffi-reference.md) · [building](docs/building.md) ·
-> [subsystems](docs/subsystems.md).
+> [subsystems](docs/subsystems.md). Changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -54,6 +60,12 @@ zig build test           # module tests (math, scene, resources)
 You normally don't run this by hand: `Zigote.Core.csproj` runs `zig build` as a pre-build step and
 copies the resulting library into its output directory. **Native (Zig/shader) changes require a full
 process restart** — they apply at load, not via C# hot reload.
+
+Prebuilt libraries for every desktop RID are attached to each
+[GitHub release](https://github.com/ZigoteProjectOrg/Zigote.Engine/releases), with `SHA256SUMS`
+and the `ffi-manifest.json` describing the ABI they implement. Apps built on the C# SDK do not
+download these: they restore `Zigote.Engine.runtime.<rid>`, which the Zigote repository packs from
+this one at the same tag. See [Versioning and releases](#versioning-and-releases).
 
 ### Build options
 
@@ -146,3 +158,20 @@ version 9 was the last flat-struct ABI). Bump it whenever a wire struct's layout
 
 GPU UBO/param structs live in [`src/renderer/uniforms.zig`](src/renderer/uniforms.zig) with comptime
 `@offsetOf`/`@sizeOf` guards pinning the field invariants the shaders depend on.
+
+---
+
+## Versioning and releases
+
+The engine and the C# SDK ship under **one version number**: `Zigote.Engine.runtime.<rid>` 0.1.0
+is this repository at tag `v0.1.0`. The version lives in `build.zig.zon` (`.version`) and in the
+shared library's `.version` in `build.zig`; the ABI has its own counter, `abi_version` in
+[`src/ffi/root.zig`](src/ffi/root.zig), which the C# side checks at startup and which is listed per
+release in [CHANGELOG.md](CHANGELOG.md).
+
+Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml): it
+verifies the tag against `build.zig.zon` and the changelog, builds `libzigote` for linux-x64,
+linux-arm64, osx-arm64, osx-x64 and win-x64, and attaches the archives to the tag's release with
+the changelog section as its notes. The release procedure for the whole SDK — engine first, then the
+C# packages that pin it — is written down in the Zigote repository's
+[`RELEASING.md`](https://github.com/ZigoteProjectOrg/Zigote/blob/main/RELEASING.md).

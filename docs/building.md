@@ -53,9 +53,8 @@ zig build shared-lib -Denable3d=false -Doptimize=fast -Dstrip
 
 ## Dependencies
 
-**Every native dependency builds from source — no Homebrew, no system libraries.** (The old CLAUDE.md
-claim that macOS deps come from `/opt/homebrew` is obsolete.) They are vendored under `libraries/` or
-fetched by the Zig package manager into `zig-pkg/`:
+**Every native dependency builds from source — no Homebrew, no system libraries.** They are vendored
+under `libraries/` or fetched by the Zig package manager into `zig-pkg/`:
 
 | Dependency                  | Role                          | Source                                                                                |
 |-----------------------------|-------------------------------|---------------------------------------------------------------------------------------|
@@ -126,3 +125,28 @@ Native cross-compilation of all five targets from macOS is verified; the Windows
 built but not yet run on their own hardware. **NativeAOT cross-OS is unsupported by .NET** — the C#
 game-export flow only produces AOT binaries for host-OS RIDs and falls back to a self-contained JIT
 publish for others (see the parent solution's export docs).
+
+## Releases
+
+Prebuilt engines come from [`.github/workflows/release.yml`](../.github/workflows/release.yml),
+which runs on every push and pull request as a build check and, on a `v*` tag, attaches one
+archive per RID to the tag's GitHub release:
+
+| Archive | Contents |
+|---|---|
+| `zigote-engine-linux-x64.tar.gz`, `zigote-engine-linux-arm64.tar.gz` | `libzigote.so` built against a glibc 2.36 floor |
+| `zigote-engine-osx-arm64.tar.gz`, `zigote-engine-osx-x64.tar.gz` | `libzigote.dylib` with a macOS 12.0 floor |
+| `zigote-engine-win-x64.zip` | `zigote.dll`, `wgpu_native.dll` and the import library (MSVC ABI, built on Windows) |
+| every archive | `ffi-manifest.json`, `LICENSE`, `THIRD-PARTY-NOTICES.md` |
+| `SHA256SUMS` | a checksum per archive — `sha256sum -c SHA256SUMS` |
+
+The flags match what `build/Zigote.Native.targets` in the Zigote repository passes when it packs
+`Zigote.Engine.runtime.<rid>`: `-Doptimize=fast`, a CPU floor (`x86_64_v2`, `apple_m1`) instead of
+the build machine's chip, and explicit OS floors. Mobile and browser targets are not published as
+archives — they are consumed only through the SDK packages, which the Zigote repository builds.
+
+To cut a release: set `.version` in `build.zig.zon` and the shared library's `.version` in
+`build.zig`, move the `[Unreleased]` entries in `CHANGELOG.md` under the new version, then tag
+`vX.Y.Z` on `main` and push the tag. The workflow refuses a tag whose version disagrees with
+`build.zig.zon` or has no changelog section. The full order of operations across both repositories
+is in the Zigote repository's `RELEASING.md`.
