@@ -855,9 +855,16 @@ pub fn decodeFile(path: [:0]const u8, out_channels: *u32, out_rate: *u32, out_fr
     const frames = decoder.getLengthInPCMFrames() catch return null;
     if (frames == 0) return null;
 
-    const samples = frames * channels;
-    const bytes = samples * @sizeOf(f32);
-    const raw = std.c.malloc(std.math.cast(usize, bytes) orelse return null) orelse return null;
+    // The frame count is whatever the container's header claims (a W64 `fact` chunk is taken
+    // verbatim), so the size is computed with checked arithmetic and capped: unchecked, a crafted
+    // count wraps to a small allocation that the decode then overruns, and an honest-looking huge
+    // one makes the tail-zeroing below touch gigabytes.
+    const bytes = decodedByteSize(frames, channels) orelse {
+        std.log.warn("zigote: audio file '{s}' declares more samples than can be decoded at once", .{path});
+        return null;
+    };
+    const samples: usize = bytes / @sizeOf(f32);
+    const raw = std.c.malloc(bytes) orelse return null;
     const buf: [*]f32 = @ptrCast(@alignCast(raw));
 
     const read = decoder.readPCMFrames(raw, frames) catch {
@@ -868,13 +875,32 @@ pub fn decodeFile(path: [:0]const u8, out_channels: *u32, out_rate: *u32, out_fr
     // never sees uninitialised samples, and report what actually decoded.
     if (read < frames) {
         const got: usize = @intCast(read * channels);
-        @memset(buf[got..@intCast(samples)], 0);
+        @memset(buf[got..samples], 0);
     }
 
     out_channels.* = channels;
     out_rate.* = rate;
     out_frames.* = read;
     return buf;
+}
+
+/// Most decoded PCM held in one buffer: 2 GiB of f32, about 1.5 hours of 48 kHz stereo. Whole-file
+/// decoding is for clips and waveform analysis; anything longer streams.
+const max_decoded_bytes: usize = 2 << 30;
+
+/// Byte size of `frames` × `channels` f32 samples, or null when it overflows or exceeds the cap.
+fn decodedByteSize(frames: u64, channels: u32) ?usize {
+    const samples = std.math.mul(u64, frames, channels) catch return null;
+    const bytes = std.math.mul(u64, samples, @sizeOf(f32)) catch return null;
+    if (bytes > max_decoded_bytes) return null;
+    return std.math.cast(usize, bytes);
+}
+
+test "decoded size: a frame count that overflows or exceeds the cap is refused" {
+    try std.testing.expectEqual(@as(?usize, 48000 * 2 * 4), decodedByteSize(48000, 2));
+    try std.testing.expectEqual(@as(?usize, null), decodedByteSize((1 << 61) + 5, 2)); // wraps to 40
+    try std.testing.expectEqual(@as(?usize, null), decodedByteSize(1 << 31, 2)); // 16 GiB
+    try std.testing.expectEqual(@as(?usize, null), decodedByteSize(std.math.maxInt(u64), 8));
 }
 
 pub fn decodeFree(frames: [*]f32) void {

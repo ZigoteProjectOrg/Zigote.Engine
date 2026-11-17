@@ -7929,6 +7929,10 @@ fn isRadianceHdr(data: []const u8) bool {
 /// Decode a Radiance RGBE (.hdr) equirectangular image into tightly-packed rgba16-float pixels
 /// (8 bytes/texel, alpha = 1). Handles the new-format RLE scanlines that DCC tools (Blender) emit,
 /// with a fallback to flat (non-RLE) rows. Returns null on a malformed file.
+/// Largest equirect edge accepted — 16k × 8k is the biggest HDRI in common circulation, and the
+/// GPU side could not take more anyway.
+const max_hdr_dimension: usize = 16384;
+
 fn decodeRadianceHdr(allocator: std.mem.Allocator, data: []const u8, out_w: *u32, out_h: *u32) ?[]u8 {
     var i: usize = 0;
     // ── Header: text lines until a blank line, then the resolution line ──
@@ -7949,7 +7953,11 @@ fn decodeRadianceHdr(allocator: std.mem.Allocator, data: []const u8, out_w: *u32
             break;
         }
     }
-    if (width == 0 or height == 0) return null;
+    // Both come straight from the file. Unbounded, `width * height` wraps (in ReleaseFast,
+    // silently): the allocation below comes out a few bytes long and every scanline after the
+    // first is then copied past it with bytes the file chose. The cap also keeps the products
+    // far inside usize, so nothing after this line can overflow.
+    if (width == 0 or height == 0 or width > max_hdr_dimension or height > max_hdr_dimension) return null;
 
     const pixel_count = width * height;
     var rgbe = allocator.alloc(u8, pixel_count * 4) catch return null;
@@ -8531,4 +8539,33 @@ test "an empty scene batch succeeds and a misaligned length is rejected" {
     var one: [8]u8 align(8) = @splat(0);
     try std.testing.expectEqual(ZgStatus.ok, zigote_scene_apply(&one, 0));
     try std.testing.expectEqual(ZgStatus.invalid_argument, zigote_scene_apply(&one, 7));
+}
+
+test "radiance hdr: a resolution that overflows the pixel count is refused" {
+    // 2^61 + 1 rows of 8 pixels: the pixel count used to wrap to 8, the buffer came out 32 bytes
+    // long, and the second scanline was copied past its end.
+    const header = "#?RADIANCE\n\n-Y 2305843009213693953 +X 8\n";
+    var file: [header.len + 64]u8 = undefined;
+    @memcpy(file[0..header.len], header);
+    @memset(file[header.len..], 0x7f);
+    var w: u32 = 0;
+    var h: u32 = 0;
+    try std.testing.expect(decodeRadianceHdr(std.testing.allocator, &file, &w, &h) == null);
+
+    const huge = "#?RADIANCE\n\n-Y 16385 +X 8\n";
+    try std.testing.expect(decodeRadianceHdr(std.testing.allocator, huge, &w, &h) == null);
+}
+
+test "radiance hdr: a flat 2x2 image decodes" {
+    const header = "#?RADIANCE\n\n-Y 2 +X 2\n";
+    var file: [header.len + 16]u8 = undefined;
+    @memcpy(file[0..header.len], header);
+    @memset(file[header.len..], 128); // RGBE (128,128,128,128): 0.5 per channel
+    var w: u32 = 0;
+    var h: u32 = 0;
+    const out = decodeRadianceHdr(std.testing.allocator, &file, &w, &h) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqual(@as(u32, 2), w);
+    try std.testing.expectEqual(@as(u32, 2), h);
+    try std.testing.expectEqual(@as(usize, 2 * 2 * 8), out.len);
 }

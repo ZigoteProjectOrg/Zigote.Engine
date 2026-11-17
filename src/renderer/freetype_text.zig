@@ -2242,6 +2242,12 @@ pub const FreeTypeTextRenderer = struct {
         if (self.pen_y + padded_h >= self.atlas_height) {
             return error.FreeTypeAtlasFull;
         }
+        // Still too wide at the start of a fresh row: the glyph does not fit this atlas at all.
+        // Unchecked, each of its rows spilled into the following atlas rows — over neighbouring
+        // glyphs, and for a wide enough bitmap past the end of the pixel store.
+        if (self.pen_x + padded_w >= self.atlas_width) {
+            return error.FreeTypeAtlasFull;
+        }
 
         const out = Pos{
             .x = self.pen_x,
@@ -2565,6 +2571,9 @@ pub const FreeTypeTextRenderer = struct {
 
         if (self.color_pen_y + padded_h >= ColorAtlas.height) {
             return error.AtlasFull;
+        }
+        if (self.color_pen_x + padded_w >= ColorAtlas.width) {
+            return error.AtlasFull; // wider than the atlas itself: see reserveAtlas
         }
 
         const out = Pos{ .x = self.color_pen_x, .y = self.color_pen_y };
