@@ -70,6 +70,27 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+
+      # The FreeType wrapper downloads its tarball from savannah.gnu.org, which zig's HTTPS client
+      # cannot reach (TlsInitializationFailed), so every build died before compiling anything.
+      # The same tarball is fetched with curl and its unpacked source offered to `zig fetch`,
+      # which hashes it and files it in the cache under that hash: content that is not exactly
+      # what the wrapper pins never matches, and the build then fails as it did before. (The
+      # unpacked directory, not the archive — zig caches a local archive with its top-level
+      # folder, which the build rejects as a hash mismatch. Relative paths, because the tar on
+      # the Windows runner reads the colon of "D:\…" as a remote host.)
+      - name: Offer zig the FreeType source from a mirror
+        shell: bash
+        run: |
+          tarball=freetype-2.14.3.tar.xz
+          mkdir -p zig-out/freetype-source
+          curl -fsSL --retry 2 -o "zig-out/$tarball" \
+              "https://downloads.sourceforge.net/project/freetype/freetype2/2.14.3/$tarball" ||
+            curl -fsSL --retry 2 -o "zig-out/$tarball" \
+              "https://download.savannah.gnu.org/releases/freetype/$tarball" ||
+            { echo "::warning::no FreeType mirror answered; the build will try the pinned URL"; exit 0; }
+          tar -xf "zig-out/$tarball" -C zig-out/freetype-source --strip-components=1
+          zig fetch zig-out/freetype-source
       - run: zig build test
 
   build:
@@ -108,6 +129,27 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+
+      # The FreeType wrapper downloads its tarball from savannah.gnu.org, which zig's HTTPS client
+      # cannot reach (TlsInitializationFailed), so every build died before compiling anything.
+      # The same tarball is fetched with curl and its unpacked source offered to `zig fetch`,
+      # which hashes it and files it in the cache under that hash: content that is not exactly
+      # what the wrapper pins never matches, and the build then fails as it did before. (The
+      # unpacked directory, not the archive — zig caches a local archive with its top-level
+      # folder, which the build rejects as a hash mismatch. Relative paths, because the tar on
+      # the Windows runner reads the colon of "D:\…" as a remote host.)
+      - name: Offer zig the FreeType source from a mirror
+        shell: bash
+        run: |
+          tarball=freetype-2.14.3.tar.xz
+          mkdir -p zig-out/freetype-source
+          curl -fsSL --retry 2 -o "zig-out/$tarball" \
+              "https://downloads.sourceforge.net/project/freetype/freetype2/2.14.3/$tarball" ||
+            curl -fsSL --retry 2 -o "zig-out/$tarball" \
+              "https://download.savannah.gnu.org/releases/freetype/$tarball" ||
+            { echo "::warning::no FreeType mirror answered; the build will try the pinned URL"; exit 0; }
+          tar -xf "zig-out/$tarball" -C zig-out/freetype-source --strip-components=1
+          zig fetch zig-out/freetype-source
 
       - name: Resolve the macOS SDK
         if: runner.os == 'macOS'
