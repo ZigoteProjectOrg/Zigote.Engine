@@ -20,7 +20,6 @@ lives in this repository (or in the referenced build-time package). If you redis
 | [libwebp](https://chromium.googlesource.com/webm/libwebp) | vendored | BSD-3-Clause © Google | `libraries/libwebp/COPYING` |
 | [zmath](https://github.com/zig-gamedev/zmath) | vendored | MIT © Michal Ziulek / zig-gamedev | `libraries/zmath/LICENSE` |
 | [zmesh](https://github.com/zig-gamedev/zmesh) (bundles [par_shapes](https://github.com/prideout/par) © Philip Rideout, [cgltf](https://github.com/jkuhlmann/cgltf), and [meshoptimizer](https://github.com/zeux/meshoptimizer) © 2016-2022 Arseny Kapoulkine — all MIT) | vendored | MIT © Michal Ziulek / zig-gamedev | `libraries/zmesh/LICENSE`; bundled libs carry license headers in their sources under `libraries/zmesh/libs/` |
-| [zpool](https://github.com/zig-gamedev/zpool) | vendored | MIT © zig-gamedev contributors | `libraries/zpool/LICENSE` |
 | [zigimg](https://github.com/zigimg/zigimg) | 0.1.0 | MIT | `zig-pkg/zigimg-*/LICENSE` |
 | SDL Linux build deps (X11/Wayland/ALSA headers etc.) | fetched | various (permissive) | fetched at build time (`sdl_linux_deps-*/LICENSES` in the downloaded package) |
 

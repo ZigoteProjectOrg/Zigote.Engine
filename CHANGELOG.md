@@ -12,6 +12,16 @@ SDK, whatever the semver says.
 
 ## [Unreleased]
 
+### Fixed
+- The Radiance `.hdr` decoder bounds the image dimensions. An unchecked `width * height` wrapped
+  for a crafted header, and the scanline copy then wrote past a too-small buffer.
+- `zigote_audio_decode_file` computes the decoded size with checked arithmetic and refuses more
+  than 2 GiB; a frame count taken from the file could wrap the allocation size.
+- A glyph wider than the atlas no longer spills into the rows below it (or past the pixel store):
+  the reservation fails and the atlas grows or resets, as it already did for a glyph too tall.
+- The release workflow publishes only when the module tests passed, and accepts prerelease tags
+  (`vX.Y.Z-rc.N`) against the base version in `build.zig.zon`.
+
 ## [0.1.0] - 2026-11-04
 
 First public release. ABI version **100** (the V2 contract).

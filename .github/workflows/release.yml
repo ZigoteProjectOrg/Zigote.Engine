@@ -48,7 +48,10 @@ jobs:
           echo "build.zig.zon version: $zon"
           case "$GITHUB_REF" in
             refs/tags/v*)
+              # A prerelease tag (v0.2.0-rc.1) carries a suffix build.zig.zon does not: the SDK
+              # pins this commit and compares the same base version, so only the base is checked.
               tag="${GITHUB_REF_NAME#v}"
+              tag="${tag%%-*}"
               if [ "$tag" != "$zon" ]; then
                 echo "::error::tag $GITHUB_REF_NAME does not match build.zig.zon version $zon"
                 exit 1
@@ -175,9 +178,10 @@ jobs:
   # anyone can get. Attach the archives to the tag's release with the changelog section as notes.
   # Not gated on the whole matrix succeeding (fail-fast is off): a tag that builds on four of the
   # five targets still publishes those four, and the missing one is re-run on the same tag.
+  # It IS gated on the tests: a tag whose module tests fail publishes nothing.
   release:
     needs: [verify, test, build]
-    if: ${{ !cancelled() && needs.verify.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.test.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
